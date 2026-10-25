@@ -1,4 +1,5 @@
-"""Byte-level structure checks for JPEG, PNG and WebP. Pure Python, no exiftool.
+"""Byte-level structure checks for JPEG, PNG and WebP (and TIFF's layout).
+Pure Python, no exiftool.
 
 These back up exiftool's ``ImageDataHash`` with something stronger: apart
 from the XMP packet (and IPTC, when As If writes it), every byte of the file
@@ -6,7 +7,13 @@ must be identical before and after a write, in the same order. They also
 find the JPEG trailer, where Samsung and Google "motion photos" and MPF
 multi-picture files (Ultra HDR gain maps, depth maps) keep their extra data.
 
-Every function takes whole files as ``bytes`` and is pure. Messages name
+exiftool rebuilds a TIFF on every write, so its bytes can't match. Instead,
+``tiff_layout`` proves exiftool *can* carry everything over: every byte is
+reachable from an IFD it rewrites. ``read_xmp`` reads the XMP packet's own
+text with an XML parser, so a value exiftool's parser misses can't vanish
+unnoticed.
+
+Every function takes whole files as bytes and is pure. Messages name
 segments, chunks and byte counts, never file contents: these files are
 somebody's photos.
 """
@@ -15,8 +22,12 @@ from __future__ import annotations
 
 import re
 import struct
-from dataclasses import dataclass
+import zlib
+from collections import Counter
+from collections.abc import Buffer, Iterable
+from dataclasses import dataclass, field
 from typing import Literal
+from xml.parsers import expat
 
 Format = Literal["jpeg", "png", "webp", "tiff"]
 
@@ -241,6 +252,8 @@ def compare_jpeg(before: bytes, after: bytes, *, allow_iptc: bool) -> list[str]:
 
 _PNG_TEXT_CHUNKS = frozenset({b"iTXt", b"tEXt", b"zTXt"})
 _PNG_XMP_KEYWORD = b"XML:com.adobe.xmp"
+# ImageMagick's hex-encoded copy of the XMP, which exiftool reads and rewrites too.
+_PNG_XMP_RAW_PROFILE = b"Raw profile type xmp"
 # exiftool's (non-standard) home for IPTC in PNG, used for compat = "wide".
 _PNG_IPTC_KEYWORD = b"Raw profile type iptc"
 
@@ -397,6 +410,366 @@ def compare_webp(before: bytes, after: bytes) -> list[str]:
     if tail_b != tail_a:
         diffs.append(_count_diff("WebP data after the RIFF data", len(tail_b), len(tail_a)))
     return diffs
+
+
+# -- TIFF ----------------------------------------------------------------------
+
+# Bytes per value of each field type (TIFF 6.0, plus 13 for IFD pointers).
+_TIFF_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
+# Pointers to the IFDs exiftool follows and rebuilds: SubIFDs, Exif, GPS, Interop.
+_TIFF_SUB_IFDS = frozenset({0x014A, 0x8769, 0x8825, 0xA005})
+# (offsets, byte counts) of data outside the IFDs: strips, tiles, a JPEG thumbnail.
+_TIFF_DATA = ((0x0111, 0x0117), (0x0144, 0x0145), (0x0201, 0x0202))
+# MakerNote, and DNGPrivateData (which holds one). exiftool rebuilds both
+# when it moves them, rewriting the offsets inside and dropping any bytes
+# nothing in them points to.
+_TIFF_MAKER_NOTES = frozenset({0x927C, 0xC634})
+_TIFF_XMP = 0x02BC
+# TIFF aligns values to even offsets and some writers to 4 bytes: a gap of
+# up to 3 bytes between two referenced parts is padding, whatever it holds.
+_TIFF_PADDING = 3
+# A longer gap holds nothing worth keeping if it is all zeros, apart from at
+# most one stale 8-byte TIFF header: Pillow's multi-page writer leaves each
+# appended page's own header (byte order, 42, an offset) in the file. Gaps
+# longer than this aren't padding, whatever they hold.
+_TIFF_JUNK_MAX = 64 * 1024
+# Far more strips or tiles than any real image has: past this, checking
+# would cost more memory than the file is worth, so refuse instead.
+_TIFF_MAX_PARTS = 1_000_000
+
+
+@dataclass(frozen=True)
+class TiffLayout:
+    unreferenced: int
+    """Bytes nothing points to from an IFD exiftool rewrites, padding and
+    zero filler aside. exiftool rebuilds the file from its IFDs, so it would
+    drop them: a vendor block behind a private offset tag, say."""
+    maker_notes: bool
+    """An IFD holds a maker note, which exiftool rebuilds when it moves it."""
+    xmp: tuple[bytes, ...] = field(repr=False)
+    """The XMP packet (tag 700) of every IFD that has one."""
+
+
+def tiff_layout(data: Buffer) -> TiffLayout:
+    """Walk every IFD exiftool rewrites and account for each byte of a TIFF.
+
+    Covered: the header, the IFD chain from IFD0 and every SubIFD, Exif,
+    GPS and Interop IFD, every value stored outside its IFD entry, and the
+    strips, tiles and JPEG thumbnail they point to. Every other tag's value
+    is just data, never an offset: exiftool copies the number, not what it
+    points to. Takes ``bytes`` or an ``mmap``, so a large TIFF isn't copied.
+    Raises ``StructureError`` for BigTIFF, an IFD loop, an unknown field
+    type, or anything that points past the end of the file.
+    """
+    with memoryview(data) as view:
+        return _tiff_walk(view)
+
+
+def _tiff_walk(view: memoryview) -> TiffLayout:
+    size = len(view)
+    magic = bytes(view[:4])
+    if magic in (b"II+\x00", b"MM\x00+"):
+        raise StructureError("BigTIFF, which exiftool can't write")
+    if magic not in (b"II*\x00", b"MM\x00*") or size < 8:
+        raise StructureError("not a TIFF file")
+    order = "<" if magic[:2] == b"II" else ">"
+    spans: list[tuple[int, int]] = [(0, 8)]
+    xmp: list[bytes] = []
+    maker_notes = False
+
+    def claim(start: int, length: int, what: str) -> None:
+        if start + length > size:
+            raise StructureError(f"TIFF {what} runs past the end of the file")
+        spans.append((start, start + length))
+
+    def ints(typ: int, count: int, at: int) -> tuple[int, ...]:
+        if typ not in (3, 4, 13):  # SHORT, LONG, IFD
+            raise StructureError(f"TIFF offsets stored as field type {typ}")
+        code = "H" if typ == 3 else "I"
+        return struct.unpack_from(f"{order}{count}{code}", view, at)
+
+    # (offset, part of the IFD0 -> IFD1 -> ... chain). Only that chain's
+    # next-IFD links are followed: exiftool ignores them in sub-IFDs.
+    todo: list[tuple[int, bool]] = [(struct.unpack_from(f"{order}I", view, 4)[0], True)]
+    seen: set[int] = set()
+    while todo:
+        at, main = todo.pop()
+        if at == 0:
+            continue
+        if at in seen:
+            raise StructureError("TIFF IFDs form a loop")
+        seen.add(at)
+        claim(at, 2, "IFD")
+        count = struct.unpack_from(f"{order}H", view, at)[0]
+        claim(at, 2 + 12 * count + 4, "IFD")
+        entries: dict[int, tuple[int, int, int]] = {}
+        for i in range(count):
+            pos = at + 2 + 12 * i
+            tag, typ, n = struct.unpack_from(f"{order}HHI", view, pos)
+            width = _TIFF_TYPE_SIZE.get(typ)
+            if width is None:
+                raise StructureError(f"TIFF tag 0x{tag:04X} has an unknown field type ({typ})")
+            where = pos + 8
+            if width * n > 4:
+                where = struct.unpack_from(f"{order}I", view, pos + 8)[0]
+                claim(where, width * n, f"tag 0x{tag:04X}")
+            entries[tag] = (typ, n, where)
+            if tag in _TIFF_MAKER_NOTES:
+                maker_notes = True
+            elif tag == _TIFF_XMP:
+                xmp.append(bytes(view[where : where + width * n]))
+            elif tag in _TIFF_SUB_IFDS and typ in (4, 13):
+                todo.extend((off, False) for off in ints(typ, n, where))
+        if main:
+            todo.append((struct.unpack_from(f"{order}I", view, at + 2 + 12 * count)[0], True))
+        for off_tag, len_tag in _TIFF_DATA:
+            if off_tag not in entries and len_tag not in entries:
+                continue
+            if off_tag not in entries or len_tag not in entries:
+                raise StructureError(f"TIFF tag 0x{off_tag:04X} or 0x{len_tag:04X} is missing")
+            offsets, lengths = ints(*entries[off_tag]), ints(*entries[len_tag])
+            if len(offsets) != len(lengths) or len(offsets) > _TIFF_MAX_PARTS:
+                raise StructureError(f"TIFF tag 0x{off_tag:04X} doesn't match 0x{len_tag:04X}")
+            for start, length in zip(offsets, lengths, strict=True):
+                claim(start, length, "image data")
+
+    unreferenced = covered = 0
+    for start, end in [*sorted(spans), (size, size)]:
+        if start > covered and not _tiff_filler(view[covered:start], magic):
+            unreferenced += start - covered
+        covered = max(covered, end)
+    return TiffLayout(unreferenced, maker_notes, tuple(xmp))
+
+
+def _tiff_filler(gap: memoryview, magic: bytes) -> bool:
+    """Bytes nothing points to that hold nothing: see ``_TIFF_PADDING``."""
+    if len(gap) <= _TIFF_PADDING:
+        return True
+    if len(gap) > _TIFF_JUNK_MAX:
+        return False
+    raw = gap.tobytes()
+    header = raw.find(magic)
+    if header >= 0:
+        raw = raw[:header] + raw[header + 8 :]
+    return not raw.strip(b"\0")
+
+
+# -- XMP text ------------------------------------------------------------------
+
+_RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_XMP_NOTE = "http://ns.adobe.com/xmp/note/"
+# As If's own namespace (asif_ns.config): its record is rewritten every time.
+_ASIF_NS = "http://ns.as-if.invalid/1.0/"
+_HAS_EXTENDED = f"{_XMP_NOTE} HasExtendedXMP"
+# RDF syntax and bookkeeping exiftool rewrites on every write, so not values:
+# rdf:about/parseType/nodeID, xml:lang (it fixes the case), its own toolkit
+# name (x:xmptk) and the GUID linking the extended XMP (an MD5 of that part).
+_XMP_NOT_VALUES = frozenset(
+    {
+        f"{_RDF} about",
+        "about",  # very old XMP, unprefixed
+        f"{_RDF} parseType",
+        f"{_RDF} nodeID",
+        "http://www.w3.org/XML/1998/namespace lang",
+        "adobe:ns:meta/ xmptk",
+        _HAS_EXTENDED,
+    }
+)
+# No real XMP packet comes near this; a compressed one that does is refused.
+_XMP_MAX = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class XmpText:
+    """What every XMP packet in a file says, read with an XML parser."""
+
+    values: Counter[str] = field(repr=False)
+    """Every non-blank text and attribute value, stripped, with how often it
+    occurs. Excluded: RDF syntax, xml:lang, the toolkit name, the
+    extended-XMP link, and everything in As If's own namespace."""
+    problem: str | None = None
+    """Why exiftool can't carry this XMP over intact, in plain words; None if it can."""
+
+
+class _XmpReader:
+    """Collects the values of XMP packets, through expat. No DTD, so no entity tricks."""
+
+    def __init__(self, values: Counter[str], links: set[str]) -> None:
+        self.values, self.links = values, links
+        self.markup = False
+        # Per open element: ([skipped, has children, has text, parseType Literal], text so far).
+        self.stack: list[tuple[list[bool], list[str]]] = []
+
+    def parse(self, packet: bytes) -> None:
+        parser = expat.ParserCreate(namespace_separator=" ")
+        parser.StartDoctypeDeclHandler = self._no_dtd
+        parser.EntityDeclHandler = self._no_dtd
+        parser.StartElementHandler = self._start
+        parser.EndElementHandler = self._end
+        parser.CharacterDataHandler = self._text
+        try:
+            # Some writers pad the packet with NULs, which XML doesn't allow.
+            parser.Parse(packet.rstrip(b"\0"), True)
+        except expat.ExpatError as exc:
+            raise StructureError("the XMP isn't well-formed XML") from exc
+
+    def _no_dtd(self, *_args: object) -> None:
+        raise StructureError("the XMP has a DTD, which XMP doesn't allow")
+
+    def _flush(self) -> None:
+        flags, text = self.stack[-1]
+        value = "".join(text).strip()
+        text.clear()
+        if value:
+            flags[2] = True
+            if not flags[0]:
+                self.values[value] += 1
+
+    def _start(self, name: str, attrs: dict[str, str]) -> None:
+        skip = name.startswith(_ASIF_NS + " ") or name == _HAS_EXTENDED
+        if self.stack:
+            self._flush()
+            self.stack[-1][0][1] = True
+            skip = skip or self.stack[-1][0][0]
+        for key, value in attrs.items():
+            if key == _HAS_EXTENDED:
+                self.links.add(value.strip())
+            elif value.strip() and not (
+                skip or key in _XMP_NOT_VALUES or key.startswith(_ASIF_NS + " ")
+            ):
+                self.values[value.strip()] += 1
+        literal = attrs.get(f"{_RDF} parseType") == "Literal"
+        self.stack.append(([skip, False, False, literal], []))
+
+    def _text(self, data: str) -> None:
+        if self.stack:
+            self.stack[-1][1].append(data)
+
+    def _end(self, name: str) -> None:
+        flags, text = self.stack[-1]
+        if name == _HAS_EXTENDED:
+            self.links.add("".join(text).strip())
+        self._flush()
+        skipped, children, has_text, literal = flags
+        # Text beside child elements (mixed content), or markup inside a
+        # parseType="Literal" value: exiftool keeps the elements as a
+        # structure and silently drops the text around them.
+        if children and (has_text or literal) and not skipped:
+            self.markup = True
+        self.stack.pop()
+
+
+def read_xmp(data: Buffer) -> XmpText:
+    """The text of every XMP packet in a JPEG, PNG, WebP or TIFF file.
+
+    Read with an XML parser rather than exiftool's, so a value exiftool
+    can't read (and so wouldn't write back) still counts. ``problem`` names
+    what exiftool would lose: markup inside a value, or JPEG extended XMP
+    the main packet doesn't link to. Raises ``StructureError`` when the
+    file can't be parsed, isn't one of those formats, or an XMP packet
+    isn't well-formed XML (or has a DTD).
+    """
+    extended: dict[bytes, list[tuple[int, int, bytes]]] = {}
+    raw_profile = False
+    with memoryview(data) as view:
+        fmt = detect_format(bytes(view[:16]))
+        if fmt == "tiff":
+            packets = list(tiff_layout(view).xmp)
+        elif fmt in ("jpeg", "png", "webp"):
+            whole = data if isinstance(data, bytes) else view.tobytes()
+            if fmt == "jpeg":
+                packets = _jpeg_xmp(whole, extended)
+            elif fmt == "png":
+                packets, raw_profile = _png_xmp(whole)
+            else:
+                packets = [cdata for f, cdata, _r in _webp_chunks(whole)[0] if f == b"XMP "]
+        else:
+            raise StructureError("not a JPEG, PNG, WebP or TIFF file")
+
+    values: Counter[str] = Counter()
+    links: set[str] = set()
+    reader = _XmpReader(values, links)
+    for packet in packets:
+        reader.parse(packet)
+    for parts in extended.values():
+        reader.parse(_join_extended(parts))
+    problem = None
+    if reader.markup:
+        problem = "its XMP has markup inside a value, which exiftool can't carry over"
+    elif any(guid.decode("ascii", "replace") not in links for guid in extended):
+        # exiftool only reads extended XMP the main packet links to (by its
+        # MD5), and drops the rest on the next write.
+        problem = "it has extended XMP its main XMP doesn't link to, which exiftool would drop"
+    elif raw_profile:
+        # exiftool rewrites that chunk along with the real XMP, so the
+        # structure gate could never pass.
+        problem = "its XMP is in ImageMagick's raw-profile form, which exiftool would rewrite"
+    return XmpText(values, problem)
+
+
+def _jpeg_xmp(data: bytes, extended: dict[bytes, list[tuple[int, int, bytes]]]) -> list[bytes]:
+    packets = []
+    for seg in _jpeg_layout(data).header:
+        if seg.marker != _APP1:
+            continue
+        if seg.payload.startswith(_XMP_STD):
+            packets.append(seg.payload[len(_XMP_STD) :])
+        elif seg.payload.startswith(_XMP_EXT):
+            # GUID (32 hex digits), full length, this part's offset, then the part.
+            body = seg.payload[len(_XMP_EXT) :]
+            if len(body) < 40:
+                raise StructureError("JPEG extended XMP segment is truncated")
+            total, offset = struct.unpack(">II", body[32:40])
+            extended.setdefault(body[:32], []).append((offset, total, body[40:]))
+    return packets
+
+
+def _join_extended(parts: Iterable[tuple[int, int, bytes]]) -> bytes:
+    out = bytearray()
+    totals = set()
+    for offset, total, chunk in sorted(parts):
+        if offset != len(out):
+            raise StructureError("JPEG extended XMP is incomplete")
+        out += chunk
+        totals.add(total)
+    if totals != {len(out)}:
+        raise StructureError("JPEG extended XMP is incomplete")
+    return bytes(out)
+
+
+def _png_xmp(data: bytes) -> tuple[list[bytes], bool]:
+    """The PNG's XMP packets, and whether it also has ImageMagick's raw-profile XMP."""
+    packets = []
+    raw_profile = False
+    for ctype, cdata, _raw in _png_chunks(data)[0]:
+        if ctype not in _PNG_TEXT_CHUNKS:
+            continue
+        keyword, _, rest = cdata.partition(b"\0")
+        raw_profile = raw_profile or keyword == _PNG_XMP_RAW_PROFILE
+        if keyword != _PNG_XMP_KEYWORD:
+            continue
+        if ctype == b"tEXt":
+            packets.append(rest)
+        elif ctype == b"zTXt":
+            packets.append(_inflate(rest[1:]))
+        else:  # iTXt: compressed flag, method, language, translated keyword, text
+            compressed = rest[:1] == b"\x01"
+            text = rest[2:].split(b"\0", 2)
+            if len(text) != 3:
+                raise StructureError("PNG iTXt chunk is truncated")
+            packets.append(_inflate(text[2]) if compressed else text[2])
+    return packets, raw_profile
+
+
+def _inflate(data: bytes) -> bytes:
+    inflater = zlib.decompressobj()
+    try:
+        out = inflater.decompress(data, _XMP_MAX + 1)
+    except zlib.error as exc:
+        raise StructureError("PNG compressed XMP can't be decompressed") from exc
+    if len(out) > _XMP_MAX:
+        raise StructureError("PNG compressed XMP is implausibly large")
+    return out
 
 
 # -- dispatch ------------------------------------------------------------------

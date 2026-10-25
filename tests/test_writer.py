@@ -3,6 +3,7 @@ exiftool round trips on private copies of the synthetic fixtures."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 from collections.abc import Callable, Iterator, Sequence
@@ -237,6 +238,66 @@ def test_caption_deleted_by_owner_is_written_again() -> None:
     assert p.caption == "A red shed in a garden"
 
 
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        ("Grandpa at the lake, 1998",),  # IPTC Caption-Abstract (Picasa and friends)
+        ("Our wedding day, Lisbon",),  # EXIF ImageDescription
+        ("OLYMPUS DIGITAL CAMERA", "Our wedding day"),  # filler next to a real one
+        ("Digital camera fun at the beach",),
+        ("Sony DSC-RX100 on a tripod",),
+    ],
+)
+def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
+    # An XMP caption next to it would hide it in apps that read XMP first.
+    p = plan(ExistingMeta(legacy_captions=legacy))
+    assert p.caption is None
+    assert p.caption_reason == "kept-user"
+    assert p.caption_digest is None and p.caption_lang is None
+    assert p.add_subjects == ("garden", "shed", "sky")  # keywords still go in
+
+
+@pytest.mark.parametrize(
+    "filler",
+    [
+        "",
+        "                               ",  # Nikon and others pad with spaces
+        "\0\0\0",
+        "OLYMPUS DIGITAL CAMERA",
+        "olympus digital camera\0\0",
+        "SONY DSC",
+        "DSC",
+        "DIGITAL CAMERA",
+        "LEICA DIGITAL CAMERA",
+        "KODAK Digital Still Camera",
+        "KODAK CX7530 ZOOM DIGITAL CAMERA",
+        "SAMSUNG CAMERA PICTURES",
+        "MINOLTA DIGITAL CAMERA",
+        "Exif_JPEG_PICTURE",
+        "EXIF_JPEG_422",
+    ],
+)
+def test_camera_filler_is_not_a_caption(filler: str) -> None:
+    p = plan(ExistingMeta(legacy_captions=(filler, " ")))
+    assert p.caption_reason == "empty"
+    assert p.caption is not None
+
+
+def test_own_caption_copied_to_older_fields_is_still_ours() -> None:
+    # Apps that keep the fields in step copy As If's caption into them.
+    existing = replace(ours("Old"), legacy_captions=("Old", "SONY DSC"))
+    p = plan(existing, result("New"))
+    assert p.caption_reason == "ours"
+    assert p.caption == "New"
+
+
+def test_older_field_edited_after_as_if_keeps_the_caption() -> None:
+    existing = replace(ours("Old"), legacy_captions=("Grandpa at the lake",))
+    p = plan(existing, result("New"))
+    assert p.caption_reason == "kept-edited"
+    assert p.caption is None
+
+
 # -- plan_write: keywords ------------------------------------------------------
 
 
@@ -283,6 +344,76 @@ def test_previous_iptc_record_survives_an_xmp_only_run() -> None:
     assert p.all_added_iptc == ("garden", "shed")
 
 
+def test_keywords_dedupe_against_the_owners_iptc_keywords() -> None:
+    existing = ExistingMeta(
+        subjects=("shed",), iptc_present=True, iptc_utf8=True, iptc_keywords=("GARDEN",)
+    )
+    p = plan(existing, result(keywords=("garden", "shed", "sky")))
+    assert p.add_subjects == ("sky",)
+    assert p.copy_subjects == ()  # XMP already has the owner's own list
+    assert p.all_added_subjects == ("sky",)
+
+
+@pytest.mark.parametrize(
+    ("utf8", "owner"),
+    [
+        (True, ("Jardim", "família", "jardim")),
+        (False, ("Garden", "family")),  # unmarked, but plain ASCII reads the same either way
+    ],
+)
+def test_iptc_only_keywords_are_copied_into_xmp_first(utf8: bool, owner: tuple[str, ...]) -> None:
+    # XMP keywords alone would hide the owner's IPTC ones in apps that read
+    # XMP first, so the new XMP list starts with theirs.
+    existing = ExistingMeta(iptc_present=True, iptc_utf8=utf8, iptc_keywords=owner)
+    p = plan(existing, result(keywords=(owner[-1].upper(), "dog")))
+    assert p.copy_subjects == owner  # every spelling, exactly
+    assert p.add_subjects == ("dog",)
+    assert p.subject_note is None
+    # Recorded as copied, never as As If's own.
+    assert p.all_added_subjects == ("dog",)
+    assert p.all_copied_subjects == owner
+
+
+def test_nothing_is_copied_when_there_is_nothing_to_add() -> None:
+    existing = ExistingMeta(iptc_present=True, iptc_utf8=True, iptc_keywords=("garden",))
+    p = plan(existing, result(keywords=("Garden",)))
+    assert p.copy_subjects == () and p.add_subjects == () and p.subject_note is None
+
+
+def test_unmarked_non_ascii_iptc_keywords_are_never_copied() -> None:
+    # Latin-1 and unmarked UTF-8 can't be told apart: a wrong guess would
+    # copy the owner's keywords garbled.
+    existing = ExistingMeta(iptc_present=True, iptc_keywords=("cafÃ©", "dog"))
+    p = plan(existing, result(keywords=("dog", "cat")))
+    assert p.copy_subjects == () and p.add_subjects == ()
+    assert p.subject_note is not None and "UTF-8" in p.subject_note
+    assert "caf" not in p.subject_note
+
+
+def test_copied_keywords_are_remembered_across_runs() -> None:
+    existing = ExistingMeta(
+        subjects=("Garden", "dog"),
+        iptc_present=True,
+        iptc_utf8=True,
+        iptc_keywords=("Garden",),
+        asif={"AddedKeywords": ("dog",), "CopiedKeywords": ("Garden",)},
+    )
+    p = plan(existing, result(keywords=("dog", "cat")))
+    assert p.copy_subjects == () and p.add_subjects == ("cat",)
+    assert p.all_copied_subjects == ("Garden",)
+    assert p.all_added_subjects == ("dog", "cat")
+
+
+def test_language_tagged_keywords_get_no_more_keywords() -> None:
+    # exiftool would label As If's English keywords with the owner's language.
+    existing = ExistingMeta(subjects=("Hund", "chien"), subject_langs=True)
+    p = plan(existing, result(keywords=("dog", "beach")))
+    assert p.add_subjects == () and p.copy_subjects == ()
+    assert p.all_added_subjects == ()
+    assert p.subject_note is not None and "language" in p.subject_note
+    assert p.caption_reason == "empty"  # the caption still goes in
+
+
 # -- plan_write: IPTC ----------------------------------------------------------
 
 
@@ -319,7 +450,33 @@ def test_plan_compat_wide_leaves_latin1_iptc_alone() -> None:
     p = plan(existing, compat="wide")
     assert p.add_iptc == () and not p.create_iptc
     assert p.iptc_note is not None and "UTF-8" in p.iptc_note
-    assert p.add_subjects == ("garden", "shed", "sky")  # XMP still gets them
+    # XMP keywords alone would hide the owner's in apps that read XMP first,
+    # and Latin-1 can't be told from unmarked UTF-8 to copy them across.
+    assert p.add_subjects == () and p.copy_subjects == ()
+    assert p.subject_note is not None and "café" not in p.subject_note
+
+
+def test_created_iptc_record_is_remembered() -> None:
+    first = plan(compat="wide")
+    assert first.create_iptc and first.created_iptc
+    # The next run finds the record, so it no longer creates it, but undo
+    # still needs to know whose it is: the flag sticks, in any compat mode.
+    again = ExistingMeta(
+        iptc_present=True,
+        iptc_utf8=True,
+        iptc_keywords=("garden",),
+        asif={"CreatedIPTC": "True"},
+    )
+    for compat in ("wide", "xmp"):
+        p = plan(again, compat=compat)
+        assert not p.create_iptc and p.created_iptc
+
+
+def test_owner_iptc_record_is_never_claimed() -> None:
+    existing = ExistingMeta(iptc_present=True, iptc_utf8=True, iptc_keywords=("old",))
+    assert not plan(existing, compat="wide").created_iptc
+    assert not plan(compat="xmp").created_iptc
+    assert not plan(res=result(keywords=("庭" * 30,)), compat="wide").created_iptc
 
 
 def test_compat_wide_skips_formats_without_standard_iptc() -> None:
@@ -363,6 +520,18 @@ def test_own_original_hash_is_remembered() -> None:
     p = plan(existing)
     assert not p.write_original_hash
     assert p.wrote_original_hash
+
+
+def test_existing_xmp_toolkit_is_kept() -> None:
+    assert plan(ExistingMeta(xmp_toolkit="Adobe XMP Core 7.0")).keep_xmp_toolkit == (
+        "Adobe XMP Core 7.0"
+    )
+    assert plan(ExistingMeta(xmp_toolkit="")).keep_xmp_toolkit is None
+    assert plan().keep_xmp_toolkit is None
+    args = build_args(plan(ExistingMeta(xmp_toolkit="x\n-o")), PROV, lang="en")
+    # The value is copied inside exiftool; it never becomes an argument.
+    assert "-XMP-x:XMPToolkit<XMP-x:XMPToolkit" in args
+    assert not any("\n" in a or a.endswith("-o") for a in args)
 
 
 # -- plan_write: inputs ----------------------------------------------------------
@@ -436,6 +605,10 @@ def test_build_args_full() -> None:
         wrote_original_hash=True,
         caption_digest=sha("A red shed"),
         caption_lang="en",
+        copy_subjects=("Garden",),
+        all_copied_subjects=("Garden",),
+        created_iptc=True,
+        keep_xmp_toolkit="Adobe XMP Core 7.0",
     )
     assert build_args(p, PROV, lang="en") == [
         "-overwrite_original",
@@ -443,8 +616,10 @@ def test_build_args_full() -> None:
         "-XMP-dc:Description-x-default=A red shed",
         "-XMP-dc:Description-en=A red shed",
         "-XMP-dc:Description-de=",
+        "-XMP-dc:Subject+=Garden",
         "-XMP-dc:Subject+=shed",
         "-XMP-dc:Subject+=sky",
+        "-XMP-x:XMPToolkit<XMP-x:XMPToolkit",
         "-charset",
         "iptc=UTF8",
         "-IPTC:CodedCharacterSet=UTF8",
@@ -462,8 +637,10 @@ def test_build_args_full() -> None:
         "-XMP-asif:AddedKeywords=garden",
         "-XMP-asif:AddedKeywords=shed",
         "-XMP-asif:AddedKeywords=sky",
+        "-XMP-asif:CopiedKeywords=Garden",
         "-XMP-asif:AddedIPTCKeywords=shed",
         "-XMP-asif:WroteOriginalImageHash=True",
+        "-XMP-asif:CreatedIPTC=True",
     ]
 
 
@@ -478,8 +655,10 @@ def test_build_args_when_only_provenance_changes() -> None:
         "-XMP-asif:RunId=r_second",
         "-XMP-asif:Timestamp=2026:10:26 08:30:00Z",
         "-XMP-asif:AddedKeywords=",  # one empty assignment clears the list
+        "-XMP-asif:CopiedKeywords=",
         "-XMP-asif:AddedIPTCKeywords=",
         "-XMP-asif:WroteOriginalImageHash=False",
+        "-XMP-asif:CreatedIPTC=False",
     ]
 
 
@@ -555,8 +734,10 @@ _FIXED_TAGS = {
             "CaptionDigest",
             "CaptionLang",
             "AddedKeywords",
+            "CopiedKeywords",
             "AddedIPTCKeywords",
             "WroteOriginalImageHash",
+            "CreatedIPTC",
         )
     ),
 }
@@ -572,7 +753,7 @@ def assert_safe_arg_stream(args: list[str], langs: set[str]) -> list[str]:
     while i < len(args):
         arg = args[i]
         assert not any(ch in arg for ch in "\n\r\0"), "a line break would split the argument"
-        if arg in ("-overwrite_original", "-P"):
+        if arg in ("-overwrite_original", "-P", "-XMP-x:XMPToolkit<XMP-x:XMPToolkit"):
             i += 1
             continue
         if arg == "-charset":
@@ -608,6 +789,16 @@ def test_hostile_values_can_never_become_options(text: str) -> None:
     for value in values:
         assert value == value.strip()
         assert not any(ch in value for ch in "\u2028\u2029\u202e\u2066\ufffe\uffff")
+
+
+@pytest.mark.parametrize("text", HOSTILE)
+def test_hostile_iptc_keywords_copied_into_xmp_stay_data(text: str) -> None:
+    # A downloaded photo's own keywords are as untrusted as the model's.
+    existing = ExistingMeta(iptc_present=True, iptc_utf8=True, iptc_keywords=(text, "x"))
+    p = plan(existing, result(keywords=("dog",)))
+    assert p.copy_subjects
+    values = assert_safe_arg_stream(build_args(p, PROV, lang="en"), {"en"})
+    assert all(v == v.strip() for v in values)
 
 
 @pytest.mark.parametrize("text", HOSTILE)
@@ -779,6 +970,7 @@ def test_write_plain_jpg(et: ExifTool, fixture_copy: Copy) -> None:
         "CaptionLang": "en",
         "AddedKeywords": ("garden", "shed", "sky"),
         "WroteOriginalImageHash": "True",
+        "CreatedIPTC": "False",
     }
     raw = et.read_tags(path, "-XMP-et:OriginalImageHashType", "-XMP-asif:ModelSHA256")
     assert raw == {"XMP-et:OriginalImageHashType": "SHA256"}  # empty SHA: no tag at all
@@ -921,7 +1113,11 @@ def test_compat_wide_leaves_latin1_iptc_alone(et: ExifTool, fixture_copy: Copy) 
     _, record = run_writer(et, path, result(keywords=("garden", "old")), compat="wide")
     assert record.iptc_added == ()
     assert record.iptc_note is not None and "UTF-8" in record.iptc_note
-    assert record.subjects_added == ("garden", "old")  # XMP still gets them
+    # XMP keywords alone would hide the owner's ("café", "old") from apps that
+    # read XMP first, and they can't be copied across safely.
+    assert record.subjects_added == () and record.subjects_copied == ()
+    assert record.subject_note is not None
+    assert read_existing(et, path).subjects == ()
     assert et.read_tags(path, "-IPTC:all") == iptc_before
     assert b"caf\xe9" in path.read_bytes()  # still Latin-1, byte for byte
 
@@ -961,6 +1157,206 @@ def test_existing_original_hash_is_never_overwritten(et: ExifTool, fixture_copy:
     assert et.read_tags(path, "-XMP-et:OriginalImageHashType") == {
         "XMP-et:OriginalImageHashType": "MD5"
     }
+
+
+def mwg(et: ExifTool, path: Path) -> dict[str, Any]:
+    """Caption and keywords as apps following the Metadata Working Group's
+    rules (Lightroom, Bridge, ...) choose them among XMP, IPTC and EXIF."""
+    rows = et.execute_json("-use", "MWG", "-MWG:Description", "-MWG:Keywords", str(path))
+    row = dict(rows[0])
+    row.pop("SourceFile")
+    return row
+
+
+@pytest.mark.parametrize("charset", ["UTF8", "Latin"])
+def test_owner_iptc_only_caption_and_keywords_stay_visible(
+    et: ExifTool, fixture_copy: Copy, charset: str
+) -> None:
+    # A Picasa-era photo: caption and keywords in IPTC only, no XMP at all.
+    path = fixture_copy("plain.jpg")
+    marker = ["-IPTC:CodedCharacterSet=UTF8"] if charset == "UTF8" else []
+    exiftool_set(
+        et,
+        path,
+        "-charset",
+        f"iptc={charset}",
+        *marker,
+        "-IPTC:Caption-Abstract=Grandpa at the lake, 1998",
+        "-IPTC:Keywords=Grandpa",
+        "-IPTC:Keywords=lake",
+    )
+    before = mwg(et, path)
+    assert read_existing(et, path).legacy_captions == ("Grandpa at the lake, 1998",)
+    _, record = run_writer(et, path, result(keywords=("lake", "boat")))
+    assert not record.caption_written and record.caption_reason == "kept-user"
+    meta = read_existing(et, path)
+    assert meta.descriptions == {}
+    assert meta.subjects == ("Grandpa", "lake", "boat")  # the owner's first, as copied
+    assert record.subjects_copied == ("Grandpa", "lake") and record.subjects_added == ("boat",)
+    assert meta.asif["CopiedKeywords"] == ("Grandpa", "lake")
+    assert meta.asif["AddedKeywords"] == ("boat",)
+    after = mwg(et, path)
+    assert after["Description"] == before["Description"] == "Grandpa at the lake, 1998"
+    assert after["Keywords"] == ["Grandpa", "lake", "boat"]
+
+
+def test_owner_exif_caption_is_kept(et: ExifTool, fixture_copy: Copy) -> None:
+    path = fixture_copy("exif.jpg")
+    exiftool_set(et, path, "-EXIF:ImageDescription=Our wedding day, Lisbon")
+    _, record = run_writer(et, path)
+    assert record.caption_reason == "kept-user"
+    assert read_existing(et, path).descriptions == {}
+
+
+def test_camera_filler_in_exif_still_gets_a_caption(et: ExifTool, fixture_copy: Copy) -> None:
+    path = fixture_copy("exif.jpg")
+    exiftool_set(et, path, "-EXIF:ImageDescription=OLYMPUS DIGITAL CAMERA         ")
+    p, record = run_writer(et, path)
+    assert record.caption_written and record.caption_reason == "empty"
+    assert read_existing(et, path).descriptions == {"x-default": p.caption, "en": p.caption}
+
+
+def test_unmarked_latin1_iptc_keywords_get_no_xmp_keywords(
+    et: ExifTool, fixture_copy: Copy
+) -> None:
+    path = fixture_copy("user_iptc.jpg")
+    _, record = run_writer(et, path, result(keywords=("garden", "café")))
+    assert record.subjects_added == () and record.subjects_copied == ()
+    assert record.subject_note is not None
+    assert mwg(et, path)["Keywords"] == ["café", "old"]  # still the owner's
+
+
+def owner_xmp(et: ExifTool, path: Path, tmp_path: Path, subject: str) -> None:
+    """Replace the photo's XMP with a packet holding this dc:subject list."""
+    xmp = tmp_path / "owner.xmp"
+    xmp.write_text(
+        "<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='Adobe XMP Core 7.0-c000'>"
+        "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+        "<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>"
+        f"<dc:subject><rdf:Bag>{subject}</rdf:Bag></dc:subject>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='w'?>",
+        encoding="utf-8",
+    )
+    exiftool_set(et, path, f"-xmp<={xmp}")
+
+
+def test_language_tagged_keywords_are_left_alone(
+    et: ExifTool, fixture_copy: Copy, tmp_path: Path
+) -> None:
+    path = fixture_copy("plain.jpg")
+    owner_xmp(
+        et,
+        path,
+        tmp_path,
+        "<rdf:li xml:lang='de'>Hund</rdf:li><rdf:li xml:lang='fr'>chien</rdf:li>",
+    )
+    assert read_existing(et, path).subject_langs
+    p, record = run_writer(et, path, result(keywords=("dog", "beach")))
+    # exiftool would have written <rdf:li xml:lang='de'>dog</rdf:li>.
+    assert record.subjects_added == () and record.subject_note is not None
+    assert record.caption_written
+    meta = read_existing(et, path)
+    assert meta.subjects == ("Hund", "chien")
+    assert meta.asif["CaptionLang"] == "en" and meta.descriptions["en"] == p.caption
+    packet = et.execute("-b", "-XMP", str(path)).stdout
+    assert "xml:lang='de'>Hund<" in packet and "dog" not in packet
+
+
+def test_plain_keywords_are_not_language_tagged(
+    et: ExifTool, fixture_copy: Copy, tmp_path: Path
+) -> None:
+    path = fixture_copy("plain.jpg")
+    owner_xmp(et, path, tmp_path, "<rdf:li>Hund</rdf:li><rdf:li xml:lang='fr'>chien</rdf:li>")
+    assert read_existing(et, path).subject_langs  # any tagged item counts
+    path = fixture_copy("user_xmp.jpg")
+    assert not read_existing(et, path).subject_langs
+    _, record = run_writer(et, path, result(keywords=("dog",)))
+    assert record.subjects_added == ("dog",)
+    assert not read_existing(et, path).subject_langs
+
+
+def test_owner_xmp_toolkit_is_kept(et: ExifTool, fixture_copy: Copy, tmp_path: Path) -> None:
+    path = fixture_copy("plain.jpg")
+    owner_xmp(et, path, tmp_path, "<rdf:li>Garden</rdf:li>")
+    toolkit = {"XMP-x:XMPToolkit": "Adobe XMP Core 7.0-c000"}
+    assert et.read_tags(path, "-XMP-x:XMPToolkit") == toolkit
+    run_writer(et, path)
+    assert et.read_tags(path, "-XMP-x:XMPToolkit") == toolkit
+    # Without XMP there is nothing to keep: exiftool's stamp goes with the
+    # packet it made, and undo removes both.
+    bare = fixture_copy("exif.jpg")
+    run_writer(et, bare)
+    assert et.read_tags(bare, "-XMP-x:XMPToolkit")["XMP-x:XMPToolkit"].startswith("Image::ExifTool")
+
+
+def test_created_iptc_record_is_labelled(et: ExifTool, fixture_copy: Copy) -> None:
+    path = fixture_copy("plain.jpg")
+    _, record = run_writer(et, path, compat="wide")
+    assert record.iptc_created
+    assert read_existing(et, path).asif["CreatedIPTC"] == "True"
+    # A later run finds the record and creates nothing, but still says whose it is.
+    p, again = run_writer(et, path, result(keywords=("garden", "dog")), compat="wide")
+    assert not p.create_iptc and not again.iptc_created and again.iptc_added == ("dog",)
+    assert read_existing(et, path).asif["CreatedIPTC"] == "True"
+    run_writer(et, path, compat="xmp")
+    assert read_existing(et, path).asif["CreatedIPTC"] == "True"
+
+
+def test_owner_iptc_record_is_not_labelled(et: ExifTool, fixture_copy: Copy) -> None:
+    path = fixture_copy("plain.jpg")
+    exiftool_set(
+        et, path, "-charset", "iptc=UTF8", "-IPTC:CodedCharacterSet=UTF8", "-IPTC:Keywords=Jardim"
+    )
+    _, record = run_writer(et, path, result(keywords=("flor",)), compat="wide")
+    assert not record.iptc_created
+    assert read_existing(et, path).asif["CreatedIPTC"] == "False"
+
+
+def read_all(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while chunk := os.read(fd, 1 << 16):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@pytest.mark.parametrize("hard_links", [True, False], ids=["link", "no-hard-links"])
+def test_write_zeroes_the_copy_it_replaces(
+    et: ExifTool, fixture_copy: Copy, monkeypatch: pytest.MonkeyPatch, hard_links: bool
+) -> None:
+    # exiftool renames a new file over the old one: the photo as it was
+    # would otherwise be freed (or left on disk) without being overwritten.
+    path = fixture_copy("exif.jpg")
+    original = path.read_bytes()
+    if not hard_links:  # as on FAT or exFAT
+
+        def no_link(*args: Any, **kwargs: Any) -> None:
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "link", no_link)
+    fd = os.open(path, os.O_RDONLY)  # what a forensic reader could keep hold of
+    try:
+        run_writer(et, path)
+        assert os.fstat(fd).st_ino != path.stat().st_ino  # exiftool did replace it
+        old = read_all(fd)
+    finally:
+        os.close(fd)
+    assert len(old) == len(original) and old == bytes(len(old))
+    assert path.read_bytes() != original and path.read_bytes()[:2] == b"\xff\xd8"
+    assert [p.name for p in path.parent.iterdir()] == [path.name]  # no names left behind
+
+
+def test_write_never_zeroes_a_copy_with_another_name(et: ExifTool, fixture_copy: Copy) -> None:
+    # Only a private copy may be zeroed: one still reachable elsewhere is
+    # someone's file.
+    path = fixture_copy("plain.jpg")
+    original = path.read_bytes()
+    other = path.with_name("other.jpg")
+    os.link(path, other)
+    run_writer(et, path)
+    assert other.read_bytes() == original
+    assert sorted(p.name for p in path.parent.iterdir()) == sorted([path.name, other.name])
 
 
 @pytest.mark.parametrize(
@@ -1031,13 +1427,18 @@ def test_panorama(et: ExifTool, panorama: Path, tmp_path: Path) -> None:
 
 
 class ScriptedExifTool:
-    """Answers ``execute`` and ``execute_json`` from a script."""
+    """Answers ``execute`` and ``execute_json`` from a script; ``xmp`` is
+    the raw packet a ``-b -XMP`` read gets."""
 
-    def __init__(self, *, stdout: str, stderr: str = "", rows: list[dict[str, Any]]) -> None:
-        self.stdout, self.stderr, self.rows = stdout, stderr, rows
+    def __init__(
+        self, *, stdout: str, stderr: str = "", rows: list[dict[str, Any]], xmp: str = ""
+    ) -> None:
+        self.stdout, self.stderr, self.rows, self.xmp = stdout, stderr, rows, xmp
         self.calls: list[tuple[str, ...]] = []
 
     def execute(self, *args: str) -> ExecResult:
+        if args[:2] == ("-b", "-XMP"):
+            return ExecResult(self.xmp, "", [])
         self.calls.append(args)
         warnings = [line for line in self.stderr.splitlines() if line.startswith("Warning")]
         return ExecResult(self.stdout, self.stderr, warnings)
@@ -1138,6 +1539,8 @@ def test_apply_write_needs_exiftool_to_report_the_update(stdout: str, ram_file: 
         ({"XMP-dc:Subject": ["other"]}, "XMP-dc:Subject"),
         ({"XMP-asif:CaptionDigest": OTHER_HASH}, "XMP-asif:CaptionDigest"),
         ({"XMP-asif:AddedKeywords": ["secretkeyword", "extra"]}, "XMP-asif:AddedKeywords"),
+        ({"XMP-asif:CopiedKeywords": ["secretkeyword"]}, "XMP-asif:CopiedKeywords"),
+        ({"XMP-asif:CreatedIPTC": "True"}, "XMP-asif:CreatedIPTC"),
     ],
 )
 def test_apply_write_checks_the_read_back(change: dict[str, Any], tag: str, ram_file: Path) -> None:
@@ -1146,6 +1549,139 @@ def test_apply_write_checks_the_read_back(change: dict[str, Any], tag: str, ram_
     with pytest.raises(ExifToolError, match=tag) as info:
         scripted_write(tool, ram_file)
     assert "secret" not in str(info.value)
+
+
+def xmp_packet(subject_items: str, extra: str = "") -> str:
+    return (
+        "<?xpacket begin='\ufeff' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'>"
+        "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+        "<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'>"
+        f"<dc:subject><rdf:Bag>{subject_items}</rdf:Bag></dc:subject>{extra}"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>\n   \n<?xpacket end='w'?>"
+    )
+
+
+def test_apply_write_catches_keywords_labelled_with_a_language(ram_file: Path) -> None:
+    # exiftool's JSON never shows xml:lang on keywords; the raw packet does.
+    tagged = xmp_packet("<rdf:li xml:lang='de'>secretkeyword</rdf:li>")
+    tool = ScriptedExifTool(stdout="    1 image files updated\n", rows=GOOD_ROWS, xmp=tagged)
+    with pytest.raises(ExifToolError, match="XMP-dc:Subject") as info:
+        scripted_write(tool, ram_file)
+    assert "secret" not in str(info.value)
+
+
+def test_apply_write_checks_the_xmp_toolkit_was_kept(ram_file: Path) -> None:
+    rows = marked({**GOOD_ROW, "XMP-x:XMPToolkit": "Image::ExifTool 12.76"})
+    tool = ScriptedExifTool(stdout="    1 image files updated\n", rows=rows)
+    p = replace(SECRET_PLAN, keep_xmp_toolkit="Adobe XMP Core 7.0")
+    with pytest.raises(ExifToolError, match="XMP-x:XMPToolkit"):
+        apply_write(cast(ExifTool, tool), ram_file, p, PROV, lang="en")
+
+
+DTD_BOMB = (
+    "<?xml version='1.0'?><!DOCTYPE x [<!ENTITY a 'aaaaaaaaaa'>"
+    "<!ENTITY b '&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;'>]>"
+)
+
+
+@pytest.mark.parametrize(
+    ("packet", "tagged"),
+    [
+        ("", False),
+        (xmp_packet("<rdf:li>Hund</rdf:li><rdf:li>chien</rdf:li>"), False),
+        (xmp_packet("<rdf:li xml:lang='de'>Hund</rdf:li>"), True),
+        (xmp_packet("<rdf:li>Hund</rdf:li><rdf:li xml:lang=''>chien</rdf:li>"), True),
+        # A language on a caption is normal and changes nothing for keywords.
+        (
+            xmp_packet(
+                "<rdf:li>Hund</rdf:li>",
+                "<dc:description><rdf:Alt><rdf:li xml:lang='x-default'>Hi</rdf:li>"
+                "</rdf:Alt></dc:description>",
+            ),
+            False,
+        ),
+        # Anything that can't be read with certainty counts as tagged.
+        ("not xml at all", True),
+        (xmp_packet("<rdf:li>Hund</rdf:li>") + "<junk/>", True),
+        (DTD_BOMB + xmp_packet("<rdf:li>&b;</rdf:li>"), True),
+        ("<?xml version='1.0' encoding='nonsense'?>" + xmp_packet("<rdf:li>x</rdf:li>"), True),
+    ],
+)
+def test_read_existing_reads_keyword_languages_from_the_raw_packet(
+    packet: str, tagged: bool
+) -> None:
+    rows = marked({"XMP-dc:Subject": ["Hund"], "File:FileType": "JPEG"})
+    tool = ScriptedExifTool(stdout="", rows=rows, xmp=packet)
+    assert read_existing(cast(ExifTool, tool), Path("/ram/x.jpg")).subject_langs is tagged
+
+
+class ReplacingExifTool(ScriptedExifTool):
+    """Writes the way exiftool does: a new file renamed over the old one."""
+
+    def execute(self, *args: str) -> ExecResult:
+        if "-overwrite_original" in args:
+            path = Path(args[-1])
+            tmp = path.with_name(path.name + "_exiftool_tmp")
+            tmp.write_bytes(b"the new file")
+            os.replace(tmp, path)
+        return super().execute(*args)
+
+
+@pytest.mark.parametrize("hard_links", [True, False], ids=["link", "no-hard-links"])
+def test_apply_write_zeroes_the_file_it_replaced(
+    ram_file: Path, monkeypatch: pytest.MonkeyPatch, hard_links: bool
+) -> None:
+    if not hard_links:
+
+        def no_link(*args: Any, **kwargs: Any) -> None:
+            raise OSError(95, "Operation not supported")
+
+        monkeypatch.setattr(os, "link", no_link)
+    size = ram_file.stat().st_size
+    fd = os.open(ram_file, os.O_RDONLY)
+    try:
+        scripted_write(
+            ReplacingExifTool(stdout="    1 image files updated\n", rows=GOOD_ROWS), ram_file
+        )
+        assert read_all(fd) == bytes(size)
+    finally:
+        os.close(fd)
+    assert ram_file.read_bytes() == b"the new file"
+    assert [p.name for p in ram_file.parent.iterdir()] == [ram_file.name]
+
+
+@pytest.mark.parametrize("hard_links", [True, False], ids=["link", "no-hard-links"])
+@pytest.mark.parametrize("stderr", ["", "Warning: something\n"], ids=["ok", "refused"])
+def test_apply_write_leaves_a_file_it_did_not_replace_alone(
+    ram_file: Path, monkeypatch: pytest.MonkeyPatch, hard_links: bool, stderr: str
+) -> None:
+    # Nothing replaced it, so it is still the caller's file: never zeroed here.
+    if not hard_links:
+
+        def no_link(*args: Any, **kwargs: Any) -> None:
+            raise OSError(95, "Operation not supported")
+
+        monkeypatch.setattr(os, "link", no_link)
+    before = ram_file.read_bytes()
+    tool = ScriptedExifTool(stdout="    1 image files updated\n", stderr=stderr, rows=GOOD_ROWS)
+    with contextlib.suppress(ExifToolError):
+        scripted_write(tool, ram_file)
+    assert ram_file.read_bytes() == before
+    assert [p.name for p in ram_file.parent.iterdir()] == [ram_file.name]
+
+
+def test_apply_write_refuses_a_symlink(tmp_path: Path) -> None:
+    # Writing (and wiping) through a link could reach an original.
+    target = tmp_path / "original.jpg"
+    target.write_bytes(b"someone's photo")
+    link = tmp_path / "x.jpg"
+    link.symlink_to(target)
+    tool = ScriptedExifTool(stdout="    1 image files updated\n", rows=GOOD_ROWS)
+    with pytest.raises(ExifToolError, match="regular file"):
+        scripted_write(tool, link)
+    assert tool.calls == []
+    assert target.read_bytes() == b"someone's photo"
 
 
 def test_read_existing_refuses_values_the_filter_did_not_mark() -> None:
@@ -1160,3 +1696,12 @@ def test_read_existing_refuses_values_the_filter_did_not_mark() -> None:
 def test_read_existing_refuses_an_empty_answer() -> None:
     with pytest.raises(ExifToolError):
         read_existing(cast(ExifTool, ScriptedExifTool(stdout="", rows=[])), Path("/ram/x.jpg"))
+
+
+def test_the_source_hash_is_recorded_when_known() -> None:
+    p = plan()
+    with_source = replace(PROV, source_sha256="ab" * 32)
+    assert f"-XMP-asif:SourceSHA256={'ab' * 32}" in build_args(p, with_source, lang="en")
+    assert not any("SourceSHA256" in a for a in build_args(p, PROV, lang="en"))
+    with pytest.raises(ValueError):
+        build_args(p, replace(PROV, source_sha256="not-a-hash"), lang="en")

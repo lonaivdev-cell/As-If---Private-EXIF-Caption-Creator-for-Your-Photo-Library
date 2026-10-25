@@ -8,14 +8,24 @@ that and nothing else, even without the vault.
 What goes where:
 
 - caption -> ``XMP-dc:Description`` (``x-default`` + the caption language),
-  only when the photo has no description yet, or when the one it has is As
+  only when the photo has no caption yet, or when the one it has is As
   If's and nobody has edited it since (it still hashes to
-  ``XMP-asif:CaptionDigest``);
+  ``XMP-asif:CaptionDigest``). A caption in the older fields (IPTC
+  Caption-Abstract, EXIF ImageDescription) counts: an XMP one next to it
+  would hide it in apps that read XMP first. Camera filler such as
+  "OLYMPUS DIGITAL CAMERA" doesn't;
 - keywords -> appended to ``XMP-dc:Subject`` (and ``IPTC:Keywords`` with
-  ``compat = "wide"``), skipping any already there in any letter case;
+  ``compat = "wide"``), skipping any already in either, in any letter case.
+  When the photo's own keywords are only in IPTC, they are copied into the
+  new XMP list first (recorded as copied, never as As If's), so apps that
+  read XMP first still show them;
 - ``XMP-et:OriginalImageHash`` once, never overwritten;
 - provenance (``XMP-asif:*``), rewritten every time: tool, model, prompt,
-  run, time, and exactly what As If added.
+  run, time, and exactly what As If added, including an IPTC record it
+  created.
+
+exiftool stamps its name (``XMP-x:XMPToolkit``) on every XMP packet it
+writes; a stamp the photo already had is kept as it was.
 
 Planning is pure (``plan_write`` -> ``build_args``), so the rules are tested
 exhaustively without exiftool; only ``read_existing`` and ``apply_write``
@@ -24,17 +34,22 @@ touch a file.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
+import secrets
+import stat
 import unicodedata
-from collections.abc import Iterable
+import xml.etree.ElementTree as ElementTree
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from asif.infer.schema import CAPTION_MAX, KEYWORD_MAX, CaptionResult, clean_text
 from asif.meta.exiftool import ExifTool, ExifToolError, check_arg
+from asif.workdir import wipe_file
 
 CaptionReason = Literal["empty", "ours", "kept-user", "kept-edited"]
 
@@ -76,10 +91,47 @@ _READ_TAGS = (
     "-XMP-dc:Subject",
     "-XMP-asif:all",
     "-XMP-et:OriginalImageHash",
+    "-XMP-x:XMPToolkit",
     "-IPTC:all",  # any IPTC tag at all means the file has an IPTC record
+    "-IFD0:ImageDescription",
     "-File:FileType",
 )
-_ASIF_LISTS = frozenset({"AddedKeywords", "AddedIPTCKeywords"})
+_ASIF_LISTS = frozenset({"AddedKeywords", "AddedIPTCKeywords", "CopiedKeywords"})
+
+# What cameras put in EXIF ImageDescription when nobody wrote a caption,
+# matched against the whole text (whitespace collapsed, any letter case).
+# Filler missing from here costs a photo its AI caption (reported as
+# kept-user); it never hides a real caption.
+_CAMERA_FILLER = re.compile(
+    r"""
+    # OLYMPUS DIGITAL CAMERA, LEICA DIGITAL CAMERA, KODAK Digital Still Camera
+    (?:\w+\s+)?digital\s+(?:still\s+)?camera
+    # KODAK CX7530 ZOOM DIGITAL CAMERA, SAMSUNG CAMERA PICTURES
+    | (?:agfa|kodak|konica|minolta|pentax|samsung)\b.*\bcamera(?:\s+pictures?)?
+    # SONY DSC
+    | (?:sony\s+)?dsc
+    # Exif_JPEG_PICTURE, EXIF_JPEG_422
+    | exif[\s_]jpeg(?:[\s_]\w+)?
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# exiftool copies the xml:lang of a keyword list's first item onto every
+# item it appends, and none of its output formats shows these qualifiers, so
+# they are read from the raw XMP packet.
+_DC_SUBJECT = "{http://purl.org/dc/elements/1.1/}subject"
+_XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
+_DTD = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
+
+# Why XMP keywords were skipped. Plain words, never the keywords themselves.
+_NOTE_LANG_TAGGED = (
+    "XMP keywords skipped: the photo's keywords are marked with a language, "
+    "and As If's would wrongly get the same mark"
+)
+_NOTE_IPTC_ONLY = (
+    "XMP keywords skipped: they would hide the photo's own IPTC keywords in many "
+    "apps, and those aren't marked as UTF-8, so they can't be copied over safely"
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +146,11 @@ class Provenance:
     run_id: str
     timestamp: str
     """UTC, in exiftool's format: ``YYYY:MM:DD HH:MM:SSZ``."""
+    source_sha256: str = ""
+    """SHA-256 of the whole original this copy was made from; "" when not known.
+
+    Lets a later run tell As If's finished copy from one made before the
+    original was edited (the image-data hash alone can't see a fixed date)."""
 
 
 @dataclass(frozen=True)
@@ -119,6 +176,13 @@ class ExistingMeta:
     """XMP-et:OriginalImageHash, or None when the file has none."""
     iptc_supported: bool = True
     """The format has a standard place for IPTC (JPEG, TIFF)."""
+    legacy_captions: tuple[str, ...] = ()
+    """IPTC:Caption-Abstract and EXIF ImageDescription: the older homes of a caption."""
+    subject_langs: bool = False
+    """An XMP-dc:Subject item carries an xml:lang tag (or the packet couldn't
+    be read to tell), which exiftool would copy onto As If's keywords."""
+    xmp_toolkit: str | None = None
+    """XMP-x:XMPToolkit, or None when the file has none."""
 
 
 @dataclass(frozen=True)
@@ -157,6 +221,18 @@ class WritePlan:
     """SHA-256 (hex) of the caption written; None when the caption is left alone."""
     caption_lang: str | None
     """Language of the caption written; None when the caption is left alone."""
+    copy_subjects: tuple[str, ...] = ()
+    """The photo's own IPTC:Keywords, copied into XMP-dc:Subject ahead of
+    ``add_subjects`` when it has no XMP keywords yet. Never As If's."""
+    all_copied_subjects: tuple[str, ...] = ()
+    """Every keyword As If has copied that way, earlier runs included."""
+    subject_note: str | None = None
+    """Why XMP keywords were skipped, in plain words (never values)."""
+    created_iptc: bool = False
+    """As If created the IPTC record, in this run or an earlier one."""
+    keep_xmp_toolkit: str | None = None
+    """The photo's XMP-x:XMPToolkit, kept as it is (exiftool would stamp its
+    own); None when it has none."""
 
 
 @dataclass(frozen=True)
@@ -169,6 +245,12 @@ class WriteRecord:
     iptc_added: tuple[str, ...]
     original_hash_written: bool
     iptc_note: str | None
+    subjects_copied: tuple[str, ...] = ()
+    """The photo's own IPTC keywords copied into XMP-dc:Subject."""
+    iptc_created: bool = False
+    """This write created the IPTC record."""
+    subject_note: str | None = None
+    """Why XMP keywords were skipped, in plain words (never values)."""
 
 
 # -- reading -----------------------------------------------------------------
@@ -186,6 +268,8 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
     iptc_keywords: tuple[str, ...] = ()
     asif: dict[str, Any] = {}
     original_hash: str | None = None
+    toolkit: str | None = None
+    legacy: tuple[str, ...] = ()
     file_type = ""
     for key, raw in rows[0].items():
         if key == "SourceFile":
@@ -203,6 +287,10 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
             asif[name] = _many(value) if name in _ASIF_LISTS else value
         elif group == "XMP-et" and name == "OriginalImageHash":
             original_hash = _one(value)
+        elif group == "XMP-x" and name == "XMPToolkit":
+            toolkit = _one(value)
+        elif group == "IFD0" and name == "ImageDescription":
+            legacy += (_one(value),)
         elif group == "File" and name == "FileType":
             file_type = _one(value)
         elif _IPTC_GROUP.fullmatch(group):
@@ -211,7 +299,11 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
                 iptc_keywords += _many(value)
             elif name == "CodedCharacterSet":
                 iptc_utf8 = _one(value).strip().upper() == "UTF8"
+            elif name == "Caption-Abstract":
+                legacy += (_one(value),)
 
+    # Only a list that has items can lend a language tag to new ones.
+    langs = bool(subjects) and _subject_langs(et.execute("-b", "-XMP", _file_arg(path)).stdout)
     return ExistingMeta(
         descriptions=descriptions,
         subjects=subjects,
@@ -221,6 +313,34 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
         asif=asif,
         original_image_hash=original_hash,
         iptc_supported=file_type in _IPTC_FILE_TYPES,
+        legacy_captions=legacy,
+        subject_langs=langs,
+        xmp_toolkit=toolkit,
+    )
+
+
+def _subject_langs(packet: str) -> bool:
+    """Does an XMP-dc:Subject item carry an xml:lang tag?
+
+    Anything that can't be read with certainty counts as yes: the cost is
+    skipping keywords, never mislabelling them. (A tag on an enclosing
+    element makes exiftool refuse the write with a warning, so only the
+    list itself matters.)
+    """
+    if not packet.strip():
+        return False
+    if _DTD.search(packet):
+        # XMP never needs one, and a DTD can make a parser expand entities
+        # without bound. Without one, expat knows only the five XML entities.
+        return True
+    try:
+        root = ElementTree.fromstring(packet.encode("utf-8"))  # noqa: S314 (no DTD, see above)
+    except (ElementTree.ParseError, LookupError, ValueError):
+        return True
+    return any(
+        item.get(_XML_LANG) is not None
+        for subject in root.iter(_DC_SUBJECT)
+        for item in subject.iter()
     )
 
 
@@ -254,6 +374,11 @@ def _many(value: Any) -> tuple[str, ...]:
     return (str(value),)
 
 
+def _flag(value: Any) -> bool:
+    """An XMP boolean As If recorded ("True"/"False")."""
+    return _one(value).strip().lower() in ("true", "1")
+
+
 # -- planning (pure) ---------------------------------------------------------
 
 
@@ -284,14 +409,15 @@ def plan_write(
     reason, remove = _caption_rule(existing, lang)
     write_caption = reason in ("empty", "ours")
 
-    have = {_key(s) for s in existing.subjects}
-    add_subjects = tuple(k for k in keywords if _key(k) not in have)
+    copy_subjects, add_subjects, subject_note = _subject_rule(existing, keywords)
     add_iptc, create_iptc, iptc_note = _iptc_rule(existing, keywords, compat)
     write_hash = existing.original_image_hash is None
 
     prev_subjects = _many(existing.asif.get("AddedKeywords"))
+    prev_copied = _many(existing.asif.get("CopiedKeywords"))
     prev_iptc = _many(existing.asif.get("AddedIPTCKeywords"))
-    prev_wrote = _one(existing.asif.get("WroteOriginalImageHash")).strip().lower() in ("true", "1")
+    prev_wrote = _flag(existing.asif.get("WroteOriginalImageHash"))
+    prev_created = _flag(existing.asif.get("CreatedIPTC"))
     return WritePlan(
         caption=caption if write_caption else None,
         caption_reason=reason,
@@ -309,14 +435,24 @@ def plan_write(
         wrote_original_hash=prev_wrote or write_hash,
         caption_digest=_digest(caption) if write_caption else None,
         caption_lang=lang if write_caption else None,
+        copy_subjects=copy_subjects,
+        all_copied_subjects=_clean_unique(prev_copied + copy_subjects, _RECORD_MAX, fold=False),
+        subject_note=subject_note,
+        # Sticky: on the next run the record exists, so create_iptc is False.
+        created_iptc=prev_created or create_iptc,
+        keep_xmp_toolkit=existing.xmp_toolkit or None,
     )
 
 
 def _caption_rule(existing: ExistingMeta, lang: str) -> tuple[CaptionReason, tuple[str, ...]]:
     # A blank entry holds nothing to protect, so it doesn't count as a caption.
     present = {code: text for code, text in existing.descriptions.items() if text.strip()}
+    # IPTC Caption-Abstract and EXIF ImageDescription hold the same caption
+    # for older apps. An XMP caption next to one would hide it in every app
+    # that reads XMP first.
+    legacy = [text for text in existing.legacy_captions if _is_caption(text)]
     if not present:
-        return "empty", ()
+        return ("kept-user" if legacy else "empty"), ()
     digest = _one(existing.asif.get("CaptionDigest"))
     if not digest:
         return "kept-user", ()
@@ -327,8 +463,42 @@ def _caption_rule(existing: ExistingMeta, lang: str) -> tuple[CaptionReason, tup
     for code, text in present.items():
         if code.casefold() not in ours or _digest(text) != digest:
             return "kept-edited", ()
+    # As If never writes the older fields. Apps that keep them in step may
+    # copy its caption there; any other text in them is someone's edit.
+    if any(_digest(text) != digest for text in legacy):
+        return "kept-edited", ()
     keep = {"x-default", lang.casefold()}
     return "ours", tuple(code for code in present if code.casefold() not in keep)
+
+
+def _is_caption(text: str) -> bool:
+    """Is an older caption field more than blank padding or camera filler?"""
+    words = " ".join(text.replace("\0", " ").split())
+    return bool(words) and not _CAMERA_FILLER.fullmatch(words)
+
+
+def _subject_rule(
+    existing: ExistingMeta, keywords: tuple[str, ...]
+) -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+    """The photo's IPTC keywords to copy into XMP-dc:Subject first, the
+    keywords to add after them, and why none, if none."""
+    # A keyword the photo has in IPTC is the owner's, even if XMP lacks it.
+    have = {_key(k) for k in (*existing.subjects, *existing.iptc_keywords)}
+    add = tuple(k for k in keywords if _key(k) not in have)
+    if not add:
+        return (), (), None
+    if existing.subject_langs:
+        return (), (), _NOTE_LANG_TAGGED
+    if existing.subjects or not existing.iptc_keywords:
+        return (), add, None
+    # The owner's keywords are only in IPTC. Apps that read XMP first would
+    # show As If's alone and hide theirs, so the new XMP list starts with a
+    # copy of theirs, as those apps do themselves when they save keywords.
+    if not existing.iptc_utf8 and not all(k.isascii() for k in existing.iptc_keywords):
+        # IPTC not marked as UTF-8 may be Latin-1 or unmarked UTF-8; a wrong
+        # guess would copy the owner's keywords garbled.
+        return (), (), _NOTE_IPTC_ONLY
+    return _clean_unique(existing.iptc_keywords, _RECORD_MAX, fold=False), add, None
 
 
 def _iptc_rule(
@@ -380,7 +550,10 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
     elif plan.remove_caption_langs:
         raise ValueError("caption languages are only removed when a new caption replaces them")
 
-    args += [f"-XMP-dc:Subject+={k}" for k in _written_subjects(plan)]
+    args += [f"-XMP-dc:Subject+={k}" for k in (*_written_copies(plan), *_written_subjects(plan))]
+    if plan.keep_xmp_toolkit is not None:
+        # Copied inside exiftool, so the value itself never becomes an argument.
+        args.append("-XMP-x:XMPToolkit<XMP-x:XMPToolkit")
 
     iptc = _written_iptc(plan)
     if iptc:
@@ -405,6 +578,9 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
         f"-XMP-asif:RunId={_clean(prov.run_id, _PROV_MAX)}",
         f"-XMP-asif:Timestamp={prov.timestamp}",
     ]
+    if prov.source_sha256:
+        _check_hash(prov.source_sha256)
+        args.append(f"-XMP-asif:SourceSHA256={prov.source_sha256}")
     if plan.caption_digest is not None:
         _check_hash(plan.caption_digest)
         args.append(f"-XMP-asif:CaptionDigest={plan.caption_digest}")
@@ -412,8 +588,10 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
         _check_lang(plan.caption_lang)
         args.append(f"-XMP-asif:CaptionLang={plan.caption_lang}")
     args += _list_args("AddedKeywords", _written_record(plan.all_added_subjects))
+    args += _list_args("CopiedKeywords", _written_record(plan.all_copied_subjects))
     args += _list_args("AddedIPTCKeywords", _written_record(plan.all_added_iptc))
     args.append(f"-XMP-asif:WroteOriginalImageHash={plan.wrote_original_hash}")
+    args.append(f"-XMP-asif:CreatedIPTC={plan.created_iptc}")
 
     for arg in args:
         check_arg(arg)
@@ -430,6 +608,11 @@ def _list_args(tag: str, values: tuple[str, ...]) -> list[str]:
 
 def _written_subjects(plan: WritePlan) -> tuple[str, ...]:
     return _clean_unique(plan.add_subjects, KEYWORD_MAX, fold=True)
+
+
+def _written_copies(plan: WritePlan) -> tuple[str, ...]:
+    # The owner's own spellings, every one of them: no case folding.
+    return _clean_unique(plan.copy_subjects, _RECORD_MAX, fold=False)
 
 
 def _written_iptc(plan: WritePlan) -> tuple[str, ...]:
@@ -452,16 +635,22 @@ def apply_write(
     """Write ``plan`` into ``path`` in place, then read it back.
 
     The caller hands this a RAM copy, never an original. The file's access
-    and modification times are kept to the nanosecond. Raises
-    ``ExifToolError`` if exiftool fails, warns about anything, doesn't
-    report the file as updated, or the result doesn't read back as planned.
+    and modification times are kept to the nanosecond, and the copy of the
+    photo the write replaces is overwritten with zeros. Raises
+    ``ExifToolError`` if the file isn't a regular file, exiftool fails,
+    warns about anything or doesn't report the file as updated, or the
+    result doesn't read back as planned.
     """
     args = build_args(plan, prov, lang=lang)
     try:
-        before = path.stat()
+        before = os.lstat(path)
     except OSError as exc:
         raise ExifToolError(f"can't read the file to write to: {exc.strerror}") from exc
-    result = et.execute(*args, _file_arg(path))
+    if not stat.S_ISREG(before.st_mode):
+        # A link could lead the write, and the wipe after it, to another file.
+        raise ExifToolError("refusing to write to anything but a regular file")
+    with _wiping_replaced_inode(path):
+        result = et.execute(*args, _file_arg(path))
     if result.warnings:
         raise ExifToolError(
             f"exiftool warned about the write ({len(result.warnings)} warning(s))", result.stderr
@@ -479,7 +668,67 @@ def apply_write(
         iptc_added=_written_iptc(plan),
         original_hash_written=plan.write_original_hash,
         iptc_note=plan.iptc_note,
+        subjects_copied=_written_copies(plan),
+        iptc_created=plan.create_iptc and bool(_written_iptc(plan)),
+        subject_note=plan.subject_note,
     )
+
+
+@contextlib.contextmanager
+def _wiping_replaced_inode(path: Path) -> Iterator[None]:
+    """Zero the file ``path`` names now, once a write has replaced it.
+
+    exiftool never writes in place: it writes a new file and renames it over
+    ``path``. The old inode, the whole photo as it was, is unlinked without
+    being overwritten, and wiping ``path`` later only reaches the new one.
+    A second name for it (or, where hard links aren't possible, as on FAT,
+    an open descriptor) keeps it reachable so it can be zeroed. Nothing is
+    zeroed while anything else still names it: a write that didn't replace
+    it leaves the caller's file as it was.
+    """
+    name = path.with_name(f"{secrets.token_hex(8)}.pre-write")
+    link: Path | None = name
+    fd: int | None = None
+    try:
+        os.link(path, name)
+    except OSError:
+        link = None
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+        except OSError as exc:
+            raise ExifToolError(f"can't open the file to write to: {exc.strerror}") from exc
+    try:
+        yield
+    finally:
+        if link is not None:
+            try:
+                only_ours = link.stat().st_nlink == 1
+            except OSError:
+                only_ours = False
+            if only_ours:
+                wipe_file(link)
+            else:
+                link.unlink(missing_ok=True)
+        elif fd is not None:
+            try:
+                if os.fstat(fd).st_nlink == 0:
+                    _zero_fd(fd)
+            finally:
+                os.close(fd)
+
+
+def _zero_fd(fd: int) -> None:
+    """Overwrite an open file with zeros: ``wipe_file`` for a file with no name left."""
+    size = os.fstat(fd).st_size
+    chunk = bytes(min(size, 1 << 20))
+    offset = 0
+    with contextlib.suppress(OSError):  # best effort, as in wipe_file
+        while offset < size:
+            written = os.pwrite(fd, chunk[: size - offset], offset)
+            if written <= 0:
+                break
+            offset += written
+        os.fsync(fd)
 
 
 def _verify(after: ExistingMeta, plan: WritePlan, lang: str) -> None:
@@ -494,18 +743,25 @@ def _verify(after: ExistingMeta, plan: WritePlan, lang: str) -> None:
             wrong.append("XMP-dc:Description")
         if _one(after.asif.get("CaptionDigest")) != plan.caption_digest:
             wrong.append("XMP-asif:CaptionDigest")
-    if not set(_written_subjects(plan)) <= set(after.subjects):
+    subjects = set(_written_copies(plan)) | set(_written_subjects(plan))
+    # The exiftool reads behind every other check can't see language tags.
+    if not subjects <= set(after.subjects) or (subjects and after.subject_langs):
         wrong.append("XMP-dc:Subject")
     if not set(_written_iptc(plan)) <= set(after.iptc_keywords):
         wrong.append("IPTC:Keywords")
     if plan.write_original_hash and after.original_image_hash != plan.image_hash:
         wrong.append("XMP-et:OriginalImageHash")
+    if plan.keep_xmp_toolkit is not None and after.xmp_toolkit != plan.keep_xmp_toolkit:
+        wrong.append("XMP-x:XMPToolkit")
     for tag, values in (
         ("AddedKeywords", plan.all_added_subjects),
+        ("CopiedKeywords", plan.all_copied_subjects),
         ("AddedIPTCKeywords", plan.all_added_iptc),
     ):
         if _many(after.asif.get(tag)) != _written_record(values):
             wrong.append(f"XMP-asif:{tag}")
+    if _flag(after.asif.get("CreatedIPTC")) != plan.created_iptc:
+        wrong.append("XMP-asif:CreatedIPTC")
     if wrong:
         raise ExifToolError(f"the write didn't read back as planned: {', '.join(wrong)}")
 

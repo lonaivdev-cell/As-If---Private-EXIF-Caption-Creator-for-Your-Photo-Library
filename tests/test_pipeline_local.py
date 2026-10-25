@@ -131,7 +131,13 @@ def test_m1_checkpoint(library: Path, cfg: Config, tmp_path: Path) -> None:
             tags = et.read_tags(out_path, "-XMP-dc:all", "-XMP-asif:all", "-XMP-et:all")
             subjects = tags.get("XMP-dc:Subject")
             subjects = subjects if isinstance(subjects, list) else [subjects]
-            assert "stub" in subjects
+            if outcome.rel.endswith("user_iptc.jpg"):
+                # The owner's keywords are Latin-1 IPTC that can't be copied into
+                # XMP safely; XMP keywords would hide them in most apps, so none.
+                assert "XMP-dc:Subject" not in tags
+                assert "keyword" in outcome.note
+            else:
+                assert "stub" in subjects
             assert tags["XMP-asif:RunId"] == "r_test"
             assert tags["XMP-asif:ModelId"] == "stub"
             assert tags["XMP-et:OriginalImageHashType"] == "SHA256"
@@ -143,7 +149,7 @@ def test_m1_checkpoint(library: Path, cfg: Config, tmp_path: Path) -> None:
                 assert tags["XMP-dc:Description"]
 
     # No plaintext left behind in the work dir, no temp files in the output.
-    assert list((tmp_path / "ram").iterdir()) == []
+    assert not any(p.is_file() for p in (tmp_path / "ram").rglob("*"))
     assert not [p for p in dest.rglob(".*") if p.is_file()]
 
 

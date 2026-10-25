@@ -127,7 +127,7 @@ Use full-disk encryption and a machine you trust.
 5. **Write.** The writer applies the tags to the RAM copy and computes `ImageDataHash` again (H1).
 6. **Gate.** Gates run: H0 == H1, protected fields unchanged, remote unchanged (§7).
 7. **Upload.** The adapter uploads the RAM copy; the orchestrator confirms the remote fingerprint.
-8. **Clean up.** Thumbnail, catalogue row and undo journal go to the vault. The RAM copy is overwritten and unlinked, and the staged ciphertext is deleted.
+8. **Clean up.** Thumbnail, catalogue row and undo journal go to the vault. The RAM copy is overwritten and unlinked (including the pre-write copy that exiftool's rename replaces), and the staged ciphertext is deleted.
 
 **Linear mode** is the same loop with a batch size of 1 and **no disk staging at all**: download goes straight into RAM, then describe, write, gate, upload, wipe. It is slowest but needs almost no disk and very little RAM.
 
@@ -176,12 +176,12 @@ DISCOVERED → STAGED → OPENED → DESCRIBED → WRITTEN → VERIFIED → UPLO
    exiftool -api requesttags=imagedatahash -api imagehashtype=SHA256 -s3 -ImageDataHash photo.jpg
    ```
 2. **Protected-fields gate.** These must be identical before and after: `DateTimeOriginal`, `CreateDate`, `GPS*`, `Orientation`, ICC profile and MakerNotes. Compare `exiftool -json -G1` dumps restricted to those tags.
-   *As built:* the comparison covers **every** tag outside As If's own fields, not just the list above: `exiftool -json -n -G1:4 -a -b -all:all -ICC_Profile -MakerNotes`. `-n` compares raw values (a 1e-7° GPS move prints the same but is caught); `-G1:4` keeps repeated tags that plain `-G1` JSON drops; the raw ICC and maker-note blocks and every binary tag (thumbnails, previews) are compared byte-for-byte. Bookkeeping that legitimately changes (WebP's VP8X flags, TIFF strip offsets, MPF's absolute image offsets) is allowed by exact tag name in `src/asif/meta/gates.py`, each with the reason.
+   *As built:* the comparison covers **every** tag outside As If's own fields, not just the list above: `exiftool -json -n -G1:4 -a -u -b -all:all -ICC_Profile -MakerNotes`. `-n` compares raw values (a 1e-7° GPS move prints the same but is caught); `-G1:4` keeps repeated tags that plain `-G1` JSON drops; `-u` includes unknown tags; the raw ICC block and every binary tag (thumbnails, previews) are compared byte for byte. For maker notes exiftool returns its rebuilt block, so their raw byte identity is proven by the structure gate (JPEG, PNG, WebP), and TIFFs with maker notes are skipped. Bookkeeping that legitimately changes (WebP's VP8X flags, the strip, tile and thumbnail offsets of every TIFF IFD, MPF's absolute image offsets) is allowed by exact tag name in `src/asif/meta/gates.py`, each with the reason. Inside As If's own fields the gate still protects the owner: XMP-dc:Subject and IPTC:Keywords may only gain values, XMP-dc:Description entries may only change if they hash to the CaptionDigest recorded before the write, and OriginalImageHash and the IPTC charset and record versions are write-once.
 3. **Trailer gate (JPEG).** Bytes after the image data must be identical, because Samsung and Google "motion photos" embed video there. If As If can't prove it, it skips the file.
 4. **Remote-unchanged gate.** The remote fingerprint now must equal the fingerprint at download time (size + mtime, plus revision or hash when the adapter exposes it). Otherwise the item becomes `SKIPPED_CONFLICT`.
 5. **Size sanity.** `processed_size − original_size < 64 KiB`, so a runaway write can't bloat files.
 
-*Added while building M1:* a **structure gate** for JPEG, PNG and WebP. Apart from the XMP packet (and IPTC when `compat = "wide"`), every segment or chunk of the file must be byte-identical and in the same order. This catches changes `ImageDataHash` can't see, such as a rewritten MPF (multi-picture) index.
+*Added while building M1:* a **structure gate** for JPEG, PNG and WebP. Apart from the XMP packet (and IPTC when `compat = "wide"`), every segment or chunk of the file must be byte-identical and in the same order. This catches changes `ImageDataHash` can't see, such as a rewritten MPF (multi-picture) index. For TIFF, which exiftool rebuilds, the snapshot instead proves every byte is reachable from an IFD exiftool rewrites (padding and zero filler aside). For every format, the XMP packet's own text values must all survive, read with an XML parser rather than exiftool's. Files the gates can't prove (maker-note TIFFs, unreferenced TIFF data, markup inside XMP values, orphaned extended XMP, ImageMagick raw-profile PNGs, unknown formats) are skipped before the model runs, as a format limitation rather than a failure.
 
 **After upload:**
 
@@ -190,7 +190,7 @@ DISCOVERED → STAGED → OPENED → DESCRIBED → WRITTEN → VERIFIED → UPLO
    - `verify = "sampled"` (default) does the same for 5 % of items.
    - `verify = "fingerprint"` trusts the listing.
 
-**Additive-only rule.** As If writes only to fields that are empty or already carry As If provenance. It never removes or rewrites your data.
+**Additive-only rule.** As If writes only to fields that are empty or already carry As If provenance. It never removes or rewrites your data. *As built:* enforced twice, by the writer's plan and by the protected gate, which doesn't trust the writer.
 
 The undo journal records exactly which fields were added. `asif undo --run <id>` strips only those fields and re-uploads, with all gates applied again.
 
@@ -234,17 +234,17 @@ There is no self-reported "confidence" field, because small models' confidence n
 
 | Data | Written to | Rule |
 |---|---|---|
-| caption | `XMP-dc:Description` (lang-alt: `x-default` + configured language) | only if empty or previously written by As If |
-| keywords | `XMP-dc:Subject` (+ `IPTC:Keywords` when `compat = "wide"`) | append + dedupe; never remove existing |
+| caption | `XMP-dc:Description` (lang-alt: `x-default` + configured language) | only if no caption exists (XMP-dc:Description, IPTC Caption-Abstract, EXIF ImageDescription; camera filler ignored) or previously written by As If |
+| keywords | `XMP-dc:Subject` (+ `IPTC:Keywords` when `compat = "wide"`) | append + dedupe against XMP and IPTC; IPTC-only keywords are copied into XMP first (UTF-8 or ASCII only, else no XMP keywords are added); never remove existing |
 | provenance | `XMP-asif:*` (custom namespace via exiftool config file): tool version, model id, model SHA-256, prompt version, run id, UTC timestamp | always |
 | integrity | `OriginalImageHash` / `OriginalImageHashType` | once; never overwritten |
 | **never touched** | dates, GPS, orientation, ICC, MakerNotes, embedded previews, RAW data | — |
 
-*As built:* the provenance record also says exactly what As If added — `CaptionDigest` (SHA-256 of the caption it wrote) and `CaptionLang`, `AddedKeywords`, `AddedIPTCKeywords`, `WroteOriginalImageHash` — so "previously written by As If" means "As If wrote it *and nobody has edited it since*", and undo works from the file alone, even without the vault. The namespace is defined in `src/asif/meta/asif_ns.config`.
+*As built:* the provenance record also says exactly what As If added — `CaptionDigest` (SHA-256 of the caption it wrote) and `CaptionLang`, `AddedKeywords`, `CopiedKeywords` (your IPTC keywords it copied into XMP), `AddedIPTCKeywords`, `WroteOriginalImageHash`, `CreatedIPTC` — so "previously written by As If" means "As If wrote it *and nobody has edited it since*", and undo works from the file alone, even without the vault. `SourceSHA256` (of the whole original) lets a re-run tell a finished copy from one made before the original was edited. An existing `XMP-x:XMPToolkit` stamp is kept. The namespace is defined in `src/asif/meta/asif_ns.config`.
 
 ### Formats
 
-- **In-place writes (v1):** JPEG, PNG, WebP, TIFF.
+- **In-place writes (v1):** JPEG, PNG, WebP, TIFF. *As built:* a file the gates can't prove safe (see §7) is skipped and reported, not written.
 - **HEIC/AVIF:** enabled only after the fixture pass proves round-trip safety on *your* exiftool version (check exiftool's supported-formats table).
 - **RAW** (DNG, CR3, NEF, ARW…): sidecar `.xmp` only, never written into the file.
 - **Video:** out of scope for v1.

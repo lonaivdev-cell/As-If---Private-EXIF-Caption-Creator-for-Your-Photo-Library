@@ -458,3 +458,59 @@ def test_commit_never_replaces_an_existing_file(tmp_path: Path) -> None:
     dest.write_bytes(b"someone else's")
     assert not local._commit(ram, dest, 0o644)
     assert dest.read_bytes() == b"someone else's"
+
+
+# -- files the gates can't vouch for, and copies that went stale ------------
+
+
+def test_a_copy_of_an_older_original_is_not_mistaken_for_done(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    import subprocess
+
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy2(fixtures_dir / "exif.jpg", src / "a.jpg")
+    assert _states(_run(src, tmp_path / "out", cfg, tmp_path)) == {"a.jpg": State.CLEAN}
+    # The owner fixes the date in the original; the pixels don't change.
+    subprocess.run(
+        [
+            "exiftool",
+            "-q",
+            "-overwrite_original",
+            "-DateTimeOriginal=2019:07:15 10:20:30",
+            str(src / "a.jpg"),
+        ],
+        check=True,
+    )
+    rerun = _run(src, tmp_path / "out", cfg, tmp_path)
+    (outcome,) = rerun.outcomes
+    assert outcome.state == State.SKIPPED_CONFLICT
+    assert "changed after its copy was made" in outcome.reason
+
+
+def test_multi_page_tiffs_are_captioned(cfg: Config, tmp_path: Path) -> None:
+    from tests.test_structure import pillow_tiff
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(6):  # past the failure budget, if they were refused as bugs
+        (src / f"scan{i}.tif").write_bytes(pillow_tiff(pages=3, compression="tiff_lzw"))
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is None
+    assert set(_states(summary).values()) == {State.CLEAN}
+
+
+def test_tiffs_with_maker_notes_are_skipped_as_a_format_limit(cfg: Config, tmp_path: Path) -> None:
+    from tests.test_gates import _canon_exif
+
+    src = tmp_path / "src"
+    src.mkdir()
+    tiff, _note = _canon_exif(image=True)
+    for i in range(6):
+        (src / f"raw{i}.tif").write_bytes(tiff)
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is None
+    assert set(_states(summary).values()) == {State.SKIPPED_FORMAT}
+    assert all("maker notes" in o.reason and not o.systematic for o in summary.outcomes)
+    assert not (tmp_path / "out").exists() or not any((tmp_path / "out").rglob("*.tif"))

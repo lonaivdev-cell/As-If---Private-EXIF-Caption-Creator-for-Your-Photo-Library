@@ -2,14 +2,18 @@
 processed copy is allowed to replace anything.
 
 Before writing, ``snapshot`` records the RAM copy: its image-data hash, a
-full tag dump and (for JPEG, PNG and WebP) its bytes. After writing,
-``check_written`` runs, in order:
+full tag dump, the XMP's own text and (for JPEG, PNG and WebP) its bytes.
+It also says when a write to the file *can't* be proven safe
+(``Snapshot.unprovable``): such a file is refused, never written. After
+writing, ``check_written`` runs, in order:
 
 1. ``equality``: exiftool's SHA-256 ``ImageDataHash`` is unchanged.
-2. ``protected``: every tag outside the ones As If writes is unchanged.
+2. ``protected``: every tag outside the ones As If writes is unchanged,
+   and the ones it writes only gained values (additive-only).
 3. ``trailer``: a JPEG's bytes after the primary image are unchanged
    (motion-photo video, MPF images), and must be provably so.
-4. ``structure``: ``asif.meta.structure.compare``, byte for byte.
+4. ``structure``: ``asif.meta.structure.compare``, byte for byte, and
+   every value of the original XMP still there, read without exiftool.
 5. ``size``: the file grew by less than 64 KiB.
 
 ``check_source_unchanged`` is the design's gate 4 (``remote-unchanged``).
@@ -23,9 +27,11 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import mmap
 import os
 import re
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -40,7 +46,8 @@ MAX_GROWTH = 64 * 1024
 _HASH_CHUNK = 1 << 20
 
 # Formats whose bytes are kept in the snapshot for the trailer and structure
-# gates. TIFFs can be huge and have no structure check, so they aren't.
+# gates. TIFFs can be huge, and exiftool rebuilds them, so their bytes can't
+# match anyway: they are checked through a memory map instead.
 _KEEP_BYTES = frozenset({"jpeg", "png", "webp"})
 
 # The tag dump. Deliberately stricter than a plain ``-json -G1 -a -b``:
@@ -49,10 +56,16 @@ _KEEP_BYTES = frozenset({"jpeg", "png", "webp"})
 #   -G1:4     with plain -G1, exiftool's JSON silently drops the second of
 #             two same-named tags in one group (two COM segments, say).
 #             Family 4 tells the copies apart; ``_dump_tags`` renumbers them.
+#   -u        unknown tags too (a scanner's private TIFF tags, say): without
+#             it they aren't compared at all.
 #   -b        binary values come back base64-encoded, compared byte for byte.
 #   -ICC_Profile -MakerNotes
-#             the raw blocks; -all:all only lists the tags decoded from them.
-_DUMP_ARGS = ("-json", "-n", "-G1:4", "-a", "-b", "-all:all", "-ICC_Profile", "-MakerNotes")
+#             the blocks themselves; -all:all only lists the tags decoded
+#             from them. exiftool rebuilds a maker note when it reads it, so
+#             this is its decoding, not the raw bytes: the structure gate
+#             compares those (JPEG, PNG, WebP), and a TIFF with a maker note
+#             is refused (``Snapshot.unprovable``).
+_DUMP_ARGS = ("-json", "-n", "-G1:4", "-a", "-u", "-b", "-all:all", "-ICC_Profile", "-MakerNotes")
 # File-system dates, exiftool's own version and values derived from other tags.
 _SKIP_GROUPS = frozenset({"System", "ExifTool", "Composite"})
 
@@ -105,35 +118,101 @@ _FORMAT_BOOKKEEPING: dict[str, frozenset[str]] = {
             "RIFF:ImageHeight#2",
         }
     ),
-    "tiff": frozenset(
-        {
-            # exiftool rewrites a TIFF and moves its image data. The equality
-            # gate hashes the data these point at; the byte counts are compared.
-            "IFD0:StripOffsets",
-            "IFD0:TileOffsets",
-        }
-    ),
 }
+# TIFF: exiftool rewrites the whole file and moves the data of every IFD
+# (every page, reduced-size preview and thumbnail). Where it sits may
+# change, never what: exiftool's ImageDataHash covers the strips and tiles
+# of every TIFF IFD outside maker notes (a byte flipped in page 2 changes
+# it), the byte counts are still compared, and so is the thumbnail itself
+# (IFDn:ThumbnailImage, as binary). Not for JPEG: there the hash doesn't
+# cover EXIF's IFD1, and nothing in a JPEG's EXIF may move anyway.
+_TIFF_MOVED = re.compile(
+    r"IFD\d+:(?:StripOffsets|TileOffsets|ThumbnailOffset)|SubIFD\d*:(?:StripOffsets|TileOffsets)"
+)
 # MPF (JPEG): exiftool reports where each extra image starts as an absolute
 # file offset, so it moves when the XMP in front of it grows. The stored,
 # relative offset must not change: the structure gate compares the MPF
 # segment byte for byte, and the trailer gate the images themselves.
 _MPF_IMAGE_START = re.compile(r"MPImage\d+:MPImageStart")
 
+# Allowed doesn't mean anything goes: the fields As If writes are
+# additive-only (§7), and the protected gate checks that itself rather than
+# trusting the writer.
+# - Keywords: every value there before is still there after, as often.
+_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "xmp": ("XMP-dc:Subject",),
+    "wide": ("XMP-dc:Subject", "IPTC:Keywords"),  # with "xmp", IPTC can't change at all
+}
+# - Set once, then never changed: As If may add these, but a value already
+#   there stays exactly as it was. Relabelling Latin-1 IPTC as UTF-8, say,
+#   would garble the owner's keywords.
+_WRITE_ONCE = frozenset({"XMP-et:OriginalImageHash", "XMP-et:OriginalImageHashType"})
+_WRITE_ONCE_IPTC = frozenset(
+    {"IPTC:CodedCharacterSet", "IPTC:EnvelopeRecordVersion", "IPTC:ApplicationRecordVersion"}
+)
+# - Captions: one may change only if it was As If's own, i.e. it hashes to
+#   the XMP-asif:CaptionDigest recorded *before* the write.
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_caption(base: str) -> bool:
+    # x-default is plain "Description", other languages "Description-pt-BR".
+    return base == "XMP-dc:Description" or base.startswith("XMP-dc:Description-")
+
 
 def _allowed(key: str, fmt: str, compat: Literal["xmp", "wide"]) -> bool:
     base = key.partition("#")[0]
     group = base.partition(":")[0]
-    if base in _OURS or group in _OURS_GROUPS:
-        return True
-    # Captions: x-default is plain "Description", other languages "Description-pt-BR".
-    if base == "XMP-dc:Description" or base.startswith("XMP-dc:Description-"):
+    if base in _OURS or group in _OURS_GROUPS or _is_caption(base):
         return True
     if compat == "wide" and base in _IPTC:
         return True
     if key in _FORMAT_BOOKKEEPING.get(fmt, ()):
         return True
+    if fmt == "tiff" and _TIFF_MOVED.fullmatch(key):
+        return True
     return fmt == "jpeg" and _MPF_IMAGE_START.fullmatch(key) is not None
+
+
+def _ours_or_blank(text: object, digest: object) -> bool:
+    """A caption As If may replace: As If's own (it hashes to ``digest``), or blank.
+
+    A blank entry holds nothing to protect, which is the writer's rule too.
+    A non-string (exiftool's JSON turns "2019" into 2019) is never As If's.
+    """
+    if not isinstance(text, str):
+        return False
+    if not text.strip():
+        return True
+    return (
+        isinstance(digest, str)
+        and _HEX64.fullmatch(digest) is not None
+        and hashlib.sha256(text.encode("utf-8")).hexdigest() == digest
+    )
+
+
+def _owned(tags: dict[str, Any], compat: Literal["xmp", "wide"]) -> dict[str, Any]:
+    """Values in fields As If writes that are not As If's to change: the
+    owner's captions, and write-once fields already set."""
+    digest = tags.get("XMP-asif:CaptionDigest")
+    once = (_WRITE_ONCE | _WRITE_ONCE_IPTC) if compat == "wide" else _WRITE_ONCE
+    return {
+        key: value
+        for key, value in tags.items()
+        if key.partition("#")[0] in once
+        or (_is_caption(key.partition("#")[0]) and not _ours_or_blank(value, digest))
+    }
+
+
+def _list_values(tags: dict[str, Any], name: str) -> Counter[str]:
+    """Every value of a list tag, all copies together, with how often it occurs."""
+    out: Counter[str] = Counter()
+    for key, value in tags.items():
+        if key.partition("#")[0] == name:
+            # One item comes back as a scalar. JSON text keeps 1, "1" and true apart.
+            for item in value if isinstance(value, list) else [value]:
+                out[json.dumps(item)] += 1
+    return out
 
 
 # -- records ------------------------------------------------------------------
@@ -162,6 +241,17 @@ class Snapshot:
     """The full tag dump, keyed ``Group:Tag`` (``Group:Tag#2`` for a second copy)."""
     data: bytes | None = field(repr=False)
     """The whole file for JPEG, PNG and WebP; None otherwise (TIFFs can be huge)."""
+    xmp: Counter[str] = field(repr=False)
+    """The XMP's own values, read without exiftool (``structure.read_xmp``)."""
+    unprovable: str | None
+    """Why no write to this file can be proven safe, in plain words, or None.
+
+    Set for a file the gates can't check (an unknown format, a structure
+    that can't be parsed) and for one exiftool can't write without losing
+    or rewriting something: a TIFF with a maker note or with bytes nothing
+    points to, XMP with markup inside a value. It is a limit of the format
+    or of exiftool, not a sign of a bug, so the caller should skip the file
+    before writing. The structure gate fails for it regardless."""
 
 
 @dataclass(frozen=True)
@@ -219,17 +309,49 @@ def _dump_tags(et: ExifTool, path: Path) -> dict[str, Any]:
     return tags
 
 
+@contextlib.contextmanager
+def _mapped(path: Path) -> Iterator[mmap.mmap]:
+    """The file, memory-mapped read-only: a large TIFF isn't copied into memory."""
+    with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        yield view
+
+
 def snapshot(et: ExifTool, path: Path) -> Snapshot:
     """Record ``path`` before writing. Raises ``ExifToolError`` if exiftool can't read it."""
     image_hash = et.image_data_hash(path)
     tags = _dump_tags(et, path)
     with path.open("rb") as fh:
         fmt = detect_format(fh.read(16)) or "other"
-    if fmt not in _KEEP_BYTES:
+    data = path.read_bytes() if fmt in _KEEP_BYTES else None
+    xmp, unprovable = _inspect(path, fmt, data)
+    if data is None:
         fp = fingerprint(path)
-        return Snapshot(fmt, image_hash, fp.size, fp.sha256, tags, None)
-    data = path.read_bytes()
-    return Snapshot(fmt, image_hash, len(data), hashlib.sha256(data).hexdigest(), tags, data)
+        return Snapshot(fmt, image_hash, fp.size, fp.sha256, tags, None, xmp, unprovable)
+    digest = hashlib.sha256(data).hexdigest()
+    return Snapshot(fmt, image_hash, len(data), digest, tags, data, xmp, unprovable)
+
+
+def _inspect(path: Path, fmt: str, data: bytes | None) -> tuple[Counter[str], str | None]:
+    """The XMP's own values, and why no write can be proven safe (None if one can)."""
+    if fmt not in _KEEP_BYTES and fmt != "tiff":
+        return Counter(), "As If can't check this file type byte by byte"
+    try:
+        if data is not None:
+            text = structure.read_xmp(data)
+            return text.values, text.problem
+        with _mapped(path) as view:
+            layout = structure.tiff_layout(view)
+            text = structure.read_xmp(view)
+    except StructureError as exc:
+        return Counter(), f"its structure can't be checked: {exc}"
+    if layout.maker_notes:
+        # exiftool moves the note, rewrites the offsets inside it and drops
+        # any bytes nothing in it points to: "never touched" can't hold.
+        return text.values, "it's a TIFF with maker notes, which exiftool would rewrite"
+    if layout.unreferenced:
+        unreferenced = f"the TIFF holds {layout.unreferenced} bytes nothing points to"
+        return text.values, f"{unreferenced}, which exiftool would drop"
+    return text.values, text.problem
 
 
 def _names(label: str, keys: Iterable[str], limit: int = 8) -> str:
@@ -259,13 +381,25 @@ def _protected(
         tags = _dump_tags(et, after)
     except ExifToolError:
         return GateResult("protected", False, "exiftool can't read the written file")
-    old = {k: v for k, v in before.tags.items() if not _allowed(k, before.fmt, compat)}
-    new = {k: v for k, v in tags.items() if not _allowed(k, before.fmt, compat)}
+    # The owner's values in fields As If writes are compared like any other tag.
+    owned = _owned(before.tags, compat)
+    old = {k: v for k, v in before.tags.items() if not _allowed(k, before.fmt, compat)} | owned
+    new = {k: v for k, v in tags.items() if k in owned or not _allowed(k, before.fmt, compat)}
     changed = [k for k in old.keys() & new.keys() if old[k] != new[k]]
     added, removed = new.keys() - old.keys(), old.keys() - new.keys()
+    lost = [
+        name
+        for name in _KEYWORDS[compat]
+        if _list_values(before.tags, name) - _list_values(tags, name)
+    ]
     parts = [
         _names(label, keys)
-        for label, keys in (("changed", changed), ("added", added), ("removed", removed))
+        for label, keys in (
+            ("changed", changed),
+            ("added", added),
+            ("removed", removed),
+            ("lost values", lost),
+        )
         if keys
     ]
     return GateResult("protected", not parts, "; ".join(parts))
@@ -290,23 +424,61 @@ def _trailer(before: Snapshot, after_data: bytes | None) -> GateResult:
 
 
 def _structure(
-    before: Snapshot, after_data: bytes | None, compat: Literal["xmp", "wide"]
+    before: Snapshot, after: Path, after_data: bytes | None, compat: Literal["xmp", "wide"]
 ) -> GateResult:
-    if before.fmt not in _KEEP_BYTES:
-        return GateResult("structure", True, "n/a")
-    if before.data is None or after_data is None:
-        return GateResult("structure", False, "can't prove the structure is intact: file not read")
-    try:
-        diffs = structure.compare(before.data, after_data, allow_iptc=compat == "wide")
-    except StructureError:
-        return GateResult("structure", False, "can't prove the structure is intact: can't parse it")
-    if diffs is None:
-        # The snapshot says JPEG/PNG/WebP but the bytes aren't: never assume.
-        return GateResult("structure", False, "can't prove the structure is intact: unknown format")
+    cant = "can't prove the structure is intact"
+    if before.unprovable is not None:
+        return GateResult("structure", False, f"can't prove a write is safe: {before.unprovable}")
+    diffs: list[str] = []
+    text: structure.XmpText | None = None
+    if before.fmt == "tiff":
+        # exiftool rebuilds a TIFF, so its bytes can't match; the snapshot
+        # proved every byte is something exiftool carries over. That leaves
+        # the XMP's own text.
+        try:
+            with _mapped(after) as view:
+                if detect_format(view[:16]) != "tiff":
+                    return GateResult("structure", False, "the written file isn't a TIFF any more")
+                text = structure.read_xmp(view)
+        except StructureError:  # before ValueError: it is one
+            text = None
+        except (OSError, ValueError):  # ValueError: an empty file can't be mapped
+            return GateResult("structure", False, f"{cant}: file not read")
+    else:
+        if before.data is None or after_data is None:
+            return GateResult("structure", False, f"{cant}: file not read")
+        try:
+            found = structure.compare(before.data, after_data, allow_iptc=compat == "wide")
+        except StructureError:
+            return GateResult("structure", False, f"{cant}: can't parse it")
+        if found is None:
+            # The snapshot says JPEG/PNG/WebP but the bytes aren't: never assume.
+            return GateResult("structure", False, f"{cant}: unknown format")
+        diffs = found
+        with contextlib.suppress(StructureError):
+            text = structure.read_xmp(after_data)
+    if text is None:
+        if not diffs:  # a file that changed format can't be read as before: said already
+            diffs.append("the written XMP can't be read")
+    elif lost := _xmp_lost(before, text.values):
+        diffs.append(f"{lost} of the original XMP's values went missing")
     if diffs:
         more = f" (+{len(diffs) - 3} more)" if len(diffs) > 3 else ""
         return GateResult("structure", False, "; ".join(diffs[:3]) + more)
     return GateResult("structure", True)
+
+
+def _xmp_lost(before: Snapshot, after: Counter[str]) -> int:
+    """How many of the original XMP's values are gone, As If's own old caption aside.
+
+    exiftool reads the XMP into tags and writes it back from them, so a
+    value its parser misses (text beside markup, say) vanishes without a
+    warning, and the protected gate, which uses the same parser, can't see
+    it. This compares the packets' own text.
+    """
+    digest = before.tags.get("XMP-asif:CaptionDigest")
+    missing = before.xmp - after
+    return sum(n for value, n in missing.items() if not _ours_or_blank(value, digest))
 
 
 def _size(before: Snapshot, after: Path) -> GateResult:
@@ -336,7 +508,7 @@ def check_written(
         _equality(et, before, after),
         _protected(et, before, after, compat),
         _trailer(before, after_data),
-        _structure(before, after_data, compat),
+        _structure(before, after, after_data, compat),
         _size(before, after),
     ]
 

@@ -496,6 +496,12 @@ def _describe(ctx: _Ctx, ram: Path, img: str) -> CaptionResult:
     raise last
 
 
+def _only_repair_warnings(stderr: str) -> bool:
+    """True if exiftool only complained about the file's own metadata layout."""
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith("Warning: [minor]") for line in lines)
+
+
 def _source_problem(rel: str, exc: OSError, when: str) -> ItemOutcome:
     """A per-photo outcome for an original that can't be read (never systematic)."""
     if isinstance(exc, FileNotFoundError):
@@ -551,6 +557,14 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
                 f"the name says {expected.upper()} but the file is {actual}; "
                 "fix the extension to caption it",
             )
+        # A file the gates couldn't prove a write safe for would fail them
+        # after the model's work; say why now, as a limit of this file.
+        if before.unprovable is not None:
+            if before.unprovable.startswith("its structure can't be checked"):
+                return ItemOutcome(rel, State.QUARANTINE, before.unprovable)
+            return ItemOutcome(
+                rel, State.SKIPPED_FORMAT, f"can't be written safely: {before.unprovable}"
+            )
 
         try:
             result = _describe(ctx, ram, img)
@@ -588,13 +602,26 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             prompt_version=PROMPT_VERSION,
             run_id=ctx.run_id,
             timestamp=datetime.now(UTC).strftime("%Y:%m:%d %H:%M:%SZ"),
+            source_sha256=fp_then.sha256,
         )
         try:
             with ctx.log.timed("write", img):
                 record = apply_write(ctx.et, ram, plan, prov, lang=lang)
-        except (ExifToolError, ValueError):
-            # ValueError: the writer refused an inconsistent plan. Neither can
-            # happen with validated input, so both count as systematic.
+        except ExifToolError as exc:
+            if _only_repair_warnings(exc.stderr):
+                # The file's own metadata needs fixing first ("... (fixed)");
+                # a property of this photo, not a bug.
+                return ItemOutcome(
+                    rel,
+                    State.QUARANTINE,
+                    "exiftool would have to repair this file's metadata first",
+                )
+            return ItemOutcome(
+                rel, State.FAILED_GATE, "exiftool refused the write", systematic=True
+            )
+        except ValueError:
+            # The writer refused an inconsistent plan: can't happen with
+            # validated input, so it's a bug.
             return ItemOutcome(
                 rel, State.FAILED_GATE, "exiftool refused the write", systematic=True
             )
@@ -645,7 +672,8 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             return ItemOutcome(
                 rel, State.SKIPPED_CONFLICT, "a file appeared at the destination meanwhile"
             )
-        return ItemOutcome(rel, State.CLEAN, plan.caption_reason, note=record.iptc_note or "")
+        note = "; ".join(n for n in (record.iptc_note, record.subject_note) if n)
+        return ItemOutcome(rel, State.CLEAN, plan.caption_reason, note=note)
     finally:
         wipe_file(ram)
 

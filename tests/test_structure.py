@@ -1,19 +1,22 @@
 """Byte-level structure checks, mostly on hand-built files.
 
-Hand-built bytes make each JPEG/PNG/WebP corner case explicit; a few tests
-also run on Pillow output and the generated fixtures to prove the parsers
-agree with real encoders.
+Hand-built bytes make each JPEG/PNG/WebP/TIFF corner case explicit; a few
+tests also run on Pillow output and the generated fixtures to prove the
+parsers agree with real encoders.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
+import mmap
 import struct
 import zlib
+from collections import Counter
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageCms
 
 from asif.meta.structure import (
     StructureError,
@@ -24,6 +27,8 @@ from asif.meta.structure import (
     detect_format,
     jpeg_eoi_offset,
     jpeg_trailer,
+    read_xmp,
+    tiff_layout,
 )
 
 SECRET = b"GPS -22.951916 my secret caption"
@@ -99,6 +104,106 @@ def vp8l(width: int, height: int, alpha: bool) -> bytes:
 WEBP_XMP = rchunk(b"XMP ", b"<x:xmpmeta>" + SECRET + b"</x:xmpmeta>")
 ICCP = rchunk(b"ICCP", b"\x00\x00\x02\x0clcms" + b"\x01" * 20)
 ALPH = rchunk(b"ALPH", b"\x00" + b"\x07" * 9)
+
+# (tag, field type, count, value): the value's bytes, or the offset of a blob already placed.
+Entry = tuple[int, int, int, bytes | int]
+
+
+class Tiff:
+    """A classic TIFF, laid out in the order its parts are added.
+
+    Build bottom-up: image data and sub-IFDs first, so their offsets are
+    known when the IFD pointing to them is written; IFD0 last.
+    """
+
+    def __init__(self, order: str = "<") -> None:
+        self.order = order
+        self.buf = bytearray((b"II*\x00" if order == "<" else b"MM\x00*") + b"\x00" * 4)
+
+    def here(self) -> int:
+        """Where the next part goes (word-aligned, as TIFF wants)."""
+        if len(self.buf) % 2:
+            self.buf += b"\x00"
+        return len(self.buf)
+
+    def blob(self, data: bytes) -> int:
+        at = self.here()
+        self.buf += data
+        return at
+
+    def ifd(self, *entries: Entry, next_ifd: int = 0) -> int:
+        at = self.here()
+        table = bytearray(struct.pack(f"{self.order}H", len(entries)))
+        values = bytearray()
+        values_at = at + 2 + 12 * len(entries) + 4
+        for tag, typ, count, value in sorted(entries, key=lambda e: e[0]):
+            head = struct.pack(f"{self.order}HHI", tag, typ, count)
+            if isinstance(value, int):
+                table += head + struct.pack(f"{self.order}I", value)
+            elif len(value) <= 4:
+                table += head + value.ljust(4, b"\x00")
+            else:
+                table += head + struct.pack(f"{self.order}I", values_at + len(values))
+                values += value + b"\x00" * (len(value) % 2)
+        table += struct.pack(f"{self.order}I", next_ifd)
+        self.buf += table + values
+        return at
+
+    def done(self, ifd0: int) -> bytes:
+        self.buf[4:8] = struct.pack(f"{self.order}I", ifd0)
+        return bytes(self.buf)
+
+    def short(self, tag: int, *values: int) -> Entry:
+        return (tag, 3, len(values), struct.pack(f"{self.order}{len(values)}H", *values))
+
+    def long(self, tag: int, *values: int) -> Entry:
+        return (tag, 4, len(values), struct.pack(f"{self.order}{len(values)}I", *values))
+
+    def page(self, width: int, height: int, *extra: Entry, seed: int = 0, next_ifd: int = 0) -> int:
+        """An uncompressed RGB image in one strip, plus ``extra`` entries; its IFD's offset."""
+        pixels = bytes((seed + i) % 251 for i in range(width * height * 3))
+        strip = self.blob(pixels)
+        return self.ifd(
+            self.long(256, width),
+            self.long(257, height),
+            self.short(258, 8, 8, 8),
+            self.short(259, 1),  # no compression
+            self.short(262, 2),  # RGB
+            self.long(273, strip),
+            self.short(277, 3),
+            self.long(278, height),
+            self.long(279, len(pixels)),
+            *extra,
+            next_ifd=next_ifd,
+        )
+
+
+def ascii_entry(tag: int, text: str) -> Entry:
+    raw = text.encode() + b"\x00"
+    return (tag, 2, len(raw), raw)
+
+
+def undefined(tag: int, raw: bytes) -> Entry:
+    return (tag, 7, len(raw), raw)
+
+
+def canon_maker_note(at: int, trailing: bytes = b"") -> bytes:
+    """A Canon-style maker note to be placed at TIFF offset ``at``: an IFD whose
+    out-of-line values use absolute offsets (as Canon's do), then ``trailing``
+    bytes nothing points to."""
+    image_type = b"Canon EOS TEST\x00\x00"
+    firmware = b"Firmware 1.0.0\x00\x00"
+    values_at = at + 2 + 12 * 3 + 4
+    return (
+        struct.pack("<H", 3)
+        + struct.pack("<HHII", 0x0006, 2, len(image_type), values_at)
+        + struct.pack("<HHII", 0x0007, 2, len(firmware), values_at + len(image_type))
+        + struct.pack("<HHII", 0x0010, 4, 1, 0x80000001)  # ModelID, inline
+        + struct.pack("<I", 0)
+        + image_type
+        + firmware
+        + trailing
+    )
 
 
 def assert_private(messages: list[str]) -> None:
@@ -646,3 +751,414 @@ def test_a_format_change_is_a_difference() -> None:
 def test_compare_raises_when_a_side_cant_be_parsed() -> None:
     with pytest.raises(StructureError):
         compare(jpeg(), jpeg()[:-2], allow_iptc=False)
+
+
+# -- tiff_layout -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("order", ["<", ">"])
+def test_tiff_simple_layout_is_fully_referenced(order: str) -> None:
+    t = Tiff(order)
+    layout = tiff_layout(t.done(t.page(16, 8, ascii_entry(0x010F, "Maker"))))
+    assert layout.unreferenced == 0
+    assert not layout.maker_notes
+    assert layout.xmp == ()
+
+
+def test_tiff_every_ifd_exiftool_rewrites_is_followed() -> None:
+    t = Tiff()
+    page2 = t.page(8, 8, seed=7)  # IFD1, through the next-IFD link
+    sub = t.page(4, 4, seed=9)  # a reduced-size SubIFD
+    interop = t.ifd(ascii_entry(0x0001, "R98"))
+    exif = t.ifd(ascii_entry(0x9003, "2019:07:14 10:20:30"), t.long(0xA005, interop))
+    gps = t.ifd((0x0000, 1, 4, b"\x02\x03\x00\x00"), ascii_entry(0x0001, "S"))
+    thumb = t.blob(b"\xff\xd8thumbnail\xff\xd9")
+    ifd2 = t.ifd(t.long(0x0201, thumb), t.long(0x0202, 13))
+    t.buf[page2 + 2 + 12 * 9 : page2 + 2 + 12 * 9 + 4] = struct.pack("<I", ifd2)  # IFD1 -> IFD2
+    sub_ptr = (0x014A, 13, 1, struct.pack("<I", sub))  # type IFD
+    ifd0 = t.page(16, 16, sub_ptr, t.long(0x8769, exif), t.long(0x8825, gps), next_ifd=page2)
+    assert tiff_layout(t.done(ifd0)).unreferenced == 0
+
+
+def test_tiff_tiles_are_followed() -> None:
+    t = Tiff()
+    tiles = [t.blob(bytes([i]) * 48) for i in range(4)]
+    ifd0 = t.ifd(
+        t.long(256, 8), t.long(257, 8), t.long(322, 4), t.long(323, 4),
+        t.long(324, *tiles), t.long(325, *[48] * 4),
+    )  # fmt: skip
+    assert tiff_layout(t.done(ifd0)).unreferenced == 0
+
+
+def test_tiff_data_behind_a_private_offset_tag_is_unreferenced() -> None:
+    # A scanner's private tag holding the offset of its own block: exiftool
+    # copies the number, not the block, so the block would be lost.
+    t = Tiff()
+    vendor = t.blob(b"VENDOR-SCAN-CALIBRATION:" + SECRET * 10)
+    data = t.done(t.page(16, 8, t.long(0xC5AB, vendor), t.long(0xC5AC, 344)))
+    assert tiff_layout(data).unreferenced == 344
+    # The same bytes as the value of a tag (an out-of-line UNDEFINED) are covered.
+    t = Tiff()
+    data = t.done(t.page(16, 8, undefined(0xC5AB, b"VENDOR-SCAN-CALIBRATION:" + SECRET * 10)))
+    assert tiff_layout(data).unreferenced == 0
+
+
+def _with_gap(gap: bytes) -> bytes:
+    t = Tiff()
+    strip = t.page(4, 4)  # a page whose IFD comes after a gap
+    t.blob(gap)
+    return t.done(t.page(4, 4, next_ifd=strip))
+
+
+@pytest.mark.parametrize(
+    ("gap", "unreferenced"),
+    [
+        pytest.param(b"\x00" * 200, 0, id="zeros"),
+        pytest.param(b"\x07\x07", 0, id="two-bytes-of-padding"),
+        pytest.param(b"\x00" * 10 + b"II*\x00\x58\x00\x00\x00" + b"\x00" * 4, 0, id="stale-header"),
+        pytest.param(b"\x00" * 10 + b"MM\x00*\x00\x00\x00\x08", 18, id="other-byte-order"),
+        pytest.param(b"II*\x00\x08\x00\x00\x00II*\x00\x08\x00\x00\x00", 16, id="two-headers"),
+        pytest.param(b"\x00" * 30 + b"\x01" + b"\x00" * 30, 62, id="one-byte-of-data"),
+        pytest.param(b"\x00" * (64 * 1024 + 2), 64 * 1024 + 2, id="too-long-for-filler"),
+    ],
+)
+def test_tiff_gaps_hold_filler_or_data(gap: bytes, unreferenced: int) -> None:
+    assert tiff_layout(_with_gap(gap)).unreferenced == unreferenced
+
+
+@pytest.mark.parametrize(
+    ("tail", "unreferenced"),
+    [(b"", 0), (b"\x00\x01\x02", 0), (b"\x00" * 64, 0), (SECRET, len(SECRET))],
+)
+def test_tiff_bytes_after_the_last_part(tail: bytes, unreferenced: int) -> None:
+    t = Tiff()
+    data = t.done(t.page(4, 4)) + tail
+    assert tiff_layout(data).unreferenced == unreferenced
+
+
+@pytest.mark.parametrize("tag", [0x927C, 0xC634])  # MakerNote, DNGPrivateData
+def test_tiff_maker_notes_are_reported(tag: int) -> None:
+    t = Tiff()
+    exif = t.ifd(undefined(tag, canon_maker_note(0)))
+    layout = tiff_layout(t.done(t.page(4, 4, t.long(0x8769, exif))))
+    assert layout.maker_notes
+    assert layout.unreferenced == 0  # its bytes are covered; exiftool rebuilds them anyway
+
+
+def test_tiff_xmp_packets_are_returned() -> None:
+    t = Tiff()
+    page2 = t.page(4, 4, undefined(0x02BC, b"<page2/>"))
+    data = t.done(t.page(4, 4, undefined(0x02BC, b"<x:xmpmeta/>"), next_ifd=page2))
+    assert tiff_layout(data).xmp == (b"<x:xmpmeta/>", b"<page2/>")
+    assert "xmpmeta" not in repr(tiff_layout(data))
+
+
+def _loop() -> bytes:
+    t = Tiff()
+    ifd0 = t.here()
+    return t.done(t.ifd(t.long(256, 1), next_ifd=ifd0))
+
+
+def _past_end() -> bytes:
+    t = Tiff()
+    return t.done(t.ifd(t.long(273, 10_000), t.long(279, 10)))
+
+
+def _unknown_type() -> bytes:
+    t = Tiff()
+    return t.done(t.ifd((0xC000, 99, 1, b"\x00\x00\x00\x00")))
+
+
+def _mismatched_strips() -> bytes:
+    t = Tiff()
+    return t.done(t.ifd(t.long(273, 8, 8), t.long(279, 1)))
+
+
+def _counts_missing() -> bytes:
+    t = Tiff()
+    return t.done(t.ifd(t.long(273, 8)))
+
+
+def _offsets_as_text() -> bytes:
+    t = Tiff()
+    return t.done(t.ifd(ascii_entry(273, "8"), t.long(279, 1)))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"II+\x00\x08\x00\x00\x00" + b"\x00" * 16, id="bigtiff"),
+        pytest.param(b"\xff\xd8\xff\xe0" + b"\x00" * 16, id="not-a-tiff"),
+        pytest.param(b"II*\x00", id="header-cut"),
+        pytest.param(b"II*\x00\xff\x00\x00\x00", id="ifd-past-the-end"),
+        pytest.param(_loop(), id="ifd-loop"),
+        pytest.param(_past_end(), id="strip-past-the-end"),
+        pytest.param(_unknown_type(), id="unknown-field-type"),
+        pytest.param(_mismatched_strips(), id="offsets-and-counts-differ"),
+        pytest.param(_counts_missing(), id="byte-counts-missing"),
+        pytest.param(_offsets_as_text(), id="offsets-as-text"),
+    ],
+)
+def test_unparseable_tiffs_raise(data: bytes) -> None:
+    with pytest.raises(StructureError) as exc:
+        tiff_layout(data)
+    assert_private([str(exc.value)])
+
+
+def test_tiff_layout_takes_a_memory_map(tmp_path: Path) -> None:
+    t = Tiff()
+    path = tmp_path / "photo.tif"
+    path.write_bytes(t.done(t.page(4, 4, undefined(0x02BC, xmp_packet("<dc:title>x</dc:title>")))))
+    with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        assert tiff_layout(view).unreferenced == 0
+        assert read_xmp(view).values == Counter({"x": 1})
+    # Leaving the block closed the map: nothing kept a view of it. Not even on an error:
+    path.write_bytes(_loop())
+    with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
+        with pytest.raises(StructureError):
+            tiff_layout(view)
+        with pytest.raises(StructureError):
+            read_xmp(view)
+
+
+def pillow_tiff(pages: int = 1, **options: object) -> bytes:
+    """A Pillow TIFF: ``pages`` pages (different sizes and modes), saved with ``options``."""
+    images = [
+        Image.new("RGB", (64, 48), (10, 120, 200)),
+        Image.new("RGB", (32, 24), (200, 10, 20)),
+        Image.new("L", (8, 8), 7),
+    ][:pages]
+    buf = io.BytesIO()
+    images[0].save(buf, "TIFF", save_all=pages > 1, append_images=images[1:], **options)
+    return buf.getvalue()
+
+
+SRGB = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(pillow_tiff(), id="plain"),
+        pytest.param(pillow_tiff(compression="tiff_lzw", icc_profile=SRGB), id="lzw-icc"),
+        pytest.param(pillow_tiff(compression="jpeg"), id="jpeg-compressed"),
+        # Pillow's multi-page writer leaves each appended page's own TIFF header behind.
+        pytest.param(pillow_tiff(2), id="two-pages"),
+        pytest.param(pillow_tiff(3, compression="tiff_lzw"), id="three-pages-lzw"),
+    ],
+)
+def test_pillow_tiffs_are_fully_referenced(data: bytes) -> None:
+    assert tiff_layout(data).unreferenced == 0
+
+
+def test_tiff_fixture_is_fully_referenced(fixtures_dir: Path) -> None:
+    layout = tiff_layout((fixtures_dir / "plain.tif").read_bytes())
+    assert layout.unreferenced == 0
+    assert not layout.maker_notes
+
+
+# -- read_xmp ------------------------------------------------------------------------
+
+_NAMESPACES = (
+    'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+    'xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" '
+    'xmlns:xmpRights="http://ns.adobe.com/xap/1.0/rights/" '
+    'xmlns:xmpNote="http://ns.adobe.com/xmp/note/" '
+    'xmlns:asif="http://ns.as-if.invalid/1.0/"'
+)
+
+
+def xmp_packet(body: str, attrs: str = "") -> bytes:
+    return (
+        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Some Toolkit 1.0">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        f'<rdf:Description rdf:about="uuid:1234" {_NAMESPACES} {attrs}>{body}'
+        '</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
+    ).encode()
+
+
+def jpeg_xmp(*segments: bytes) -> bytes:
+    return jpeg(JFIF, *segments, DQT0, SOF0, DHT)
+
+
+def std_xmp(packet: bytes) -> bytes:
+    return seg(0xE1, b"http://ns.adobe.com/xap/1.0/\x00" + packet)
+
+
+def ext_xmp(guid: bytes, packet: bytes, parts: int = 2) -> list[bytes]:
+    size = -(-len(packet) // parts)
+    return [
+        seg(
+            0xE1,
+            b"http://ns.adobe.com/xmp/extension/\x00"
+            + guid
+            + struct.pack(">II", len(packet), at)
+            + packet[at : at + size],
+        )
+        for at in range(0, len(packet), size)
+    ]
+
+
+OWNER_XMP = xmp_packet(
+    '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">Garden</rdf:li></rdf:Alt></dc:title>'
+    "<dc:subject><rdf:Bag><rdf:li>family</rdf:li><rdf:li> family </rdf:li></rdf:Bag></dc:subject>"
+    '<photoshop:Source rdf:resource="http://example.com/x"/>'
+    "<photoshop:Instructions><![CDATA[a <b> & c]]></photoshop:Instructions>"
+    "<asif:RunId>run-1</asif:RunId>"
+    "<asif:AddedKeywords><rdf:Bag><rdf:li>dog</rdf:li></rdf:Bag></asif:AddedKeywords>"
+    "<xmpNote:HasExtendedXMP>0123456789ABCDEF0123456789ABCDEF</xmpNote:HasExtendedXMP>",
+    attrs='photoshop:City="  Rio  " asif:ModelId="stub" rdf:nodeID="n1"',
+)
+OWNER_VALUES = Counter(
+    {"Garden": 1, "family": 2, "http://example.com/x": 1, "a <b> & c": 1, "Rio": 1}
+)
+
+
+def test_xmp_values_skip_syntax_and_as_ifs_own_record() -> None:
+    text = read_xmp(jpeg_xmp(std_xmp(OWNER_XMP)))
+    assert text.values == OWNER_VALUES
+    assert text.problem is None
+    assert "Garden" not in repr(text)
+
+
+def test_no_xmp_means_no_values() -> None:
+    assert read_xmp(jpeg()) == read_xmp(png()) == read_xmp(riff(VP8))
+    assert read_xmp(jpeg()).values == Counter()
+
+
+PNG_KEY = b"XML:com.adobe.xmp\x00"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(png(chunk(b"iTXt", PNG_KEY + b"\x00\x00\x00\x00" + OWNER_XMP)), id="itxt"),
+        pytest.param(
+            png(chunk(b"iTXt", PNG_KEY + b"\x01\x00en\x00\x00" + zlib.compress(OWNER_XMP))),
+            id="itxt-compressed",
+        ),
+        pytest.param(png(chunk(b"zTXt", PNG_KEY + b"\x00" + zlib.compress(OWNER_XMP))), id="ztxt"),
+        pytest.param(png(chunk(b"tEXt", PNG_KEY + OWNER_XMP)), id="text"),
+        pytest.param(riff(vp8x(0x04), VP8, rchunk(b"XMP ", OWNER_XMP)), id="webp"),
+        pytest.param(jpeg_xmp(std_xmp(OWNER_XMP + b"\x00\x00\x00")), id="nul-padding"),
+    ],
+)
+def test_xmp_is_found_in_every_format(data: bytes) -> None:
+    assert read_xmp(data).values == OWNER_VALUES
+
+
+def test_xmp_in_a_tiff() -> None:
+    t = Tiff(">")
+    data = t.done(t.page(4, 4, undefined(0x02BC, OWNER_XMP)))
+    assert read_xmp(data).values == OWNER_VALUES
+
+
+def test_other_png_text_is_not_xmp() -> None:
+    assert read_xmp(png(chunk(b"tEXt", b"Comment\x00" + SECRET))).values == Counter()
+
+
+def test_imagemagick_raw_profile_xmp_is_a_problem() -> None:
+    # exiftool reads this hex-encoded copy as XMP and rewrites it on every write.
+    raw = chunk(b"zTXt", b"Raw profile type xmp\x00\x00" + zlib.compress(b"\nxmp\n  4\n3c612f3e\n"))
+    text = read_xmp(png(raw, chunk(b"iTXt", PNG_KEY + b"\x00\x00\x00\x00" + OWNER_XMP)))
+    assert text.problem == (
+        "its XMP is in ImageMagick's raw-profile form, which exiftool would rewrite"
+    )
+    assert text.values == OWNER_VALUES
+
+
+LITERAL = '<xmpRights:UsageTerms rdf:parseType="Literal">{}</xmpRights:UsageTerms>'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(LITERAL.format("Use only with <i>credit</i> to Jane"), id="literal"),
+        pytest.param(LITERAL.format("<i>credit</i>"), id="literal-markup-only"),
+        pytest.param("<photoshop:Headline>Head <b>bold</b> tail</photoshop:Headline>", id="mixed"),
+    ],
+)
+def test_markup_inside_a_value_is_a_problem(body: str) -> None:
+    # exiftool keeps the elements as a structure and drops the text around them.
+    text = read_xmp(jpeg_xmp(std_xmp(xmp_packet(body))))
+    assert text.problem == "its XMP has markup inside a value, which exiftool can't carry over"
+    assert "credit" in text.values or "bold" in text.values  # the values are still counted
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        LITERAL.format("Use only with credit"),
+        '<dc:rights rdf:parseType="Resource"><photoshop:Inner>x</photoshop:Inner></dc:rights>',
+        "<asif:Note>As If <b>own</b></asif:Note>",
+    ],
+)
+def test_plain_values_and_structures_are_no_problem(body: str) -> None:
+    assert read_xmp(jpeg_xmp(std_xmp(xmp_packet(body)))).problem is None
+
+
+def test_extended_xmp_linked_from_the_main_packet() -> None:
+    extended = xmp_packet("<photoshop:History>" + "long history " * 50 + "</photoshop:History>")
+    guid = hashlib.md5(extended).hexdigest().upper().encode()  # XMP's own choice of hash
+    main = xmp_packet("", attrs=f'xmpNote:HasExtendedXMP="{guid.decode()}"')
+    text = read_xmp(jpeg_xmp(std_xmp(main), *ext_xmp(guid, extended, parts=3)))
+    assert text.problem is None
+    assert text.values == Counter({("long history " * 50).strip(): 1})
+
+
+@pytest.mark.parametrize("link", ["", 'xmpNote:HasExtendedXMP="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"'])
+def test_extended_xmp_nobody_links_to_is_a_problem(link: str) -> None:
+    # exiftool ignores it ("non-standard extended XMP") and drops it on write.
+    extended = xmp_packet("<photoshop:History>depth map</photoshop:History>")
+    guid = hashlib.md5(extended).hexdigest().upper().encode()
+    text = read_xmp(jpeg_xmp(std_xmp(xmp_packet("", attrs=link)), *ext_xmp(guid, extended)))
+    assert text.problem == (
+        "it has extended XMP its main XMP doesn't link to, which exiftool would drop"
+    )
+
+
+def test_incomplete_extended_xmp_raises() -> None:
+    extended = xmp_packet("<photoshop:History>depth map</photoshop:History>")
+    guid = b"0" * 32
+    parts = ext_xmp(guid, extended, parts=3)
+    with pytest.raises(StructureError, match="incomplete"):
+        read_xmp(jpeg_xmp(std_xmp(xmp_packet("")), parts[0], parts[2]))
+    with pytest.raises(StructureError, match="truncated"):
+        read_xmp(jpeg_xmp(seg(0xE1, b"http://ns.adobe.com/xmp/extension/\x00" + guid)))
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(jpeg_xmp(std_xmp(b"<x:xmpmeta>" + SECRET)), id="not-well-formed"),
+        pytest.param(jpeg_xmp(XMP), id="unbound-prefix"),
+        pytest.param(
+            jpeg_xmp(std_xmp(b'<!DOCTYPE x [<!ENTITY a "' + SECRET + b'">]><x>&a;&a;</x>')),
+            id="dtd-entities",
+        ),
+        pytest.param(
+            png(chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x01\x00\x00\x00" + b"not zlib")),
+            id="bad-compression",
+        ),
+        pytest.param(
+            png(chunk(b"zTXt", b"XML:com.adobe.xmp\x00\x00" + zlib.compress(b" " * (17 << 20)))),
+            id="compression-bomb",
+        ),
+        pytest.param(png(chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x00\x00")), id="itxt-cut"),
+        pytest.param(b"GIF89a" + b"\x00" * 16, id="unknown-format"),
+        pytest.param(jpeg()[:-2], id="jpeg-cut"),
+    ],
+)
+def test_unreadable_xmp_raises(data: bytes) -> None:
+    with pytest.raises(StructureError) as exc:
+        read_xmp(data)
+    assert_private([str(exc.value)])
+
+
+def test_fixture_xmp(fixtures_dir: Path) -> None:
+    text = read_xmp((fixtures_dir / "user_xmp.jpg").read_bytes())
+    assert {"Grandma's garden, summer 2003", "Garden", "family"} <= text.values.keys()
+    assert text.problem is None
+    for name in ("plain.jpg", "plain.png", "lossy.webp", "plain.tif"):
+        assert read_xmp((fixtures_dir / name).read_bytes()).problem is None

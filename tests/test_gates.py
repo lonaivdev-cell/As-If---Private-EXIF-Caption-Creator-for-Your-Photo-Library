@@ -12,13 +12,15 @@ import contextlib
 import dataclasses
 import hashlib
 import io
+import json
 import os
 import struct
 import time
 import zlib
+from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 from PIL import Image, ImageCms, PngImagePlugin
@@ -28,7 +30,9 @@ from asif.meta.gates import (
     MAX_GROWTH,
     Fingerprint,
     GateResult,
+    Snapshot,
     _allowed,
+    _protected,
     all_ok,
     check_source_unchanged,
     check_written,
@@ -37,6 +41,17 @@ from asif.meta.gates import (
 )
 from asif.meta.structure import jpeg_eoi_offset
 from tests.conftest import HAVE_EXIFTOOL
+from tests.test_structure import (
+    LITERAL,
+    Tiff,
+    ascii_entry,
+    canon_maker_note,
+    ext_xmp,
+    pillow_tiff,
+    std_xmp,
+    undefined,
+    xmp_packet,
+)
 
 Compat = Literal["xmp", "wide"]
 FixtureCopy = Callable[[str], Path]
@@ -78,24 +93,43 @@ def legit_write(
     image_hash: str,
     *,
     keywords: tuple[str, ...] = KEYWORDS,
+    caption: str = CAPTION,
 ) -> None:
-    """Write like As If's writer: only XMP-dc, XMP-asif, XMP-et (and IPTC if wide)."""
-    args = [
-        f"-XMP-dc:Description-x-default={CAPTION}",
-        f"-XMP-dc:Description-pt-BR={CAPTION}",
-        *(f"-XMP-dc:Subject+={k}" for k in keywords),
+    """Write like As If's writer: only XMP-dc, XMP-asif, XMP-et (and IPTC if wide).
+
+    Like the writer, it leaves a caption alone unless it's blank or As If's
+    own, and writes the original-image hash only once.
+    """
+    existing = et.read_tags(path, "-XMP-dc:Description*", "-XMP-asif:CaptionDigest", "-XMP-et:all")
+    digest = existing.pop("XMP-asif:CaptionDigest", None)
+    has_hash = existing.pop("XMP-et:OriginalImageHash", None) is not None
+    existing.pop("XMP-et:OriginalImageHashType", None)
+    ours = all(
+        not str(text).strip() or hashlib.sha256(str(text).encode()).hexdigest() == digest
+        for text in existing.values()
+    )
+    args = [*(f"-XMP-dc:Subject+={k}" for k in keywords)]
+    if ours:
+        args += [
+            f"-XMP-dc:Description-x-default={caption}",
+            f"-XMP-dc:Description-pt-BR={caption}",
+            f"-XMP-asif:CaptionDigest={hashlib.sha256(caption.encode()).hexdigest()}",
+            "-XMP-asif:CaptionLang=pt-BR",
+        ]
+    if not has_hash:
+        args += [
+            f"-XMP-et:OriginalImageHash={image_hash}",
+            "-XMP-et:OriginalImageHashType=SHA256",
+        ]
+    args += [
         "-XMP-asif:ToolVersion=0.1.0",
         "-XMP-asif:ModelId=stub",
         "-XMP-asif:ModelSHA256=",
         "-XMP-asif:PromptVersion=caption_v1",
         "-XMP-asif:RunId=20261025-abcdef",
         "-XMP-asif:Timestamp=2026:10:25 10:00:00Z",
-        f"-XMP-asif:CaptionDigest={hashlib.sha256(CAPTION.encode()).hexdigest()}",
-        "-XMP-asif:CaptionLang=pt-BR",
         *(f"-XMP-asif:AddedKeywords={k}" for k in keywords),
         "-XMP-asif:WroteOriginalImageHash=True",
-        f"-XMP-et:OriginalImageHash={image_hash}",
-        "-XMP-et:OriginalImageHashType=SHA256",
     ]
     iptc: list[str] = []
     if compat == "wide":
@@ -136,6 +170,7 @@ def test_legitimate_write_passes_every_gate(
 ) -> None:
     path = fixture_copy(name)
     before = snapshot(et, path)
+    assert before.unprovable is None
     legit_write(et, path, compat, before.image_hash)
     assert et.read_tags(path, "-XMP-asif:RunId") == {"XMP-asif:RunId": "20261025-abcdef"}
     # IPTC really is written where it can be: Latin-1 IPTC is left alone, and
@@ -155,7 +190,7 @@ def test_legitimate_write_passes_every_gate(
         assert gates["trailer"].detail != "n/a"
     else:
         assert gates["trailer"].detail == "n/a"
-    assert (gates["structure"].detail == "n/a") == (before.fmt == "tiff")
+    assert gates["structure"].detail == ""  # checked, TIFF included
     assert_private(results)
 
 
@@ -387,6 +422,8 @@ def test_snapshot_dump_is_raw_and_binary(et: ExifTool, fixtures_dir: Path) -> No
 def test_snapshot_repr_leaks_nothing(et: ExifTool, fixtures_dir: Path) -> None:
     text = repr(snapshot(et, fixtures_dir / "gps.jpg"))
     assert "22.95" not in text and "GPS" not in text and "\\xff" not in text
+    text = repr(snapshot(et, fixtures_dir / "user_xmp.jpg"))
+    assert "Grandma" not in text and "family" not in text  # the XMP's own values
 
 
 def test_snapshot_of_corrupt_file_raises(et: ExifTool, fixtures_dir: Path) -> None:
@@ -410,7 +447,6 @@ def test_allow_list_never_covers_protected_tags() -> None:
         "ExifIFD:MakerNoteCanon",
         "ExifIFD:MakerNoteUnknown",
         "IFD1:ThumbnailImage",
-        "IFD1:ThumbnailOffset",
         "IFD1:ThumbnailLength",
         "IFD0:PreviewImage",
         "Photoshop:PhotoshopThumbnail",
@@ -434,7 +470,12 @@ def test_allow_list_never_covers_protected_tags() -> None:
         "File:Comment",
         "File:ImageWidth",
         "IFD0:StripByteCounts",
-        "IFD1:StripOffsets",
+        "IFD1:StripByteCounts",
+        "IFD1:TileByteCounts",
+        "SubIFD:StripByteCounts",
+        "SubIFD:ThumbnailOffset",
+        "IFD0:PreviewImageStart",
+        "IFD0:Exif_0xc5ab",
     ]
     for key in protected:
         for variant in (key, f"{key}#2"):
@@ -444,6 +485,24 @@ def test_allow_list_never_covers_protected_tags() -> None:
     # A WebP's size is reported twice once it has a VP8X header; the first copy counts.
     assert not _allowed("RIFF:ImageWidth", "webp", "xmp")
     assert not _allowed("RIFF:ImageHeight", "webp", "wide")
+
+
+def test_tiff_data_of_every_page_may_move() -> None:
+    # exiftool rebuilds a TIFF; the data each IFD points at is checked elsewhere.
+    moved = [
+        "IFD0:StripOffsets",
+        "IFD1:StripOffsets",
+        "IFD2:TileOffsets",
+        "IFD1:ThumbnailOffset",
+        "SubIFD:StripOffsets",
+        "SubIFD2:TileOffsets",
+    ]
+    for key in moved:
+        assert _allowed(key, "tiff", "xmp")
+        for fmt in ("jpeg", "png", "webp", "other"):  # in a JPEG's EXIF nothing may move
+            assert not _allowed(key, fmt, "wide"), (key, fmt)
+    for key in ("IFD1:StripOffsetsX", "XIFD1:StripOffsets", "IFD:StripOffsets"):
+        assert not _allowed(key, "tiff", "xmp"), key
 
 
 class FakeExifTool:
@@ -796,6 +855,8 @@ def test_truncated_jpeg_fails_trailer_and_structure(
     path = fixture_copy("truncated.jpg")
     before = snapshot(et, path)  # exiftool can still hash what's there
     assert before.fmt == "jpeg"
+    assert before.unprovable is not None
+    assert before.unprovable.startswith("its structure can't be checked: JPEG ")
     with contextlib.suppress(ExifToolError):  # exiftool may refuse; the gates must fail anyway
         legit_write(et, path, "xmp", before.image_hash)
     results = check_written(et, before, path, compat="xmp")
@@ -899,3 +960,417 @@ def test_all_ok() -> None:
     assert all_ok(r for r in [good])
     assert not all_ok([good, bad])
     assert not all_ok([])  # nothing checked proves nothing
+
+
+# -- TIFF: every page, preview and thumbnail --------------------------------------------------
+
+
+def _offset(et: ExifTool, path: Path, tag: str) -> int:
+    """Where the (first) strip or thumbnail of ``tag`` starts in the file."""
+    return int(str(et.read_tags(path, "-n", f"-{tag}")[tag]).split()[0])
+
+
+def _flip(path: Path, at: int) -> None:
+    data = bytearray(path.read_bytes())
+    data[at] ^= 0x01
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+@pytest.mark.parametrize(
+    ("pages", "options"), [(2, {}), (3, {"compression": "tiff_lzw"})], ids=["2-pages", "3-lzw"]
+)
+def test_multi_page_tiff_passes_and_every_page_stays_checked(
+    et: ExifTool, tmp_path: Path, compat: Compat, pages: int, options: dict[str, Any]
+) -> None:
+    # exiftool moves every page's strips; the pages themselves must not change.
+    path = tmp_path / "scan.tif"
+    path.write_bytes(pillow_tiff(pages, **options))
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    results = check_written(et, before, path, compat=compat)
+    assert all_ok(results), results
+
+    _flip(path, _offset(et, path, f"IFD{pages - 1}:StripOffsets") + 3)  # the last page
+    assert failing(check_written(et, before, path, compat=compat)) == {"equality"}
+
+
+def _thumbnail() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 12), (200, 30, 30)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def _tiff_with_preview_and_thumbnail() -> bytes:
+    t = Tiff()
+    preview = t.page(8, 8, t.long(254, 1), seed=40)  # a reduced-size image, in a SubIFD
+    thumb = _thumbnail()
+    ifd1 = t.ifd(t.long(254, 1), t.long(0x0201, t.blob(thumb)), t.long(0x0202, len(thumb)))
+    sub_ifds = (0x014A, 13, 1, struct.pack("<I", preview))
+    return t.done(t.page(32, 24, sub_ifds, next_ifd=ifd1))
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_tiff_preview_and_thumbnail_move_but_stay_checked(
+    et: ExifTool, tmp_path: Path, compat: Compat
+) -> None:
+    path = tmp_path / "preview.tif"
+    path.write_bytes(_tiff_with_preview_and_thumbnail())
+    before = snapshot(et, path)
+    assert {"SubIFD:StripOffsets", "IFD1:ThumbnailOffset", "IFD1:ThumbnailImage"} <= set(
+        before.tags
+    )
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
+
+    written = path.read_bytes()
+    _flip(path, _offset(et, path, "SubIFD:StripOffsets") + 5)
+    # (exiftool also rebuilds the preview as SubIFD:ThumbnailTIFF, so protected sees it too.)
+    assert "equality" in failing(check_written(et, before, path, compat=compat))
+    path.write_bytes(written)
+    _flip(path, _offset(et, path, "IFD1:ThumbnailOffset") + 30)
+    protected = by_name(check_written(et, before, path, compat=compat))["protected"]
+    assert "IFD1:ThumbnailImage" in protected.detail
+
+
+def test_unknown_tiff_tags_are_compared(et: ExifTool, tmp_path: Path) -> None:
+    path = tmp_path / "scanner.tif"
+    settings = b"PRIVATE-SCANNER-SETTINGS" * 4
+    t = Tiff()
+    path.write_bytes(t.done(t.page(16, 8, undefined(0xC5AD, settings))))
+    before = snapshot(et, path)
+    assert "IFD0:Exif_0xc5ad" in before.tags
+    legit_write(et, path, "xmp", before.image_hash)
+    assert all_ok(check_written(et, before, path, compat="xmp"))
+
+    data = path.read_bytes()
+    assert data.count(settings) == 1
+    path.write_bytes(data.replace(settings, settings.lower()))
+    results = check_written(et, before, path, compat="xmp")
+    assert failing(results) == {"protected"}
+    assert by_name(results)["protected"].detail == "changed: IFD0:Exif_0xc5ad"
+
+
+# -- files no write to can be proven safe ------------------------------------------------------
+
+
+def test_tiff_data_nothing_points_to_is_refused(et: ExifTool, tmp_path: Path) -> None:
+    # A scanner's private tag holds the offset of its own calibration block.
+    path = tmp_path / "scanner.tif"
+    vendor = b"VENDOR-SCAN-CALIBRATION:" + b"\x5a" * 512
+    t = Tiff()
+    at = t.blob(vendor)
+    path.write_bytes(t.done(t.page(32, 16, t.long(0xC5AB, at), t.long(0xC5AC, len(vendor)))))
+    before = snapshot(et, path)
+    assert before.unprovable == (
+        "the TIFF holds 536 bytes nothing points to, which exiftool would drop"
+    )
+
+    legit_write(et, path, "xmp", before.image_hash)
+    assert vendor not in path.read_bytes()  # why: exiftool copied the offset, not the block
+    results = check_written(et, before, path, compat="xmp")
+    assert failing(results) == {"structure"}  # nothing else can see it
+    assert by_name(results)["structure"].detail == (
+        f"can't prove a write is safe: {before.unprovable}"
+    )
+
+
+def _canon_exif(*, image: bool) -> tuple[bytes, bytes]:
+    """EXIF (a TIFF structure, with an image when ``image``) holding a Canon
+    maker note with out-of-line values and trailing bytes; also the note."""
+    t = Tiff()
+    at = t.here()
+    note = canon_maker_note(at, trailing=b"VENDOR-TRAILING-BYTES")
+    t.blob(note)
+    exif = t.ifd((0x927C, 7, len(note), at))
+    tags = (ascii_entry(0x010F, "Canon"), ascii_entry(0x0110, "Canon EOS"), t.long(0x8769, exif))
+    return t.done(t.page(32, 16, *tags) if image else t.ifd(*tags)), note
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_jpeg_maker_note_passes_and_is_compared_byte_for_byte(
+    et: ExifTool, fixture_copy: FixtureCopy, compat: Compat
+) -> None:
+    path = fixture_copy("plain.jpg")
+    exif, note = _canon_exif(image=False)
+    data = path.read_bytes()
+    app1 = b"\xff\xe1" + (len(exif) + 8).to_bytes(2, "big") + b"Exif\x00\x00" + exif
+    path.write_bytes(data[:2] + app1 + data[2:])
+    before = snapshot(et, path)
+    assert "ExifIFD:MakerNoteCanon" in before.tags and "Canon:CanonFirmwareVersion" in before.tags
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
+
+    written = path.read_bytes()
+    start = written.index(note)
+    # Entry count, an offset inside an entry, an out-of-line value, the
+    # next-IFD link and a trailing byte: exiftool decodes only some of them.
+    for at in (0, 10, 42, 38, len(note) - 1):
+        _flip(path, start + at)
+        results = check_written(et, before, path, compat=compat)
+        assert "APP1" in by_name(results)["structure"].detail, at
+        path.write_bytes(written)
+
+
+def test_tiff_with_maker_notes_is_refused(et: ExifTool, tmp_path: Path) -> None:
+    path = tmp_path / "dpp_export.tif"
+    path.write_bytes(_canon_exif(image=True)[0])
+    before = snapshot(et, path)
+    assert before.unprovable == "it's a TIFF with maker notes, which exiftool would rewrite"
+
+    legit_write(et, path, "xmp", before.image_hash)
+    # Why: exiftool moved the note, rewrote its offsets and dropped its trailing bytes.
+    assert b"VENDOR-TRAILING-BYTES" not in path.read_bytes()
+    detail = by_name(check_written(et, before, path, compat="xmp"))["structure"].detail
+    assert detail == f"can't prove a write is safe: {before.unprovable}"
+
+
+def _with_xmp(fmt: str, jpeg: Path, packet: bytes) -> Path:
+    """``jpeg`` with ``packet`` as its XMP, or a TIFF next to it holding the packet."""
+    if fmt == "jpeg":
+        data = jpeg.read_bytes()
+        jpeg.write_bytes(data[:2] + std_xmp(packet) + data[2:])
+        return jpeg
+    t = Tiff()
+    path = jpeg.with_suffix(".tif")
+    path.write_bytes(t.done(t.page(16, 8, undefined(0x02BC, packet))))
+    return path
+
+
+@pytest.mark.parametrize("fmt", ["jpeg", "tiff"])
+@pytest.mark.parametrize(
+    "body",
+    [
+        LITERAL.format("Use only with <i>credit</i> to Jane"),
+        "<photoshop:Headline>Use only with <b>credit</b> to Jane</photoshop:Headline>",
+    ],
+    ids=["literal", "mixed"],
+)
+def test_xmp_exiftool_cant_carry_over_is_refused_and_caught(
+    et: ExifTool, fixture_copy: FixtureCopy, fmt: str, body: str
+) -> None:
+    path = _with_xmp(fmt, fixture_copy("plain.jpg"), xmp_packet(body))
+    before = snapshot(et, path)
+    assert before.unprovable == "its XMP has markup inside a value, which exiftool can't carry over"
+    legit_write(et, path, "xmp", before.image_hash)
+    assert failing(check_written(et, before, path, compat="xmp")) == {"structure"}
+
+    # Even unflagged, the XMP's own text shows what exiftool silently dropped:
+    # the protected gate can't, as it reads the XMP with exiftool's parser.
+    unflagged = dataclasses.replace(before, unprovable=None)
+    results = check_written(et, unflagged, path, compat="xmp")
+    assert failing(results) == {"structure"}
+    assert by_name(results)["structure"].detail == "2 of the original XMP's values went missing"
+    assert_private(results, "Jane", "Use only")
+
+
+def test_extended_xmp_nobody_links_to_is_refused(et: ExifTool, fixture_copy: FixtureCopy) -> None:
+    path = fixture_copy("plain.jpg")
+    extended = xmp_packet("<photoshop:History>" + "depth " * 200 + "</photoshop:History>")
+    guid = hashlib.md5(extended).hexdigest().upper().encode()
+    data = path.read_bytes()
+    segments = std_xmp(xmp_packet("")) + b"".join(ext_xmp(guid, extended))
+    path.write_bytes(data[:2] + segments + data[2:])
+    before = snapshot(et, path)
+    assert before.unprovable == (
+        "it has extended XMP its main XMP doesn't link to, which exiftool would drop"
+    )
+
+
+def test_png_with_imagemagick_raw_profile_is_refused(
+    et: ExifTool, fixture_copy: FixtureCopy
+) -> None:
+    path = fixture_copy("plain.png")
+    packet = xmp_packet("<photoshop:City>Rio</photoshop:City>").hex()
+    profile = f"\nxmp\n{len(packet) // 2:8d}\n{packet}\n".encode()
+    text = b"zTXt" + b"Raw profile type xmp\x00\x00" + zlib.compress(profile)
+    raw = struct.pack(">I", len(text) - 4) + text + struct.pack(">I", zlib.crc32(text))
+    data = path.read_bytes()
+    idat = data.index(b"IDAT") - 4
+    path.write_bytes(data[:idat] + raw + data[idat:])
+    before = snapshot(et, path)
+    assert before.unprovable == (
+        "its XMP is in ImageMagick's raw-profile form, which exiftool would rewrite"
+    )
+    legit_write(et, path, "xmp", before.image_hash)
+    assert raw not in path.read_bytes()  # why: exiftool rewrote the profile too
+
+
+def test_unknown_format_cant_be_proven(tmp_path: Path) -> None:
+    path = tmp_path / "photo.jpg"
+    path.write_bytes(b"GIF89a" + b"\x00" * 32)
+    fake = FakeExifTool('[{"SourceFile": "photo.jpg"}]')
+    before = snapshot(fake, path)  # type: ignore[arg-type]
+    assert before.fmt == "other"
+    assert before.unprovable == "As If can't check this file type byte by byte"
+    structure = by_name(check_written(fake, before, path, compat="xmp"))["structure"]  # type: ignore[arg-type]
+    assert structure == GateResult(
+        "structure", False, f"can't prove a write is safe: {before.unprovable}"
+    )
+
+
+# -- additive-only, enforced by the gate --------------------------------------------------------
+
+OURS = "A dog on the beach"
+OURS_DIGEST = hashlib.sha256(OURS.encode()).hexdigest()
+
+
+def _protected_detail(before: dict[str, Any], after: dict[str, Any], compat: Compat) -> str:
+    """The protected gate's verdict for two tag dumps, without exiftool."""
+    snap = Snapshot("jpeg", "0" * 64, 0, "", before, None, Counter(), None)
+    fake = FakeExifTool(json.dumps([{"SourceFile": "photo.jpg", **after}]))
+    result = _protected(fake, snap, Path("photo.jpg"), compat)  # type: ignore[arg-type]
+    assert result.ok == (result.detail == "")
+    return result.detail
+
+
+SUBJECT, KEYWORDS_IPTC, DESC = "XMP-dc:Subject", "IPTC:Keywords", "XMP-dc:Description"
+DIGEST, HASH = "XMP-asif:CaptionDigest", "XMP-et:OriginalImageHash"
+CHARSET, RECORD = "IPTC:CodedCharacterSet", "IPTC:ApplicationRecordVersion"
+LOST_SUBJECT = "lost values: XMP-dc:Subject"
+ADDITIVE = {
+    "added": ({SUBJECT: ["a", "b"]}, {SUBJECT: ["b", "a", "c"]}, ""),
+    "one-to-list": ({SUBJECT: "a"}, {SUBJECT: ["a", "b"]}, ""),
+    "removed": ({SUBJECT: ["a", "b"]}, {SUBJECT: ["a", "c"]}, LOST_SUBJECT),
+    "duplicate-collapsed": ({SUBJECT: ["a", "a"]}, {SUBJECT: ["a", "b"]}, LOST_SUBJECT),
+    "case-changed": ({SUBJECT: ["Dog"]}, {SUBJECT: ["dog"]}, LOST_SUBJECT),
+    "type-changed": ({SUBJECT: [2019]}, {SUBJECT: ["2019"]}, LOST_SUBJECT),
+    "all-gone": ({SUBJECT: ["a"]}, {}, LOST_SUBJECT),
+    "iptc-removed": (
+        {KEYWORDS_IPTC: ["old"]},
+        {KEYWORDS_IPTC: ["new"]},
+        "lost values: IPTC:Keywords",
+    ),
+    "iptc-copies": (
+        {KEYWORDS_IPTC: ["a"], f"{KEYWORDS_IPTC}#2": ["b"]},
+        {KEYWORDS_IPTC: ["b", "a"]},
+        "",
+    ),
+    # Captions: the owner's never change; As If's own (by the digest recorded before) may.
+    "owner-caption": ({DESC: "Oma"}, {DESC: OURS}, "changed: XMP-dc:Description"),
+    "owner-caption-removed": (
+        {f"{DESC}-de": "Oma"},
+        {DESC: OURS},
+        "removed: XMP-dc:Description-de",
+    ),
+    "ours-replaced": (
+        {DESC: OURS, f"{DESC}-en": OURS, DIGEST: OURS_DIGEST},
+        {DESC: "new", f"{DESC}-pt-BR": "new"},
+        "",
+    ),
+    "ours-edited-since": (
+        {DESC: OURS + "!", DIGEST: OURS_DIGEST},
+        {DESC: "new"},
+        "changed: XMP-dc:Description",
+    ),
+    "digest-written-now": (
+        {DESC: OURS},
+        {DESC: "new", DIGEST: OURS_DIGEST},
+        "changed: XMP-dc:Description",
+    ),
+    "digest-malformed": (
+        {DESC: OURS, DIGEST: OURS_DIGEST.upper()},
+        {DESC: "new"},
+        "changed: XMP-dc:Description",
+    ),
+    "not-text": (
+        {DESC: 2019, DIGEST: hashlib.sha256(b"2019").hexdigest()},
+        {DESC: "new"},
+        "changed: XMP-dc:Description",
+    ),
+    "blank": ({DESC: "  "}, {DESC: "new"}, ""),
+    "empty": ({}, {DESC: "new", f"{DESC}-en": "new"}, ""),
+    # Write-once fields.
+    "hash-added": ({}, {HASH: "b" * 64, "XMP-et:OriginalImageHashType": "SHA256"}, ""),
+    "hash-overwritten": ({HASH: "a" * 64}, {HASH: "b" * 64}, "changed: XMP-et:OriginalImageHash"),
+    "iptc-relabelled": (
+        {CHARSET: "\x1b%A"},
+        {CHARSET: "\x1b%G"},
+        "changed: IPTC:CodedCharacterSet",
+    ),
+    "iptc-version-removed": ({RECORD: 2}, {}, "removed: IPTC:ApplicationRecordVersion"),
+    "iptc-created": ({}, {CHARSET: "\x1b%G", RECORD: 4}, ""),
+}
+
+
+@pytest.mark.parametrize(("before", "after", "detail"), ADDITIVE.values(), ids=ADDITIVE.keys())
+def test_fields_as_if_writes_are_additive_only(
+    before: dict[str, Any], after: dict[str, Any], detail: str
+) -> None:
+    assert _protected_detail(before, after, "wide") == detail
+    for value in ("Oma", OURS, "Dog", "old", "a" * 64):
+        assert value not in detail
+
+
+def test_iptc_keywords_cant_change_at_all_in_xmp_mode() -> None:
+    before, after = {"IPTC:Keywords": ["old"]}, {"IPTC:Keywords": ["old", "new"]}
+    assert _protected_detail(before, after, "xmp") == "changed: IPTC:Keywords"
+    assert _protected_detail(before, after, "wide") == ""
+
+
+def test_owner_caption_overwritten_by_exiftool_fails(
+    et: ExifTool, fixture_copy: FixtureCopy
+) -> None:
+    path = fixture_copy("user_xmp.jpg")
+    before = snapshot(et, path)
+    # As if the writer's own rule had failed: the gate doesn't trust it.
+    et.execute("-overwrite_original", f"-XMP-dc:Description-x-default={CAPTION}", str(path))
+    results = check_written(et, before, path, compat="xmp")
+    assert failing(results) == {"protected", "structure"}
+    assert by_name(results)["protected"].detail == "changed: XMP-dc:Description"
+    assert by_name(results)["structure"].detail == "1 of the original XMP's values went missing"
+    assert_private(results, "Grandma")
+
+
+def test_as_ifs_own_caption_may_be_replaced(et: ExifTool, fixture_copy: FixtureCopy) -> None:
+    path = fixture_copy("exif.jpg")
+    first = snapshot(et, path)
+    legit_write(et, path, "xmp", first.image_hash)
+    before = snapshot(et, path)
+    legit_write(et, path, "xmp", before.image_hash, caption="Outra legenda")
+    assert et.read_tags(path, "-XMP-dc:Description")["XMP-dc:Description"] == "Outra legenda"
+    assert all_ok(results := check_written(et, before, path, compat="xmp")), results
+
+    # Once the owner edits it, it's theirs.
+    et.execute("-overwrite_original", "-XMP-dc:Description-pt-BR=Minha legenda", str(path))
+    before = snapshot(et, path)
+    et.execute("-overwrite_original", "-XMP-dc:Description-pt-BR=Outra", str(path))
+    results = check_written(et, before, path, compat="xmp")
+    assert by_name(results)["protected"].detail == "changed: XMP-dc:Description-pt-BR"
+
+
+@pytest.mark.parametrize(
+    ("name", "edit", "detail"),
+    [
+        ("user_xmp.jpg", "-XMP-dc:Subject-=family", "lost values: XMP-dc:Subject"),
+        ("exif.jpg", "-XMP-et:OriginalImageHash=" + "0" * 64, "changed: XMP-et:OriginalImageHash"),
+    ],
+)
+def test_keywords_and_original_hash_survive_real_writes(
+    et: ExifTool, fixture_copy: FixtureCopy, name: str, edit: str, detail: str
+) -> None:
+    path = fixture_copy(name)
+    first = snapshot(et, path)
+    legit_write(et, path, "wide", first.image_hash)
+    before = snapshot(et, path)
+    legit_write(et, path, "wide", before.image_hash, keywords=("areia",))
+    assert all_ok(check_written(et, before, path, compat="wide"))
+    et.execute("-overwrite_original", edit, str(path))
+    assert by_name(check_written(et, before, path, compat="wide"))["protected"].detail == detail
+
+
+def test_iptc_keywords_survive_real_writes(et: ExifTool, fixture_copy: FixtureCopy) -> None:
+    path = fixture_copy("plain.jpg")
+    et.execute(
+        "-overwrite_original", "-charset", "iptc=UTF8", "-IPTC:CodedCharacterSet=UTF8",
+        "-IPTC:Keywords=família", str(path),
+    )  # fmt: skip
+    before = snapshot(et, path)
+    legit_write(et, path, "wide", before.image_hash)
+    assert all_ok(check_written(et, before, path, compat="wide"))
+    et.execute("-overwrite_original", "-charset", "iptc=UTF8", "-IPTC:Keywords-=família", str(path))
+    detail = by_name(check_written(et, before, path, compat="wide"))["protected"].detail
+    assert detail == "lost values: IPTC:Keywords"

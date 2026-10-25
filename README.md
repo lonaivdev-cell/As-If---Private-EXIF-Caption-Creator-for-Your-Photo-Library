@@ -4,8 +4,8 @@
 A model on *your* machine describes each photo, and the description and keywords go into the photo's own metadata (XMP), so any photo app can search them. Your photos, and everything said about them, never reach a third party. *As if.*
 
 - 🔒 **Offline by design.** The model runs locally, in its own process. The main `asif` process has no network code at all, and any Python code in it that tries to open a socket crashes it.
-- 🧾 **Your data stays yours.** It only *adds* to empty fields and never overwrites your own captions or keywords. Everything it adds is labelled, so it can be removed cleanly.
-- 🛡️ **Your pixels stay as they are.** Before any copy is written, As If proves the image data, dates, GPS, orientation, colour profile, previews, and every other byte outside the caption are unchanged.
+- 🧾 **Your data stays yours.** It only *adds* to empty fields and never overwrites your own captions or keywords. The file itself records exactly what As If added, so `asif undo` (M6) can remove just that.
+- 🛡️ **Your pixels stay as they are.** Before any copy is written, As If proves the image data, dates, GPS, orientation, colour profile, previews and the rest of your metadata are unchanged. For JPEG, PNG and WebP that means every byte outside the caption; a file it can't prove that for is skipped, not risked.
 
 > **Status: early (M0 + M1 of 11).** It captions a local folder into a separate folder of copies. Cloud sync, sandboxing, encryption and search are designed but not built yet. See [Status](#status).
 
@@ -60,13 +60,13 @@ uv run asif caption ~/Pictures/test ~/Pictures/test-captioned \
 
 | What | Where in the file | Rule |
 |---|---|---|
-| Caption | `XMP-dc:Description` (default language + yours) | Only if empty, or if As If wrote it and nobody has edited it since |
-| Keywords | `XMP-dc:Subject` (plus `IPTC:Keywords` with `--compat wide`) | Added, de-duplicated, never removed |
+| Caption | `XMP-dc:Description` (default language + yours) | Only if the photo has no caption yet (in XMP, IPTC or EXIF; camera filler like "OLYMPUS DIGITAL CAMERA" doesn't count), or if As If wrote it and nobody has edited it since |
+| Keywords | `XMP-dc:Subject` (plus `IPTC:Keywords` with `--compat wide`, JPEG and TIFF only) | Added and de-duplicated against your XMP and IPTC keywords, never removed. Keywords you only have in IPTC are copied into XMP first, so apps that read XMP still show them; if that can't be done safely, no keywords are added and the summary says why |
 | "As If did this" | `XMP-asif:*`: tool and model version, model hash, prompt version, run id, time, and exactly what was added | Always |
 | Image fingerprint | `XMP-et:OriginalImageHash` (SHA-256 of the pixel data) | Once, never overwritten |
-| **Never touched** | Dates, GPS, orientation, colour profile, maker notes, previews, the image itself | — |
+| **Never touched** | Dates, GPS, orientation, colour profile, maker notes, previews, the image itself | A TIFF with maker notes is skipped, because exiftool would have to rewrite them |
 
-Formats written today: **JPEG, PNG, WebP, TIFF**. HEIC/AVIF, RAW (sidecars) and video are skipped and listed in the summary.
+Formats written today: **JPEG, PNG, WebP, TIFF**. HEIC/AVIF, RAW (sidecars) and video are skipped and listed in the summary, and so is any file As If can't prove safe to write: a TIFF with maker notes or with data nothing points to, XMP with markup inside a value or unlinked extended XMP, an ImageMagick "raw profile" PNG, or a file whose extension doesn't match its content.
 
 ---
 
@@ -78,11 +78,12 @@ Each one is a rule enforced by code and checked by the test suite, not just a pr
 |---|---|
 | Originals are never modified | M1 only reads them and writes copies to a different folder. A file already at the destination is never overwritten. |
 | The image data is unchanged | exiftool's `ImageDataHash` (SHA-256) before and after must match. |
-| Nothing else changed either | Every tag outside As If's own fields is compared, binary ones byte-for-byte. For JPEG, PNG and WebP, every byte outside the XMP packet must match too. |
+| Nothing else changed either | Every tag outside As If's own fields is compared, unknown ones too, and binary ones byte for byte. For JPEG, PNG and WebP, every byte outside the XMP packet must match too; for TIFF, every byte must be reachable from what exiftool rewrites. The XMP's own text is also read with an XML parser, so nothing exiftool's parser misses can silently vanish. |
+| Your captions and keywords are never removed | The gate checks this itself instead of trusting the writer: every keyword there before is still there after, and a caption may only change if it's As If's own, unedited (its hash matches the one As If recorded). |
 | Motion photos and multi-picture files survive | The data after a JPEG's end marker (motion-photo video, Ultra HDR gain maps) must be byte-identical, or the photo is skipped. |
-| Nothing is clobbered | If the original changes while As If works on it, the photo is skipped. |
+| Nothing is clobbered | If the original changes while As If works on it, the photo is skipped. If it changed after its copy was made, a re-run says so instead of calling the old copy done. |
 | The copy on disk is the copy that was checked | It's written atomically, then read back and compared. |
-| Plaintext stays in RAM | Photos are worked on in a private RAM folder (tmpfs), overwritten and deleted after each one. No RAM folder? As If refuses to start unless you pass `--allow-disk-workdir`. |
+| Plaintext stays in RAM | Photos are worked on in a private RAM folder (tmpfs). Every copy, including the one exiftool replaces during the write, is overwritten and deleted after each photo. No RAM folder? As If refuses to start unless you pass `--allow-disk-workdir`. |
 | Stopping is safe | Ctrl+C, `kill`, closing the terminal: the RAM copy is wiped and every helper process stops before As If exits. Core dumps are off, so a crash can't write a photo to disk. If As If is killed outright, the next run wipes what it left in RAM. |
 | Private photos stay private | A copy never gets more permissions than its original effectively had: photos from a `0700` folder are copied into `0700` folders. |
 | No network in the main process | CI fails if orchestrator code imports networking modules (checked by importing all of it and by reading the source). At runtime an audit hook turns any socket use by Python code into a crash. Native code could get around a Python hook; the real wall is the sandbox in M3. |
