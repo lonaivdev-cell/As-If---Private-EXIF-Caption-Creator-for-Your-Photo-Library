@@ -10,7 +10,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
-from asif import cli
+from asif import cli, paths
 from asif.cli import EXIT_INTERRUPTED, EXIT_ITEMS_FAILED, EXIT_USAGE, app
 from tests.conftest import requires_exiftool
 
@@ -249,15 +249,126 @@ def test_names_that_arent_utf8_dont_crash_the_summary(
         assert "1" in text and "captioned" in text
 
 
-@pytest.mark.parametrize("broken", ["unmounted", "state_is_a_file", "log_is_a_folder", "no_access"])
+def test_summary_escapes_control_characters_in_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    from asif.pipeline.local import ItemOutcome, RunSummary, iter_problems
+    from asif.pipeline.states import State
+
+    out = _strict_stdout(monkeypatch)
+    names = {
+        "x\x1b]52;c;QQ==\x1b\\.heic": "x\\x1b]52;c;QQ==\\x1b\\.heic",  # writes the clipboard
+        "y\x1b[2K\x1b[1A.heic": "y\\x1b[2K\\x1b[1A.heic",  # erases the line above
+        "z\x9b2K.heic": "z\\x9b2K.heic",  # the same, as one C1 character
+        "w\x7f\r.heic": "w\\x7f\\x0d.heic",  # DEL, and a return to the start of the line
+    }
+    summary = RunSummary(
+        run_id="r_1",
+        dry_run=False,
+        outcomes=[ItemOutcome(name, State.SKIPPED_FORMAT, "HEIC/AVIF: not yet") for name in names],
+    )
+    cli._print_summary(summary, list(iter_problems(summary)))
+    text = out.getvalue().decode("utf-8")
+    for char in ("\x1b", "\x9b", "\x7f", "\r"):
+        assert char not in text
+    for shown in names.values():
+        assert shown in text
+
+
+@requires_exiftool
+def test_control_characters_in_a_name_never_reach_the_terminal(
+    fixtures_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = _strict_stdout(monkeypatch)
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "a.jpg")
+    (src / "x\x1b]52;c;QQ==\x1b\\.heic").write_bytes(b"from a downloaded zip")
+    result = runner.invoke(app, ["caption", str(src), str(tmp_path / "out"), "-m", "stub"])
+    assert result.exit_code == 0, result.output
+    text = out.getvalue().decode("utf-8") + result.output
+    assert "\x1b" not in text
+    assert "x\\x1b]52;c;QQ==\\x1b\\.heic" in text  # under "Needs a look"
+
+
+def test_the_model_log_keeps_its_lines_but_not_its_control_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from asif.infer.client import InferenceError
+    from asif.pipeline import local
+
+    def failing(*args: object, **kwargs: object) -> object:
+        raise InferenceError("start", "llama-server said:\nfirst line\nsecond\x1b[2K line")
+
+    monkeypatch.setattr(local, "caption_folder", failing)
+    (tmp_path / "src").mkdir()
+    result = runner.invoke(
+        app, ["caption", str(tmp_path / "src"), str(tmp_path / "out"), "-m", "stub"]
+    )
+    assert result.exit_code == EXIT_USAGE, result.output
+    assert "\x1b" not in result.output
+    lines = [line.strip(" │") for line in result.output.splitlines()]
+    assert "first line" in lines
+    assert "second\\x1b[2K line" in lines
+
+
+@requires_exiftool
+@pytest.mark.parametrize("stage", ["open", "commit"])
+def test_a_timings_log_that_fills_its_disk_mid_run_changes_no_photo(
+    fixtures_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """The state disk fills up as a photo's ``stage`` event is logged."""
+    import errno
+    from typing import Any
+
+    full = False
+    real_open = Path.open
+
+    class FillingLog:
+        def __init__(self, fh: Any) -> None:
+            self.fh = fh
+
+        def __enter__(self) -> FillingLog:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.fh.close()
+
+        def write(self, line: str) -> int:
+            nonlocal full
+            full = full or f'"stage":"{stage}"' in line
+            if full:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return int(self.fh.write(line))
+
+    def filling_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        fh = real_open(self, mode, *args, **kwargs)
+        return FillingLog(fh) if self.name == "timings.jsonl" and mode == "a" else fh
+
+    monkeypatch.setattr(Path, "open", filling_open)
+    src = tmp_path / "src"
+    src.mkdir()
+    for name in ("a.jpg", "b.jpg"):
+        shutil.copy2(fixtures_dir / "plain.jpg", src / name)
+    out = tmp_path / "out"
+    result = runner.invoke(app, ["caption", str(src), str(out), "-m", "stub"])
+    assert result.exit_code == 0, result.output
+    message = " ".join(result.output.split())
+    assert "2 captioned" in message
+    assert "Needs a look" not in message
+    assert sorted(p.name for p in out.iterdir()) == ["a.jpg", "b.jpg"]
+    assert "stopped partway through the run (No space left on device)" in message
+    assert "Your photos weren't affected" in message
+    assert message.index("2 captioned") < message.index("stopped partway")  # after the summary
+    assert full
+
+
+@pytest.mark.parametrize("broken", ["state_is_a_file", "log_is_a_folder", "no_access"])
 def test_a_state_folder_that_cant_be_written_stops_before_any_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broken: str
 ) -> None:
     home = tmp_path / "home"
     (home / "state").mkdir(parents=True)
-    if broken == "unmounted":  # ASIF_HOME on an encrypted volume that isn't mounted
-        home = tmp_path / "Vault" / "asif"
-    elif broken == "state_is_a_file":
+    (home / paths.HOME_MARKER).touch()
+    if broken == "state_is_a_file":
         (home / "state").rmdir()
         (home / "state").write_text("")
     elif broken == "log_is_a_folder":
@@ -284,22 +395,136 @@ def test_a_state_folder_that_cant_be_written_stops_before_any_work(
     assert "mounted" in message
     assert "enabled = false under [telemetry]" in message
     assert not out.exists()
-    assert not (tmp_path / "Vault").exists()  # nothing made on the disk under a mount point
 
 
-@requires_exiftool
-def test_a_missing_asif_home_is_never_created_by_a_dry_run(
-    fixtures_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _tree(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+# Each command but these stops when ASIF_HOME isn't set up.
+_WORK_WITHOUT_HOME = {"version", "config path", "config init"}
+_STOP_WITHOUT_HOME = [
+    ("caption", ["caption", "{src}", "{out}", "-m", "stub"]),
+    ("caption", ["caption", "{src}", "{out}", "-m", "stub", "--dry-run"]),
+    ("config show", ["config", "show"]),
+    ("config show", ["--config", "{cfg}", "config", "show"]),
+    ("doctor", ["doctor", "--json"]),
+    ("models list", ["models", "list"]),
+    ("models recommend", ["models", "recommend"]),
+]
+
+
+def test_every_command_is_listed_as_needing_asif_home_or_not() -> None:
+    import typer.main
+
+    def leaves(command: object, words: tuple[str, ...] = ()) -> list[str]:
+        subcommands = getattr(command, "commands", None)
+        if subcommands is None:
+            return [" ".join(words)]
+        return [n for name, sub in subcommands.items() for n in leaves(sub, (*words, name))]
+
+    listed = {name for name, _ in _STOP_WITHOUT_HOME} | _WORK_WITHOUT_HOME
+    assert set(leaves(typer.main.get_command(app))) == listed
+
+
+@pytest.mark.parametrize(
+    ("home", "mount_point_left"),
+    [
+        ("Vault/asif", False),  # the mount point goes away when locked (/media, /Volumes)
+        ("Vault/asif", True),  # an empty folder is left (gocryptfs, CryFS, fstab LUKS)
+        ("Vault", True),  # ASIF_HOME is the mount point itself
+    ],
+)
+@pytest.mark.parametrize(("command", "args"), _STOP_WITHOUT_HOME)
+def test_an_asif_home_that_isnt_set_up_stops_before_the_config_is_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    home: str,
+    mount_point_left: bool,
+    command: str,
+    args: list[str],
 ) -> None:
-    monkeypatch.setenv("ASIF_HOME", str(tmp_path / "Vault" / "asif"))
+    if mount_point_left:
+        (tmp_path / "Vault").mkdir()
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path / home))
     src = tmp_path / "src"
     src.mkdir()
-    shutil.copy2(fixtures_dir / "plain.jpg", src / "a.jpg")
+    (src / "a.jpg").write_bytes(b"never read")
+    cfg = tmp_path / "mine.toml"
+    cfg.write_text('[general]\ncaption_lang = "pt-BR"\n')
+    before = _tree(tmp_path)
+    fill = {"src": str(src), "out": str(tmp_path / "out"), "cfg": str(cfg)}
+    result = runner.invoke(app, [arg.format(**fill) for arg in args])
+    assert result.exit_code == EXIT_USAGE, result.output
+    message = " ".join(result.output.split())
+    assert f"Can't start: ASIF_HOME {tmp_path / home} isn't set up here" in message
+    assert "is its volume mounted?" in message
+    assert "run `asif config init`" in message
+    assert _tree(tmp_path) == before  # nothing made on the disk under a mount point
+
+
+def test_version_and_config_path_work_when_asif_home_isnt_set_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "Vault").mkdir()
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path / "Vault" / "asif"))
+    assert runner.invoke(app, ["version"]).exit_code == 0
+    result = runner.invoke(app, ["config", "path"])
+    assert result.exit_code == 0, result.output
+    shown = "".join(result.stdout.split())  # rich wraps long paths
+    assert shown == str(tmp_path / "Vault" / "asif" / "config" / "config.toml")
+    assert _tree(tmp_path) == ["Vault"]
+
+
+def test_config_init_never_creates_the_folders_asif_home_is_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path / "Vault" / "asif"))
+    result = runner.invoke(app, ["config", "init"])
+    assert result.exit_code == EXIT_USAGE, result.output
+    message = " ".join(result.output.split())
+    assert f"Can't set up ASIF_HOME {tmp_path / 'Vault' / 'asif'}" in message
+    assert f"{tmp_path / 'Vault'} doesn't exist" in message
+    assert "check that it's mounted" in message
+    assert _tree(tmp_path) == []
+
+
+def test_config_init_sets_up_asif_home_for_the_commands_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "Vault").mkdir()  # mounted
+    home = tmp_path / "Vault" / "asif"
+    monkeypatch.setenv("ASIF_HOME", str(home))
+    result = runner.invoke(app, ["config", "init"])
+    assert result.exit_code == 0, result.output
+    assert f"Set up ASIF_HOME {home}" in " ".join(result.output.split())
+    assert (home / paths.HOME_MARKER).is_file()
+    assert (home / "config" / "config.toml").is_file()
+    assert home.stat().st_mode & 0o777 == 0o700
+    assert runner.invoke(app, ["config", "show"]).exit_code == 0
+    (tmp_path / "src").mkdir()
     result = runner.invoke(
-        app, ["caption", str(src), str(tmp_path / "out"), "-m", "stub", "--dry-run"]
+        app, ["caption", str(tmp_path / "src"), str(tmp_path / "out"), "-m", "stub"]
     )
     assert result.exit_code == 0, result.output
-    assert not (tmp_path / "Vault").exists()
+    assert "No photos found" in result.output
+    assert (home / "state" / "timings.jsonl").is_file()
+
+
+def test_config_init_keeps_the_settings_in_an_asif_home_without_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "asif"
+    (home / "config").mkdir(parents=True)  # made by an older As If
+    (home / "config" / "config.toml").write_text('[general]\ncaption_lang = "pt-BR"\n')
+    monkeypatch.setenv("ASIF_HOME", str(home))
+    assert runner.invoke(app, ["config", "show"]).exit_code == EXIT_USAGE
+    result = runner.invoke(app, ["config", "init"])
+    assert result.exit_code == 0, result.output
+    assert "Kept your config file" in result.output
+    shown = runner.invoke(app, ["config", "show"])
+    assert shown.exit_code == 0, shown.output
+    assert json.loads(shown.stdout)["general"]["caption_lang"] == "pt-BR"
 
 
 def test_a_library_of_linked_folders_says_so(tmp_path: Path) -> None:

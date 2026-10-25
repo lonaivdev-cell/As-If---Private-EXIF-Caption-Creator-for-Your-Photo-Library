@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -53,6 +56,31 @@ def test_disabled_log_writes_nothing(tmp_path: Path) -> None:
     with log.timed("infer"):
         pass
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_write_that_fails_mid_run_stops_the_log_not_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "t.jsonl"
+    log = TimingsLog(path, run_id="r_1", model="m")
+    log.event("run_start")
+    real_open = Path.open
+
+    def full_disk(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == path:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", full_disk)
+    with pytest.raises(ValueError, match="the stage's own"), log.timed("write", "i_1"):
+        raise ValueError("the stage's own error")  # not replaced by the log's
+    with log.timed("commit", "i_1"):
+        pass
+    assert log.problem == "No space left on device"
+    monkeypatch.setattr(Path, "open", real_open)  # space again: the log stays off for this run
+    log.event("run_end")
+    assert [e["stage"] for e in _events(path)] == ["run_start"]
+    assert log.problem == "No space left on device"
 
 
 def test_prune_drops_old_and_garbled_lines(tmp_path: Path) -> None:

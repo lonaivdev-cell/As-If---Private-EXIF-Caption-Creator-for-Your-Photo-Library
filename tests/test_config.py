@@ -106,13 +106,44 @@ def test_ensure_private_dir(tmp_path: Path) -> None:
     assert path.stat().st_mode & 0o777 == 0o700
 
 
-def test_ensure_private_dir_never_creates_the_folders_asif_home_is_in(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("home", "mount_point_left"),
+    [
+        ("Vault/asif", False),  # the mount point goes away when locked (/media, /Volumes)
+        ("Vault/asif", True),  # an empty folder is left (gocryptfs, CryFS, fstab LUKS)
+        ("Vault", True),  # ASIF_HOME is the mount point itself
+    ],
+)
+def test_ensure_private_dir_never_writes_to_an_asif_home_that_isnt_set_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: str, mount_point_left: bool
 ) -> None:
     # An encrypted volume that isn't mounted, or a typo: nothing goes on the disk underneath.
-    monkeypatch.setenv("ASIF_HOME", str(tmp_path / "Vault" / "asif"))
-    with pytest.raises(FileNotFoundError, match="Vault doesn't exist"):
+    if mount_point_left:
+        (tmp_path / "Vault").mkdir()
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path / home))
+    assert paths.asif_home_not_set_up() == tmp_path / home
+    before = sorted(tmp_path.rglob("*"))
+    with pytest.raises(FileNotFoundError, match="isn't set up here"):
         paths.ensure_private_dir(paths.state_dir())
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_setting_up_asif_home_never_creates_the_folders_its_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "Vault" / "asif"
+    monkeypatch.setenv("ASIF_HOME", str(home))
+    with pytest.raises(FileNotFoundError, match="Vault doesn't exist"):
+        paths.set_up_asif_home()
     assert not (tmp_path / "Vault").exists()
+
     (tmp_path / "Vault").mkdir()  # mounted
+    assert paths.set_up_asif_home() is True
+    assert (home / paths.HOME_MARKER).is_file()
+    assert paths.asif_home_not_set_up() is None
     assert paths.ensure_private_dir(paths.state_dir()).is_dir()
+    assert paths.set_up_asif_home() is False  # already set up
+
+    monkeypatch.delenv("ASIF_HOME")
+    assert paths.asif_home_not_set_up() is None
+    assert paths.set_up_asif_home() is False

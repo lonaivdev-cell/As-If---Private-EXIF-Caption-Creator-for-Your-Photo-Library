@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from asif import proc
+from asif import paths, proc
 
 
 def _python(code: str) -> subprocess.CompletedProcess[str]:
@@ -192,6 +192,7 @@ def test_sigterm_mid_photo_leaves_no_plaintext_and_no_children(tmp_path: Path) -
     )
     env = {**os.environ, "ASIF_HOME": str(tmp_path / "home")}
     (tmp_path / "home" / "config").mkdir(parents=True)
+    (tmp_path / "home" / paths.HOME_MARKER).touch()  # set up, as `asif config init` does
     (tmp_path / "home" / "config" / "config.toml").write_text(f'[resources]\nwork_dir = "{ram}"\n')
     run = subprocess.Popen([sys.executable, "-c", driver], env=env, stderr=subprocess.PIPE)
     try:
@@ -331,6 +332,8 @@ def test_sigkill_of_the_real_cli_leaves_no_helper_running(tmp_path: Path) -> Non
         """
     )
     env = {**os.environ, "ASIF_HOME": str(tmp_path / "home")}
+    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / paths.HOME_MARKER).touch()  # set up, as `asif config init` does
     run = subprocess.Popen([sys.executable, "-c", driver], env=env, stderr=subprocess.DEVNULL)
     try:
         for _ in range(300):

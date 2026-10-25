@@ -26,6 +26,7 @@ be a caption, a keyword or GPS coordinates.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -159,6 +160,31 @@ _MPF_IMAGE_START = re.compile(r"MPImage\d+:MPImageStart")
 # language of it): C2PA's link to Content Credentials kept outside the file.
 _C2PA_LINK = re.compile(r"XMP-dcterms:Provenance(?:-[\w-]+)?")
 
+# A JPEG's EXIF can point past the end of the image, to a preview in the
+# trailer: Olympus and Minolta maker notes do, and so do older Sony ones
+# (tag 0x2001, into the MPF preview image; exiftool's Sony.pm lists the
+# DSLR-A230 to the A7S). The offset counts from the EXIF header, and
+# exiftool writing XMP copies the EXIF as it is, so new XMP in front of
+# the trailer moves the preview and the pointer goes stale. ``snapshot``
+# refuses such a file; the protected gate would fail it after the model.
+PREVIEW_AFTER_IMAGE = (
+    "its EXIF points to a preview stored after the image, which new XMP would move"
+)
+# - Where exiftool says a preview, thumbnail or data block starts: with -n,
+#   an offset from the start of the file.
+_POINTER = re.compile(r"\w*(?:ImageStart|PreviewStart|ThumbnailOffset|DataOffset)|JpgFromRawStart")
+#   Not pointers from the EXIF: MPF's offsets count from the MPF segment
+#   (``_MPF_IMAGE_START``), XMP's from the end of the file (a motion photo's
+#   MicroVideoOffset), and File is exiftool's own.
+_NOT_EXIF = re.compile(r"MPF0|MPImage\d+|XMP(?:-[\w-]+)?|File")
+# - Sony's 0x2001 has no offset tag: exiftool gives the preview itself, as
+#   ``Sony:PreviewImage``, so the file is searched for its bytes. Only in the
+#   maker note's own group (``ExifIFD:MakerNoteSony`` -> "Sony"): MPF images
+#   and trailers exiftool reads (FotoStation's, say) hold previews too, and
+#   their offsets survive a write.
+_MAKER_NOTE = re.compile(r"[\w-]+:MakerNote([A-Za-z]+?)\d*")
+_NUMBERS = re.compile(r"[0-9]+(?: [0-9]+)*")
+
 # Allowed doesn't mean anything goes: the fields As If writes are
 # additive-only (§7), and the protected gate checks that itself rather than
 # trusting the writer.
@@ -289,7 +315,8 @@ class Snapshot:
     would move) and for one exiftool can't write without losing or
     rewriting something: a TIFF with a maker note or with bytes nothing
     points to, XMP with markup inside a value, metadata exiftool warns it
-    can't read in full, Content Credentials, Apple's iDOT PNG chunk. It is
+    can't read in full, Content Credentials, Apple's iDOT PNG chunk, a JPEG
+    whose EXIF points to a preview after the image. It is
     a limit of the format or of exiftool, not a sign of a bug, so the
     caller should skip the file before writing. Only a file whose structure
     can't be parsed gets a reason starting "its structure can't be
@@ -386,6 +413,8 @@ def snapshot(et: ExifTool, path: Path) -> Snapshot:
     data = path.read_bytes() if fmt in _KEEP_BYTES else None
     xmp, unprovable = _inspect(path, fmt, data)
     unprovable = unprovable or unhashable or _exiftool_limit(fmt, tags, warnings)
+    if unprovable is None and fmt == "jpeg" and data is not None:
+        unprovable = _preview_after_image(data, tags)
     if data is None:
         fp = fingerprint(path)
         return Snapshot(fmt, image_hash, fp.size, fp.sha256, tags, None, xmp, unprovable)
@@ -414,6 +443,41 @@ def _exiftool_limit(fmt: str, tags: dict[str, Any], warnings: list[str]) -> str 
             "it's a TIFF with an embedded preview that exiftool would move, which As If can't check"
         )
     return None
+
+
+def _preview_after_image(data: bytes, tags: dict[str, Any]) -> str | None:
+    """``PREVIEW_AFTER_IMAGE`` if the JPEG's EXIF points into the bytes after
+    its image (see there); None if it doesn't."""
+    try:
+        eoi = structure.jpeg_eoi_offset(data)
+    except StructureError:
+        return None  # _inspect said so already
+    makers = {m[1] for key in tags if (m := _MAKER_NOTE.fullmatch(key.partition("#")[0]))}
+    for key, value in tags.items():
+        group, _, name = key.partition("#")[0].partition(":")
+        if _POINTER.fullmatch(name) and not _NOT_EXIF.fullmatch(group):
+            # One past the end of the file points nowhere: a write can't break it.
+            if any(eoi <= at < len(data) for at in _numbers(value)):
+                return PREVIEW_AFTER_IMAGE
+        elif name == "PreviewImage" and group in makers and str(value).startswith("base64:"):
+            try:
+                preview = base64.b64decode(str(value)[7:], validate=True)
+            except ValueError:
+                continue
+            # exiftool rewrites the first byte of Sony's, so that one is left
+            # out. Found first after the image: nothing before it has the bytes.
+            if len(preview) > 1 and data.find(preview[1:]) >= eoi:
+                return PREVIEW_AFTER_IMAGE
+    return None
+
+
+def _numbers(value: object) -> list[int]:
+    """The numbers in a raw (-n) value: one, or several separated by spaces."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [value]
+    if isinstance(value, str) and _NUMBERS.fullmatch(value):
+        return [int(n) for n in value.split()]
+    return []
 
 
 def _inspect(path: Path, fmt: str, data: bytes | None) -> tuple[Counter[str], str | None]:

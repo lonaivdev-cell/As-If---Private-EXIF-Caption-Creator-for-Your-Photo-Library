@@ -7,6 +7,7 @@ capability: ``main()`` installs the netguard tripwire before anything else.
 from __future__ import annotations
 
 import json
+import re
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -58,22 +59,47 @@ class Compat(StrEnum):
 
 _state = _State()
 
+# Control characters (C0, DEL and C1), except the newline and tab that
+# multi-line messages need.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
 
 def _safe(text: str) -> str:
     """``text`` ready to print: markup escaped, and fine on any UTF-8 terminal.
 
     A name that isn't UTF-8 (Latin-1 from an old camera card or a Windows zip)
     arrives with its odd bytes as stand-in characters that a strict UTF-8
-    terminal refuses to print. They're shown as ``\\xe9`` instead.
+    terminal refuses to print. They're shown as ``\\xe9`` instead. Control
+    characters are shown the same way (``\\x1b``), so a crafted file name
+    can't send the terminal commands, like writing the clipboard or erasing
+    lines of the summary.
     """
     try:
         raw = text.encode("utf-8", "surrogateescape")
     except UnicodeEncodeError:  # a stand-in no file name decodes to
         raw = text.encode("utf-8", "backslashreplace")
-    return escape(raw.decode("utf-8", "backslashreplace"))
+    shown = raw.decode("utf-8", "backslashreplace")
+    return escape(_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", shown))
+
+
+def _require_home() -> None:
+    """Stop if ``ASIF_HOME`` is set but isn't set up here.
+
+    Checked before the config is read: a locked encrypted volume often leaves
+    an empty folder at its mount point, and using it would mean the default
+    settings instead of yours, and state on the disk underneath.
+    """
+    home = paths.asif_home_not_set_up()
+    if home is not None:
+        err.print(
+            f"[red]Can't start:[/] ASIF_HOME {_safe(str(home))} isn't set up here (is its "
+            "volume mounted? To set it up, run `asif config init`)"
+        )
+        raise typer.Exit(EXIT_USAGE)
 
 
 def _load() -> Config:
+    _require_home()
     if _state.config_path is not None and not _state.config_path.is_file():
         err.print(f"[red]Config problem:[/] {_safe(str(_state.config_path))} doesn't exist.")
         raise typer.Exit(EXIT_USAGE)
@@ -291,6 +317,11 @@ def caption(
     for message in notices:
         err.print(f"[yellow]Note:[/] {_safe(message)}")
     _print_summary(summary, list(iter_problems(summary)))
+    if log.problem is not None:
+        err.print(
+            f"[yellow]Note:[/] The timings log {_safe(str(log.path))} stopped partway through "
+            f"the run ({_safe(log.problem)}). Your photos weren't affected."
+        )
     if summary.interrupted:
         raise typer.Exit(EXIT_INTERRUPTED)
     if summary.aborted:
@@ -389,6 +420,7 @@ def models_list() -> None:
     """Show the models As If knows about."""
     from asif.models.manifest import load_manifest
 
+    _require_home()
     table = Table(title="Model catalogue (§9 of the design)")
     for col in ("id", "tier", "size", "languages", "licence", "pinned"):
         table.add_column(col)
@@ -440,9 +472,25 @@ def config_show() -> None:
 def config_init(
     force: Annotated[bool, typer.Option(help="Overwrite an existing config file.")] = False,
 ) -> None:
-    """Write a commented starter config file."""
+    """Write a commented starter config file, and set up ASIF_HOME if you use it."""
     target = _state.config_path or paths.config_file()
+    # The only place ASIF_HOME is created (never the folders it's in).
+    home = paths.asif_home_not_set_up()
+    try:
+        set_up = paths.set_up_asif_home()
+    except OSError as exc:
+        err.print(
+            f"[red]Can't set up[/] ASIF_HOME {_safe(str(home))} "
+            f"({_safe(exc.strerror or str(exc))}). If it's on a drive or encrypted volume, "
+            "check that it's mounted."
+        )
+        raise typer.Exit(EXIT_USAGE) from exc
+    if set_up:
+        console.print(f"Set up ASIF_HOME {_safe(str(home))}")
     if target.exists() and not force:
+        if set_up:  # only the marker was missing: keep the settings
+            console.print(f"Kept your config file {_safe(str(target))}")
+            return
         err.print(f"{_safe(str(target))} already exists. Use --force to replace it.")
         raise typer.Exit(EXIT_USAGE)
     try:

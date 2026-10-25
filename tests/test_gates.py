@@ -8,12 +8,14 @@ each gate must fail when the thing it guards is tampered with afterwards.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import dataclasses
 import hashlib
 import io
 import json
 import os
+import shutil
 import struct
 import time
 import zlib
@@ -25,10 +27,12 @@ from typing import Any, Literal
 import pytest
 from PIL import Image, ImageCms, PngImagePlugin
 
+from asif.config import Config
 from asif.meta import structure
 from asif.meta.exiftool import ExecResult, ExifTool, ExifToolError
 from asif.meta.gates import (
     MAX_GROWTH,
+    PREVIEW_AFTER_IMAGE,
     Fingerprint,
     GateResult,
     Snapshot,
@@ -41,7 +45,20 @@ from asif.meta.gates import (
     snapshot,
 )
 from asif.meta.structure import C2PA_LINK_PROBLEM, C2PA_PROBLEM, jpeg_eoi_offset
+from asif.pipeline import local
+from asif.pipeline.local import caption_folder, choose_model
+from asif.pipeline.states import State
+from asif.pipeline.timings import TimingsLog
 from tests.conftest import HAVE_EXIFTOOL
+from tests.fixtures.make_fixtures import (
+    exif_segment,
+    ifd,
+    long,
+    olympus_jpeg,
+    scene_jpeg,
+    sony_jpeg,
+    with_mpf,
+)
 from tests.test_structure import (
     LITERAL,
     Tiff,
@@ -1583,6 +1600,229 @@ def test_apple_png_with_xmp_ahead_of_idot_passes(et: ExifTool, tmp_path: Path) -
     assert before.unprovable is None
     legit_write(et, path, "xmp", before.image_hash)
     assert all_ok(results := check_written(et, before, path, compat="xmp")), results
+
+
+# -- maker notes pointing past a JPEG's image ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "detail"),
+    [
+        ("sony_preview.jpg", "added: File:PreviewImage; removed: Sony:PreviewImage"),
+        ("olympus_preview.jpg", "changed: Olympus:PreviewImageStart"),
+    ],
+)
+def test_preview_after_the_image_is_refused_and_caught(
+    et: ExifTool, fixture_copy: FixtureCopy, name: str, detail: str
+) -> None:
+    path = fixture_copy(name)
+    before = snapshot(et, path)
+    assert before.unprovable == PREVIEW_AFTER_IMAGE
+    legit_write(et, path, "xmp", before.image_hash)
+    # Why: the new XMP moved the preview, and the maker note still points
+    # where it was. Every byte is still there, so only this gate sees it.
+    unflagged = dataclasses.replace(before, unprovable=None)
+    results = check_written(et, unflagged, path, compat="xmp")
+    assert failing(results) == {"protected"}
+    assert by_name(results)["protected"].detail == detail
+
+
+def _nikon_note(at: int) -> bytes:
+    """A Nikon maker note: its own TIFF header, and a PreviewIFD whose preview
+    sits inside the note, so inside the EXIF segment."""
+    preview = scene_jpeg((160, 120), 41)
+    tags = ((0x0001, 7, 4, b"0210"), long(0x0011, 0))
+    preview_ifd = 8 + len(ifd(8, *tags))
+    starts = 0x0201, 0x0202  # PreviewImageStart and -Length
+    preview_at = preview_ifd + len(ifd(preview_ifd, long(starts[0], 0), long(starts[1], 0)))
+    return (
+        b"Nikon\x00\x02\x10\x00\x00II*\x00\x08\x00\x00\x00"
+        + ifd(8, tags[0], (0x0011, 13, 1, preview_ifd))
+        + ifd(preview_ifd, long(starts[0], preview_at), long(starts[1], len(preview)))
+        + preview
+    )
+
+
+def _samsung_motion_photo() -> bytes:
+    """A Galaxy motion photo: a Samsung maker note, and the video in Samsung's
+    own trailer (SEFT), whose offsets count back from its directory."""
+    exif = exif_segment(
+        "samsung", "SM-G950F", lambda at: ifd(at, (0x0001, 7, 4, b"0100"), long(0x0002, 0x12000))
+    )
+    image = scene_jpeg((640, 480), 42)
+    name = b"MotionPhoto_Data"
+    video = b"\x00\x00\x00\x18ftypmp42" + bytes(range(256)) * 400
+    block = struct.pack("<HHI", 0, 0x0A30, len(name)) + name + video
+    sefh = b"SEFH" + struct.pack("<IIHHII", 101, 1, 0, 0x0A30, len(block), len(block))
+    seft = block + sefh + struct.pack("<I", len(sefh)) + b"SEFT"
+    return image[:2] + exif + image[2:] + seft
+
+
+_CONTAINER = (
+    'xmlns:Container="http://ns.google.com/photos/1.0/container/" '
+    'xmlns:Item="http://ns.google.com/photos/1.0/container/item/" '
+)
+
+
+def _directory(*items: str) -> str:
+    """A Google container directory: the files in the JPEG, the primary image first."""
+    lis = "".join(
+        f'<rdf:li rdf:parseType="Resource"><Container:Item {item}/></rdf:li>' for item in items
+    )
+    return f"<Container:Directory><rdf:Seq>{lis}</rdf:Seq></Container:Directory>"
+
+
+def _pixel_motion_photo() -> bytes:
+    """A Pixel motion photo: its video, longer than the image, right after it."""
+    video = b"\x00\x00\x00\x18ftypisom" + bytes(range(256)) * 400
+    packet = xmp_packet(
+        _directory(
+            'Item:Semantic="Primary" Item:Mime="image/jpeg" Item:Length="0" Item:Padding="0"',
+            f'Item:Semantic="MotionPhoto" Item:Mime="video/mp4" Item:Length="{len(video)}"',
+        ),
+        attrs=_CONTAINER + 'xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" '
+        f'GCamera:MotionPhoto="1" GCamera:MotionPhotoVersion="1" GCamera:MicroVideo="1" '
+        f'GCamera:MicroVideoOffset="{len(video)}"',
+    )
+    image = scene_jpeg((640, 480), 43)
+    return image[:2] + std_xmp(packet) + image[2:] + video
+
+
+def _ultra_hdr() -> bytes:
+    """An Ultra HDR photo: XMP, MPF, and the gain map (with XMP of its own) after it."""
+    hdrgm = 'xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/" hdrgm:Version="1.0"'
+    gain = scene_jpeg((320, 240), 44)
+    ranges = ' hdrgm:GainMapMax="2.3" hdrgm:OffsetSDR="0.015625" hdrgm:OffsetHDR="0.015625"'
+    gain = gain[:2] + std_xmp(xmp_packet("", attrs=hdrgm + ranges)) + gain[2:]
+    primary = xmp_packet(
+        _directory(
+            'Item:Semantic="Primary" Item:Mime="image/jpeg"',
+            f'Item:Semantic="GainMap" Item:Mime="image/jpeg" Item:Length="{len(gain)}"',
+        ),
+        attrs=_CONTAINER + hdrgm,
+    )
+    return with_mpf(std_xmp(primary), gain, 45)
+
+
+def _fotostation_preview() -> bytes:
+    """A FotoWare FotoStation trailer: a record holding a preview of its own."""
+    preview = scene_jpeg((160, 120), 46)
+    record = preview + struct.pack(">HII", 4, len(preview) + 10, 0xA1B2C3D4)  # tag, size, signature
+    return scene_jpeg((640, 480), 47) + record
+
+
+def _olympus_pointing_past_the_end() -> bytes:
+    """An Olympus whose preview pointer leads past the end of the file, and no preview."""
+    data = olympus_jpeg(48, preview_at=10**7)
+    return data[: jpeg_eoi_offset(data)]
+
+
+# Each one with a tag showing exiftool read what the case is about.
+UNBROKEN: dict[str, tuple[Callable[[], bytes], str]] = {
+    "sony-without-0x2001": (
+        lambda: sony_jpeg(49, preview_pointer=False),
+        "MPImage2:MPImageStart",  # past the image, but counted from the MPF segment
+    ),
+    "olympus-pointing-past-the-end": (_olympus_pointing_past_the_end, "Olympus:PreviewImageStart"),
+    "nikon-preview-in-the-exif-and-mpf": (
+        lambda: with_mpf(
+            exif_segment("NIKON CORPORATION", "NIKON D750", _nikon_note),
+            scene_jpeg((320, 240), 50),
+            51,
+        ),
+        "PreviewIFD:PreviewImage",
+    ),
+    "canon-with-mpf": (
+        lambda: with_mpf(
+            exif_segment("Canon", "Canon EOS R", canon_maker_note), scene_jpeg((320, 240), 52), 53
+        ),
+        "Canon:CanonFirmwareVersion",
+    ),
+    "samsung-motion-photo": (_samsung_motion_photo, "Samsung:EmbeddedVideoFile"),
+    "pixel-motion-photo": (_pixel_motion_photo, "XMP-GCamera:MicroVideoOffset"),
+    "ultra-hdr": (_ultra_hdr, "XMP-hdrgm:Version"),
+    "fotostation-preview": (_fotostation_preview, "FotoStation:PreviewImage"),
+}
+
+
+@pytest.mark.parametrize("case", UNBROKEN)
+def test_previews_a_write_cant_break_pass(et: ExifTool, tmp_path: Path, case: str) -> None:
+    make, shown = UNBROKEN[case]
+    path = tmp_path / "photo.jpg"
+    path.write_bytes(make())
+    before = snapshot(et, path)
+    assert shown in before.tags
+    assert before.unprovable is None
+    legit_write(et, path, "xmp", before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat="xmp")), results
+
+
+def _unprovable(path: Path, dump: dict[str, Any]) -> str | None:
+    fake = FakeExifTool(json.dumps([{"SourceFile": path.name, **dump}]))
+    return snapshot(fake, path).unprovable  # type: ignore[arg-type]
+
+
+def test_what_points_past_the_image(tmp_path: Path) -> None:
+    # Dumps as exiftool gives them, for a file laid out like the Sony fixture.
+    path = tmp_path / "DSC00001.JPG"
+    path.write_bytes(data := sony_jpeg(54, preview_pointer=True))
+    eoi = jpeg_eoi_offset(data)
+    # Sony's preview, as exiftool gives it: the first byte made a marker again.
+    preview = b"\xff" + data[data.index(b"\x00\xd8\xff\xdb", eoi) + 1 :]
+    sony = "base64:" + base64.b64encode(preview).decode()
+    maker_note = {"ExifIFD:MakerNoteSony": "base64:AA=="}
+    assert _unprovable(path, {**maker_note, "Sony:PreviewImage": sony}) == PREVIEW_AFTER_IMAGE
+    # The maker note's own previews only: a trailer exiftool reads may carry
+    # its own (FotoStation's does), which survives a write.
+    assert _unprovable(path, {**maker_note, "FotoStation:PreviewImage": sony}) is None
+    assert _unprovable(path, {"Sony:PreviewImage": sony}) is None  # no Sony maker note
+    for key, value in {
+        "Olympus:PreviewImageStart": eoi,
+        "PreviewIFD:PreviewImageStart": f"{eoi - 100} {eoi + 10}",
+        "Canon:OriginalDecisionDataOffset": len(data) - 1,
+    }.items():
+        assert _unprovable(path, {key: value}) == PREVIEW_AFTER_IMAGE, key
+    for key, value in {
+        "Olympus:PreviewImageStart": eoi - 1,  # in the image's own segments
+        "Minolta:PreviewImageStart": len(data),  # past the end of the file: nowhere
+        "MPImage2:MPImageStart": eoi,  # counted from the MPF segment, which moves too
+        "XMP-GCamera:MicroVideoOffset": eoi,  # counted from the end of the file
+        "XMP-xmp:PreviewImageStart": eoi,
+        "Olympus:PreviewImageLength": eoi,
+        "Casio:PreviewImageStart": "(none)",
+    }.items():
+        assert _unprovable(path, {key: value}) is None, key
+
+
+def test_photos_with_a_preview_after_the_image_never_reach_the_model(
+    fixtures_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # More than the failure budget allows (5 in 200), had they counted as failures.
+    src = tmp_path / "Pictures"
+    src.mkdir()
+    for i in range(6):
+        shutil.copy2(fixtures_dir / "sony_preview.jpg", src / f"DSC0000{i}.JPG")
+    shutil.copy2(fixtures_dir / "olympus_preview.jpg", src / "P1010001.JPG")
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "plain.jpg")
+    asked: list[str] = []
+    describe = local._describe
+    monkeypatch.setattr(
+        local, "_describe", lambda ctx, ram, img: asked.append(img) or describe(ctx, ram, img)
+    )
+    cfg = Config()
+    cfg.model.id = "stub"
+    cfg.resources.work_dir = str(tmp_path / "ram")
+    cfg.resources.allow_disk_workdir = True
+    log = TimingsLog(tmp_path / "timings.jsonl", run_id="r_test", model="stub")
+    summary = caption_folder(
+        src, tmp_path / "out", cfg, model=choose_model(cfg), run_id="r_test", log=log
+    )
+    assert summary.aborted is None
+    outcomes = {o.rel: (o.state, o.reason, o.systematic) for o in summary.outcomes}
+    assert outcomes.pop("plain.jpg")[0] == State.CLEAN
+    skipped = (State.SKIPPED_FORMAT, f"can't be written safely: {PREVIEW_AFTER_IMAGE}", False)
+    assert len(outcomes) == 7 and set(outcomes.values()) == {skipped}
+    assert len(asked) == 1  # plain.jpg alone
 
 
 @pytest.mark.parametrize("compat", ["xmp", "wide"])

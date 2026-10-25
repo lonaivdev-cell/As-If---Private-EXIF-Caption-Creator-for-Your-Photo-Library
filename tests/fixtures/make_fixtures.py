@@ -1,13 +1,15 @@
 """Generate the synthetic fixture photos (§16, pass 3 of docs/DESIGN.md).
 
 Nothing here is a real photo: every file is drawn by Pillow and tagged by
-exiftool, so the fixture set is reproducible and contains nobody's data.
+exiftool (or laid out byte by byte, as a camera would), so the fixture set
+is reproducible and contains nobody's data.
 
     python tests/fixtures/make_fixtures.py OUTPUT_DIR [--with-panorama]
 
 Each fixture's purpose is in ``FIXTURES`` below. ``expect`` is what the
 pipeline must do with it: ``ok`` (captioned), ``quarantine`` (refused before
-anything is written) or ``skip-format`` (a format As If doesn't write yet).
+anything is written) or ``skip-format`` (a format As If doesn't write yet, or
+a file it can't prove a write safe for).
 """
 
 from __future__ import annotations
@@ -53,6 +55,16 @@ FIXTURES: tuple[Fixture, ...] = (
     Fixture("corrupt.jpg", "quarantine", "random bytes with a .jpg name"),
     Fixture("photo.heic", "skip-format", "HEIC (not written until the fixture pass proves it)"),
     Fixture("raw.dng", "skip-format", "RAW gets sidecars only, not in M1"),
+    Fixture(
+        "sony_preview.jpg",
+        "skip-format",
+        "Sony JPEG whose maker note points into the MPF preview after the image",
+    ),
+    Fixture(
+        "olympus_preview.jpg",
+        "skip-format",
+        "Olympus JPEG whose maker note points to a preview after the image",
+    ),
     Fixture("panorama.jpg", "ok", "50 MP panorama (slow; only with --with-panorama)"),
 )
 
@@ -232,6 +244,168 @@ def _panorama_jpg(out: Path) -> None:
     _exiftool(out, "-EXIF:DateTimeOriginal=2020:01:01 12:00:00")
 
 
+# -- camera JPEGs, built byte by byte ------------------------------------------
+# Laid out the way the cameras write them. Their maker notes point to a preview
+# by offset, so each is built twice: once to measure, then with the offsets in.
+
+# (tag, field type, count, value): the value's bytes, or an offset already known.
+IfdEntry = tuple[int, int, int, bytes | int]
+
+
+def ifd(at: int, *entries: IfdEntry) -> bytes:
+    """A little-endian TIFF IFD placed at offset ``at``, its longer values right
+    after it. Offsets count from where ``at`` does."""
+    table = struct.pack("<H", len(entries))
+    values = b""
+    values_at = at + 2 + 12 * len(entries) + 4
+    for tag, typ, count, value in sorted(entries, key=lambda e: e[0]):
+        head = struct.pack("<HHI", tag, typ, count)
+        if isinstance(value, int):
+            table += head + struct.pack("<I", value)
+        elif len(value) <= 4:
+            table += head + value.ljust(4, b"\x00")
+        else:
+            table += head + struct.pack("<I", values_at + len(values))
+            values += value + b"\x00" * (len(value) % 2)
+    return table + b"\x00\x00\x00\x00" + values
+
+
+def text(tag: int, value: str) -> IfdEntry:
+    raw = value.encode() + b"\x00"
+    return (tag, 2, len(raw), raw)
+
+
+def long(tag: int, value: int) -> IfdEntry:
+    return (tag, 4, 1, value)
+
+
+def segment(marker: int, payload: bytes) -> bytes:
+    return bytes((0xFF, marker)) + (len(payload) + 2).to_bytes(2, "big") + payload
+
+
+def scene_jpeg(size: tuple[int, int], seed: int) -> bytes:
+    """The test scene as a Pillow JPEG (SOI, JFIF, tables, frame, scan, EOI)."""
+    return _jpeg(_scene(size, seed))
+
+
+def jpeg_body(data: bytes) -> bytes:
+    """A Pillow JPEG without its SOI and JFIF segment: tables, frame, scan, EOI."""
+    assert data[:4] == b"\xff\xd8\xff\xe0", "expected Pillow's JFIF JPEG"
+    return data[4 + int.from_bytes(data[4:6], "big") :]
+
+
+def exif_segment(make: str, model: str, maker_note: Callable[[int], bytes]) -> bytes:
+    """APP1 EXIF with Make, Model, a date and ``maker_note(at)``: the maker note
+    as it should be placed at TIFF offset ``at``."""
+    tags = (text(0x010F, make), text(0x0110, model), long(0x8769, 0))
+    exif_at = 8 + len(ifd(8, *tags))
+    exif_tags = [(0x9000, 7, 4, b"0230"), text(0x9003, "2013:06:01 12:00:00")]
+    note_at = exif_at + len(ifd(exif_at, *exif_tags, (0x927C, 7, 0, 0)))
+    note = maker_note(note_at)
+    tiff = (
+        b"II*\x00\x08\x00\x00\x00"
+        + ifd(8, *tags[:2], long(0x8769, exif_at))
+        + ifd(exif_at, *exif_tags, (0x927C, 7, len(note), note_at))
+        + note
+    )
+    return segment(0xE1, b"Exif\x00\x00" + tiff)
+
+
+# Where EXIF offsets count from when the EXIF comes first: past SOI, the APP1
+# marker and length, and "Exif\0\0".
+EXIF_BASE = 12
+
+
+def mpf_segment(primary: int, second: int, second_at: int) -> bytes:
+    """APP2 MPF listing the primary image (``primary`` bytes long) and a large
+    preview, ``second`` bytes at ``second_at`` from the MPF header (the "II")."""
+    entries = struct.pack("<IIIHH", 0x20030000, primary, 0, 0, 0)
+    entries += struct.pack("<IIIHH", 0x00010002, second, second_at, 0, 0)
+    index = ifd(8, (0xB000, 7, 4, b"0100"), long(0xB001, 2), (0xB002, 7, 32, entries))
+    return segment(0xE2, b"MPF\x00II*\x00\x08\x00\x00\x00" + index)
+
+
+def with_mpf(app: bytes, second: bytes, seed: int, padding: int = 0) -> bytes:
+    """SOI, the ``app`` segments, MPF, the test scene, then ``padding`` zeros
+    and the MPF's ``second`` image."""
+    body = jpeg_body(scene_jpeg((640, 480), seed))
+
+    def build(primary: int) -> bytes:
+        mpf_at = 2 + len(app) + 8
+        mpf = mpf_segment(primary, len(second), max(0, primary + padding - mpf_at))
+        return b"\xff\xd8" + app + mpf + body
+
+    return build(len(build(0))) + b"\x00" * padding + second
+
+
+def sony_jpeg(seed: int, *, preview_pointer: bool) -> bytes:
+    """A Sony NEX-6 JPEG: EXIF, MPF, the image, zeros, then the MPF preview.
+
+    With ``preview_pointer`` the maker note's tag 0x2001 points into that
+    preview, 130 bytes in, as on the NEX-5N, NEX-6, A6000 and A7 among others
+    (exiftool's Sony.pm): inside the preview's APP1, at Sony's 32-byte header
+    and "\\x00\\xd8", which run on into the preview's own tables and scan.
+    Without it there is no 0x2001, as on later models.
+    """
+    small = (320, 240)
+    rest = jpeg_body(scene_jpeg(small, seed + 1))
+    size = struct.pack("<II", *small)
+    header = struct.pack("<I", len(rest) + 2) + size + b"\x00" * 8 + size + b"\x00" * 4
+    # The preview's own EXIF (its size), then zeros up to Sony's header.
+    exif = b"II*\x00\x08\x00\x00\x00" + ifd(8, (0x0128, 3, 1, b"\x02\x00"), long(0x8769, 38))
+    exif += ifd(38, long(0xA002, small[0]), long(0xA003, small[1]))
+    app1 = b"Exif\x00\x00" + exif.ljust(118, b"\x00") + header + b"\x00\xd8"
+    preview = b"\xff\xd8" + segment(0xE1, app1) + rest
+    assert preview.index(header) == 130
+
+    def exif_for(target: int) -> bytes:
+        def note(at: int) -> bytes:
+            entries: list[IfdEntry] = [text(0xB020, "Standard")]  # CreativeStyle
+            if preview_pointer:
+                entries.append((0x2001, 7, len(header) + 2 + len(rest), target))
+            return b"SONY DSC \x00\x00\x00" + ifd(at + 12, *entries)
+
+        return exif_segment("SONY", "NEX-6", note)
+
+    primary = len(with_mpf(exif_for(0), b"", seed))  # no offset changes a length
+    target = primary + 2002 + 130 - EXIF_BASE  # counted from the EXIF header
+    return with_mpf(exif_for(target), preview, seed, padding=2002)
+
+
+def olympus_jpeg(seed: int, *, preview_at: int | None = None) -> bytes:
+    """An Olympus E-M5 JPEG whose maker note points to the preview stored right
+    after the image, as the OM-D cameras (and the E-1 and E-300) do, or to
+    ``preview_at`` when given."""
+    body = jpeg_body(scene_jpeg((640, 480), seed))
+    preview = scene_jpeg((320, 240), seed + 1)
+
+    def build(start: int) -> bytes:
+        def note(at: int) -> bytes:
+            # Olympus' newer maker notes count their offsets from the note's start.
+            settings_at = 12 + len(ifd(12, (0x0000, 7, 4, b"0100"), long(0x2020, 0)))
+            settings = ifd(
+                settings_at,
+                (0x0000, 7, 4, b"0100"),
+                long(0x0100, 1),  # PreviewImageValid
+                long(0x0101, max(0, start - EXIF_BASE - at)),  # PreviewImageStart
+                long(0x0102, len(preview)),  # PreviewImageLength
+            )
+            main = ifd(12, (0x0000, 7, 4, b"0100"), (0x2020, 13, 1, settings_at))
+            return b"OLYMPUS\x00II\x03\x00" + main + settings
+
+        return b"\xff\xd8" + exif_segment("OLYMPUS IMAGING CORP.", "E-M5", note) + body
+
+    return build(len(build(0)) if preview_at is None else preview_at) + preview
+
+
+def _sony_preview_jpg(out: Path) -> None:
+    out.write_bytes(sony_jpeg(20, preview_pointer=True))
+
+
+def _olympus_preview_jpg(out: Path) -> None:
+    out.write_bytes(olympus_jpeg(22))
+
+
 MAKERS: dict[str, Callable[[Path], None]] = {
     "plain.jpg": _plain_jpg,
     "exif.jpg": _exif_jpg,
@@ -251,6 +425,8 @@ MAKERS: dict[str, Callable[[Path], None]] = {
     "corrupt.jpg": _corrupt_jpg,
     "photo.heic": _heic,
     "raw.dng": _raw_dng,
+    "sony_preview.jpg": _sony_preview_jpg,
+    "olympus_preview.jpg": _olympus_preview_jpg,
     "panorama.jpg": _panorama_jpg,
 }
 

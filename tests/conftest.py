@@ -25,7 +25,10 @@ def _isolated_home(
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Point As If at a throwaway home so tests never touch real config or state."""
+    from asif.paths import HOME_MARKER
+
     home = tmp_path_factory.mktemp("asif-home")
+    (home / HOME_MARKER).touch()  # set up, as `asif config init` does
     monkeypatch.setenv("ASIF_HOME", str(home))
 
 

@@ -36,25 +36,34 @@ def _now() -> str:
 
 
 class TimingsLog:
-    """Append-only JSONL writer. ``path=None`` disables logging entirely."""
+    """Append-only JSONL writer. ``path=None`` disables logging entirely.
+
+    A write that fails mid-run (a full disk, a volume that went away) never
+    stops the run or changes how a photo is reported: logging just stops, and
+    ``problem`` says why.
+    """
 
     def __init__(self, path: Path | None, run_id: str, model: str) -> None:
         self.path = path
         self.run_id = run_id
         self.model = model
+        self.problem: str | None = None
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             os.close(fd)
 
     def event(self, stage: str, **fields: Any) -> None:
-        if self.path is None:
+        if self.path is None or self.problem is not None:
             return
         record: dict[str, Any] = {"ts": _now(), "run": self.run_id, "stage": stage}
         record.update({k: v for k, v in fields.items() if k in _ALLOWED})
         record.setdefault("model", self.model)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        try:
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            self.problem = exc.strerror or str(exc)
 
     @contextmanager
     def timed(self, stage: str, img: str | None = None) -> Iterator[dict[str, Any]]:
