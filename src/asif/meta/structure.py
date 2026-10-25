@@ -21,6 +21,7 @@ somebody's photos.
 
 from __future__ import annotations
 
+import heapq
 import re
 import struct
 import zlib
@@ -51,6 +52,11 @@ def detect_format(data: bytes) -> Format | None:
     if data[:4] in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
         return "tiff"
     return None
+
+
+def is_bigtiff(data: bytes) -> bool:
+    """BigTIFF (either byte order), which exiftool reads but can't write."""
+    return data[:4] in (b"II+\x00", b"MM\x00+")
 
 
 _FORMAT_NAMES = {"jpeg": "JPEG", "png": "PNG", "webp": "WebP", "tiff": "TIFF", None: "unknown"}
@@ -287,7 +293,11 @@ def _chunk_name(fourcc: bytes) -> str:
 
 
 def _png_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], bytes]:
-    """``([(type, data, raw chunk), ...], bytes after IEND)``."""
+    """``([(type, data, raw chunk), ...], bytes after IEND)``.
+
+    Every chunk's CRC is checked: exiftool refuses to write a PNG with a bad
+    one (a sign of corruption), and it always writes good ones itself.
+    """
     if data[:8] != _PNG_SIGNATURE:
         raise StructureError("no PNG signature")
     chunks: list[tuple[bytes, bytes, bytes]] = []
@@ -300,7 +310,11 @@ def _png_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], bytes]:
         chunk_end = pos + 12 + length  # length, type, data, CRC
         if chunk_end > end:
             raise StructureError(f"PNG {_chunk_name(ctype)} chunk runs past the end")
-        chunks.append((ctype, data[pos + 8 : pos + 8 + length], data[pos:chunk_end]))
+        cdata = data[pos + 8 : pos + 8 + length]
+        crc = int.from_bytes(data[chunk_end - 4 : chunk_end], "big")
+        if zlib.crc32(cdata, zlib.crc32(ctype)) != crc:
+            raise StructureError(f"PNG {_chunk_name(ctype)} chunk has a bad CRC")
+        chunks.append((ctype, cdata, data[pos:chunk_end]))
         pos = chunk_end
         if ctype == b"IEND":
             return chunks, data[pos:]
@@ -493,6 +507,11 @@ class TiffLayout:
     """An IFD holds a maker note, which exiftool rebuilds when it moves it."""
     xmp: tuple[bytes, ...] = field(repr=False)
     """The XMP packet (tag 700) of every IFD that has one."""
+    shared: int = 0
+    """Bytes the strips, tiles and JPEG blocks (tags 0x201/0x202) claim more
+    than once: old-style JPEG TIFFs point a page's JPEG block at its strips,
+    say. exiftool writes each claim out on its own, so these bytes would be
+    written again for every extra claim."""
 
 
 def tiff_layout(data: Buffer) -> TiffLayout:
@@ -503,6 +522,7 @@ def tiff_layout(data: Buffer) -> TiffLayout:
     strips, tiles and JPEG thumbnail they point to. Every other tag's value
     is just data, never an offset: exiftool copies the number, not what it
     points to. Takes ``bytes`` or an ``mmap``, so a large TIFF isn't copied.
+    ``shared`` counts the bytes those strips, tiles and JPEG blocks share.
     Raises ``StructureError`` for BigTIFF, an IFD loop, an unknown field
     type, or anything that points past the end of the file.
     """
@@ -519,13 +539,14 @@ def _tiff_walk(view: memoryview) -> TiffLayout:
         raise StructureError("not a TIFF file")
     order = "<" if magic[:2] == b"II" else ">"
     spans: list[tuple[int, int]] = [(0, 8)]
+    data_spans: list[tuple[int, int]] = []  # strips, tiles and JPEG blocks
     xmp: list[bytes] = []
     maker_notes = False
 
-    def claim(start: int, length: int, what: str) -> None:
+    def claim(start: int, length: int, what: str, into: list[tuple[int, int]] = spans) -> None:
         if start + length > size:
             raise StructureError(f"TIFF {what} runs past the end of the file")
-        spans.append((start, start + length))
+        into.append((start, start + length))
 
     def ints(typ: int, count: int, at: int) -> tuple[int, ...]:
         if typ not in (3, 4, 13):  # SHORT, LONG, IFD
@@ -576,14 +597,26 @@ def _tiff_walk(view: memoryview) -> TiffLayout:
             if len(offsets) != len(lengths) or len(offsets) > _TIFF_MAX_PARTS:
                 raise StructureError(f"TIFF tag 0x{off_tag:04X} doesn't match 0x{len_tag:04X}")
             for start, length in zip(offsets, lengths, strict=True):
-                claim(start, length, "image data")
+                claim(start, length, "image data", data_spans)
 
+    spans.sort()
+    data_spans.sort()  # in place: there can be a million of them
     unreferenced = covered = 0
-    for start, end in [*sorted(spans), (size, size)]:
+    for start, end in heapq.merge(spans, data_spans, [(size, size)]):
         if start > covered and not _tiff_filler(view[covered:start], magic):
             unreferenced += start - covered
         covered = max(covered, end)
-    return TiffLayout(unreferenced, maker_notes, tuple(xmp))
+    return TiffLayout(unreferenced, maker_notes, tuple(xmp), _overlap(data_spans))
+
+
+def _overlap(spans: list[tuple[int, int]]) -> int:
+    """How many bytes sorted ``(start, end)`` spans cover more than once, in all."""
+    union = covered = 0
+    for start, end in spans:
+        if end > covered:
+            union += end - max(start, covered)
+            covered = end
+    return sum(end - start for start, end in spans) - union
 
 
 def _tiff_filler(gap: memoryview, magic: bytes) -> bool:
@@ -628,6 +661,37 @@ _XMP_NOT_VALUES = frozenset(
 )
 # No real XMP packet comes near this; a compressed one that does is refused.
 _XMP_MAX = 16 * 1024 * 1024
+# The trailer that ends an XMP packet. Adobe's apps (Photoshop, Bridge,
+# Lightroom) rewrite a packet in place, and when the new one is shorter,
+# what is left of the old one can follow the trailer.
+_XPACKET_END = re.compile(rb"<\?xpacket\s+end\s*=\s*(['\"])[rw]\1\s*\?>")
+# Leftovers that hold nothing: whitespace, stray angle brackets and slashes,
+# and bare tags (no attributes, no text). Anything else may be a value.
+_EMPTY_LEFTOVERS = re.compile(rb"(?:[\s<>/]|</?[A-Za-z_][\w.:-]*\s*/?>)*")
+
+
+def leftovers(packet: bytes) -> tuple[bytes, bytes] | None:
+    """``(the packet up to its trailer, what follows)`` if something other
+    than whitespace follows the trailer; None if nothing does, or there is
+    no trailer."""
+    end = _XPACKET_END.search(packet)
+    if end is None or not packet[end.end() :].strip():
+        return None
+    return packet[: end.end()], packet[end.end() :]
+
+
+def empty_leftovers(tail: bytes) -> bool:
+    """Do leftovers after an XMP packet's trailer hold nothing (no text, no
+    attribute values)? Then no reader of any kind can find a value there."""
+    return _EMPTY_LEFTOVERS.fullmatch(tail) is not None
+
+
+LEFTOVERS_PROBLEM = (
+    "its XMP is followed by leftovers of an older XMP packet, which exiftool can't carry over"
+)
+"""Why a file whose XMP packet is followed by what may be older values is
+never written: exiftool reads them as part of the packet, then drops them or
+refuses the write."""
 
 
 @dataclass(frozen=True)
@@ -650,12 +714,41 @@ class _XmpReader:
         self.values, self.links = values, links
         self.markup = False
         self.c2pa_link = False
+        self.leftovers = False
+        """A packet was followed by leftovers that may hold values."""
         # Per open element: ([skipped, has children, has text, parseType Literal], text so far).
         self.stack: list[tuple[list[bool], list[str]]] = []
         self.cdata: list[str] | None = None
         """The text of the CDATA section being read, if any."""
 
     def parse(self, packet: bytes) -> None:
+        """Read one packet. Leftovers after its trailer that make it ill-formed
+        are left out: only the packet itself is read, and ``leftovers`` says
+        whether they might hold values (which exiftool can't carry over)."""
+        # Some writers pad the packet with NULs, which XML doesn't allow.
+        packet = packet.rstrip(b"\0")
+        try:
+            part = self._read(packet)
+        except StructureError:
+            split = leftovers(packet)
+            if split is None:
+                raise
+            head, tail = split
+            part = self._read(head)  # an ill-formed packet still raises
+            self.leftovers = self.leftovers or not empty_leftovers(tail)
+        self.values.update(part.values)
+        self.links |= part.links
+        self.markup = self.markup or part.markup
+        self.c2pa_link = self.c2pa_link or part.c2pa_link
+
+    @staticmethod
+    def _read(packet: bytes) -> _XmpReader:
+        """A reader that has read ``packet`` alone, so a failed read leaves nothing behind."""
+        reader = _XmpReader(Counter(), set())
+        reader._parse(packet)
+        return reader
+
+    def _parse(self, packet: bytes) -> None:
         parser = expat.ParserCreate(namespace_separator=" ")
         parser.StartDoctypeDeclHandler = self._no_dtd
         parser.EntityDeclHandler = self._no_dtd
@@ -665,8 +758,7 @@ class _XmpReader:
         parser.StartCdataSectionHandler = self._start_cdata
         parser.EndCdataSectionHandler = self._end_cdata
         try:
-            # Some writers pad the packet with NULs, which XML doesn't allow.
-            parser.Parse(packet.rstrip(b"\0"), True)
+            parser.Parse(packet, True)
         except expat.ExpatError as exc:
             raise StructureError("the XMP isn't well-formed XML") from exc
 
@@ -736,11 +828,13 @@ def read_xmp(data: Buffer) -> XmpText:
 
     Read with an XML parser rather than exiftool's, so a value exiftool
     can't read (and so wouldn't write back) still counts. ``problem`` names
-    what exiftool would lose (markup inside a value, or JPEG extended XMP
-    the main packet doesn't link to) or what a write would break (Content
-    Credentials kept outside the file). Raises ``StructureError`` when the
-    file can't be parsed, isn't one of those formats, or an XMP packet
-    isn't well-formed XML (or has a DTD).
+    what exiftool would lose (markup inside a value, JPEG extended XMP the
+    main packet doesn't link to, leftovers of an older packet after the
+    trailer that may hold values) or what a write would break (Content
+    Credentials kept outside the file). Leftovers that hold nothing (a stray
+    ">") are no problem: no XMP reader sees them. Raises ``StructureError``
+    when the file can't be parsed, isn't one of those formats, or an XMP
+    packet isn't well-formed XML (or has a DTD).
     """
     extended: dict[bytes, list[tuple[int, int, bytes]]] = {}
     raw_profile = False
@@ -773,6 +867,8 @@ def read_xmp(data: Buffer) -> XmpText:
         # exiftool only reads extended XMP the main packet links to (by its
         # MD5), and drops the rest on the next write.
         problem = "it has extended XMP its main XMP doesn't link to, which exiftool would drop"
+    elif reader.leftovers:
+        problem = LEFTOVERS_PROBLEM
     elif raw_profile:
         # exiftool rewrites that chunk along with the real XMP, so the
         # structure gate could never pass.

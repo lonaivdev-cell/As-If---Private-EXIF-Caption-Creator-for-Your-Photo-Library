@@ -21,7 +21,9 @@ from PIL import Image, ImageCms
 from asif.meta.structure import (
     C2PA_LINK_PROBLEM,
     C2PA_PROBLEM,
+    LEFTOVERS_PROBLEM,
     StructureError,
+    XmpText,
     compare,
     compare_jpeg,
     compare_png,
@@ -540,9 +542,19 @@ def test_png_ancillary_chunk_changed_added_reordered() -> None:
     assert len(compare_png(png(GAMA, phys), png(phys, GAMA))) == 2
 
 
-def test_png_crc_is_compared() -> None:
-    bad_crc = GAMA[:-1] + bytes([GAMA[-1] ^ 1])
-    assert compare_png(png(GAMA), png(bad_crc)) != []
+@pytest.mark.parametrize(("good", "name"), [(GAMA, "gAMA"), (IDAT, "IDAT"), (IEND, "IEND")])
+def test_a_bad_png_crc_means_the_file_cant_be_parsed(good: bytes, name: str) -> None:
+    # exiftool refuses to write a PNG with a bad CRC anywhere (PngSuite's
+    # xcsn0g01, say): a sign of corruption, caught before the model's work.
+    bad = good[:-1] + bytes([good[-1] ^ 1])
+    data = (PNG_SIG + IHDR + GAMA + IDAT + IEND).replace(good, bad)
+    with pytest.raises(StructureError, match=f"^PNG {name} chunk has a bad CRC$"):
+        compare_png(png(GAMA), data)
+    with pytest.raises(StructureError, match="bad CRC"):
+        read_xmp(data)
+    with pytest.raises(StructureError, match="bad CRC"):
+        write_hazard(data)
+    assert compare_png(png(GAMA), png(GAMA)) == []
 
 
 def test_png_bytes_after_iend() -> None:
@@ -943,6 +955,30 @@ def test_tiff_maker_notes_are_reported(tag: int) -> None:
     assert layout.unreferenced == 0  # its bytes are covered; exiftool rebuilds them anyway
 
 
+def test_tiff_image_data_shared_between_parts_is_counted() -> None:
+    # exiftool writes every strip, tile and JPEG block out on its own, so
+    # bytes two of them share would be written twice.
+    t = Tiff()
+    strip = t.blob(bytes(range(48)))
+    entries = (t.long(256, 4), t.long(257, 4), t.long(278, 2))
+    shared = t.done(t.ifd(*entries, t.long(273, strip, strip), t.long(279, 48, 48)))
+    assert tiff_layout(shared).shared == 48
+    assert tiff_layout(shared).unreferenced == 0
+    # An old-style JPEG page: its JPEG block starts before its strip and covers it.
+    t = Tiff()
+    block = t.blob(b"\xff\xd8" + b"\x01" * 30 + b"\x02" * 60 + b"\xff\xd9")
+    page = t.page(4, 4)
+    jpeg = t.ifd(t.long(273, block + 32), t.long(279, 60), t.long(0x201, block), t.long(0x202, 94))
+    t.buf[page + 2 + 12 * 9 : page + 2 + 12 * 9 + 4] = struct.pack("<I", jpeg)  # IFD0 -> IFD1
+    assert tiff_layout(t.done(page)).shared == 60
+    # Parts that only touch, or are empty, share nothing.
+    t = Tiff()
+    strip = t.blob(bytes(range(48)))
+    touching = t.ifd(*entries, t.long(273, strip, strip + 24, strip), t.long(279, 24, 24, 0))
+    assert tiff_layout(t.done(touching)).shared == 0
+    assert tiff_layout(pillow_tiff(3, compression="tiff_lzw")).shared == 0
+
+
 def test_tiff_xmp_packets_are_returned() -> None:
     t = Tiff()
     page2 = t.page(4, 4, undefined(0x02BC, b"<page2/>"))
@@ -1244,6 +1280,72 @@ def test_old_adobe_toolkit_attribute_is_not_a_value() -> None:
     packet = OWNER_XMP.replace(b'x:xmptk="Some Toolkit 1.0"', b'x:xaptk="XMP toolkit 2.8.2-33"')
     assert b"x:xaptk" in packet
     assert read_xmp(jpeg_xmp(std_xmp(packet))).values == OWNER_VALUES
+
+
+# Adobe's apps rewrite a packet in place: a shorter one can leave the end of
+# the older one behind, after the trailer.
+WITH_TRAILER = xmp_packet("<dc:title>Pier</dc:title>")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param(b">", id="bracket"),  # what Photoshop CC 2019 left in one corpus PNG
+        pytest.param(b"\n</rdf:Description>\n </rdf:RDF>\n</x:xmpmeta>\n", id="closing-tags"),
+        pytest.param(b"<rdf:li/>\x00\x00", id="empty-element"),
+    ],
+)
+@pytest.mark.parametrize("fmt", ["jpeg", "png", "tiff"])
+def test_leftovers_holding_nothing_are_read_past(tail: bytes, fmt: str) -> None:
+    data = _xmp_in(fmt, WITH_TRAILER + tail)
+    assert read_xmp(data) == read_xmp(_xmp_in(fmt, WITH_TRAILER))
+    assert read_xmp(data).values == Counter({"Pier": 1})
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        pytest.param(b"li>\n <rdf:li>Someone</rdf:li>\n</rdf:Bag>", id="text"),
+        pytest.param(b"<rdf:Description mwg-rs:Name='Someone'/>", id="attribute"),
+        pytest.param(WITH_TRAILER, id="a-whole-older-packet"),
+    ],
+)
+@pytest.mark.parametrize("fmt", ["jpeg", "png", "tiff"])
+def test_leftovers_that_may_hold_values_are_a_problem(tail: bytes, fmt: str) -> None:
+    # exiftool reads them as part of the packet, then drops them or refuses
+    # the write: a limit of the file, not corruption.
+    text = read_xmp(_xmp_in(fmt, WITH_TRAILER + tail))
+    assert text.problem == LEFTOVERS_PROBLEM
+    assert text.values == Counter({"Pier": 1})  # the packet itself is still compared
+    assert "Someone" not in LEFTOVERS_PROBLEM
+
+
+@pytest.mark.parametrize(
+    "packet",
+    [
+        pytest.param(WITH_TRAILER.replace(b'<?xpacket end="w"?>', b"") + b">", id="no-trailer"),
+        pytest.param(WITH_TRAILER.replace(b"</dc:title>", b"") + b">", id="bad-packet"),
+        pytest.param(WITH_TRAILER.replace(b"<?xpacket end", b"<?xpacket ending") + b">", id="odd"),
+    ],
+)
+def test_leftovers_after_anything_but_a_well_formed_packet_still_raise(packet: bytes) -> None:
+    with pytest.raises(StructureError, match="isn't well-formed"):
+        read_xmp(_xmp_in("png", packet))
+
+
+def test_a_well_formed_packet_is_read_whole() -> None:
+    # Comments and processing instructions may follow the root: no leftovers.
+    packet = WITH_TRAILER + b"<!-- Pier -->\n<?other x?>"
+    assert read_xmp(_xmp_in("jpeg", packet)) == XmpText(Counter({"Pier": 1}))
+
+
+def _xmp_in(fmt: str, packet: bytes) -> bytes:
+    if fmt == "jpeg":
+        return jpeg_xmp(std_xmp(packet))
+    if fmt == "png":
+        return png(chunk(b"iTXt", PNG_KEY + b"\x00\x00\x00\x00" + packet))
+    t = Tiff()
+    return t.done(t.page(4, 4, undefined(0x02BC, packet)))
 
 
 def test_extended_xmp_linked_from_the_main_packet() -> None:

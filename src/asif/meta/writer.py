@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from asif.infer.schema import CAPTION_MAX, KEYWORD_MAX, CaptionResult, clean_text
+from asif.meta import structure
 from asif.meta.exiftool import ExifTool, ExifToolError, check_arg
 from asif.workdir import wipe_file
 
@@ -414,15 +415,28 @@ def _subject_langs(packet: str) -> bool:
         # XMP never needs one, and a DTD can make a parser expand entities
         # without bound. Without one, expat knows only the five XML entities.
         return True
-    try:
-        root = ElementTree.fromstring(packet.encode("utf-8"))  # noqa: S314 (no DTD, see above)
-    except (ElementTree.ParseError, LookupError, ValueError):
+    root = _xml(packet)
+    if root is None:
+        # Leftovers of an older packet after the trailer (Adobe's apps rewrite
+        # packets in place) are read past only when they hold nothing.
+        split = structure.leftovers(packet.encode("utf-8"))
+        if split is not None and structure.empty_leftovers(split[1]):
+            root = _xml(split[0].decode("utf-8"))
+    if root is None:
         return True
     return any(
         item.get(_XML_LANG) is not None
         for subject in root.iter(_DC_SUBJECT)
         for item in subject.iter()
     )
+
+
+def _xml(text: str) -> ElementTree.Element | None:
+    """``text`` parsed as XML (checked for a DTD by the caller), or None."""
+    try:
+        return ElementTree.fromstring(text.encode("utf-8"))  # noqa: S314 (no DTD, see above)
+    except (ElementTree.ParseError, LookupError, ValueError):
+        return None
 
 
 def _unmark(raw: Any, key: str) -> str | tuple[str, ...]:
@@ -649,8 +663,7 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
 
     args += [f"-XMP-dc:Subject+={k}" for k in (*_written_copies(plan), *_written_subjects(plan))]
     if plan.keep_xmp_toolkit is not None:
-        # Copied inside exiftool, so the value itself never becomes an argument.
-        args.append("-XMP-x:XMPToolkit<XMP-x:XMPToolkit")
+        args.append(_toolkit_arg(plan.keep_xmp_toolkit))
 
     iptc = _written_iptc(plan)
     if iptc:
@@ -698,6 +711,28 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
     for arg in args:
         check_arg(arg)
     return args
+
+
+def _toolkit_arg(toolkit: str) -> str:
+    """The argument that keeps the photo's own XMP-x:XMPToolkit stamp.
+
+    Passed as a value, like the owner's IPTC keywords: after the first "=",
+    so exiftool takes it as data, never interpolated. Not as a copy
+    ("<XMP-x:XMPToolkit"): a copy makes exiftool read the whole file again
+    and print that read's warnings with the write's (an empty FPXR segment,
+    say, or a maker-note quirk), which would refuse a clean write. A value
+    that can't be sent as one is still copied: a line break can't be sent at
+    all, and exiftool drops a space right after the "=" of an argument it
+    reads from its argument file (``_verify`` would catch either).
+    """
+    copy = "-XMP-x:XMPToolkit<XMP-x:XMPToolkit"
+    if toolkit[:1].isspace():
+        return copy
+    try:
+        toolkit.encode("utf-8")  # strictly: XMP is UTF-8, unlike a file name
+        return check_arg(f"-XMP-x:XMPToolkit={toolkit}")
+    except (UnicodeEncodeError, ValueError):
+        return copy
 
 
 def _list_args(tag: str, values: tuple[str, ...]) -> list[str]:

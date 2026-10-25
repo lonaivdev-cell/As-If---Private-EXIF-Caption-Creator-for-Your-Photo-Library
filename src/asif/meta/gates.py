@@ -171,6 +171,12 @@ _MPF_IMAGE_START = re.compile(r"MPImage\d+:MPImageStart")
 _IN_SEGMENT: dict[str, tuple[str, int, bytes]] = {
     "Pentax:PreviewImageStart": ("Pentax:PreviewImageLength", 0xE7, b"PENTAX \x00"),
 }
+# Tags exiftool can't write a TIFF with: TIFF 6.0's old-style JPEG tables
+# (0x207-0x209) and SharedData (0x8781) are stored by offset without a
+# length. exiftool rebuilds every IFD of a TIFF and refuses one holding any
+# of them ("No size tag"); its Exif.pm marks them unwritable on purpose.
+_TIFF_UNWRITABLE = re.compile(r"[\w-]+:(?:JPEGQTables|JPEGDCTables|JPEGACTables|SharedData)")
+BIGTIFF = "it's a BigTIFF, which exiftool can't write"
 # XMP dcterms:provenance, as exiftool names it with the usual prefix (any
 # language of it): C2PA's link to Content Credentials kept outside the file.
 _C2PA_LINK = re.compile(r"XMP-dcterms:Provenance(?:-[\w-]+)?")
@@ -188,6 +194,9 @@ PREVIEW_AFTER_IMAGE = (
 # - Where exiftool says a preview, thumbnail or data block starts: with -n,
 #   an offset from the start of the file.
 _POINTER = re.compile(r"\w*(?:ImageStart|PreviewStart|ThumbnailOffset|DataOffset)|JpgFromRawStart")
+# - A pointer's length tag: ThumbnailOffset -> ThumbnailLength,
+#   PreviewImageStart -> PreviewImageLength, and so on.
+_POINTER_END = re.compile(r"Start$|Offset$")
 #   Not pointers from the EXIF: MPF's offsets count from the MPF segment
 #   (``_MPF_IMAGE_START``), XMP's from the end of the file (a motion photo's
 #   MicroVideoOffset), and File is exiftool's own.
@@ -199,6 +208,18 @@ _NOT_EXIF = re.compile(r"MPF0|MPImage\d+|XMP(?:-[\w-]+)?|File")
 #   their offsets survive a write.
 _MAKER_NOTE = re.compile(r"[\w-]+:MakerNote([A-Za-z]+?)\d*")
 _NUMBERS = re.compile(r"[0-9]+(?: [0-9]+)*")
+# A thumbnail or preview the EXIF says starts inside the EXIF segment may run
+# on by one byte at most: the next segment's first byte, which is 0xFF before
+# and after a write, whatever segment follows. Sony's DCR-PC110 and PC120E
+# count that byte; Sigma's DP2 Quattro counts two, and the second, the next
+# segment's marker, changes when new XMP is put after the EXIF. exiftool
+# copies the EXIF as it is, so the protected gate would fail after the
+# model's work: ``snapshot`` refuses such a file.
+PAST_EXIF_SEGMENT = (
+    "its EXIF says its thumbnail or preview runs past the end of the EXIF segment, "
+    "into bytes new XMP would change"
+)
+_PAST_EXIF_ALLOWED = 1
 
 # Allowed doesn't mean anything goes: the fields As If writes are
 # additive-only (§7), and the protected gate checks that itself rather than
@@ -327,15 +348,18 @@ class Snapshot:
 
     Set for a file the gates can't check (an unknown format, a structure
     that can't be parsed, a TIFF exiftool can't hash or whose preview it
-    would move) and for one exiftool can't write without losing or
-    rewriting something: a TIFF with a maker note or with bytes nothing
-    points to, XMP with markup inside a value, metadata exiftool warns it
-    can't read in full, Content Credentials, Apple's iDOT PNG chunk, a JPEG
-    whose EXIF points to a preview after the image. It is
-    a limit of the format or of exiftool, not a sign of a bug, so the
-    caller should skip the file before writing. Only a file whose structure
-    can't be parsed gets a reason starting "its structure can't be
-    checked". The structure gate fails for it regardless."""
+    would move) and for one exiftool can't write, or can't write without
+    losing, rewriting or duplicating something: a BigTIFF, a TIFF with a
+    maker note, with bytes nothing points to, with image data used twice or
+    with old-style JPEG tables, XMP with markup inside a value or followed
+    by leftovers of an older packet, metadata exiftool warns it can't read
+    in full, Content Credentials, Apple's iDOT PNG chunk, a JPEG whose EXIF
+    points to a preview after the image or says its thumbnail runs past the
+    EXIF segment. It is a limit of the format or of exiftool, not a sign of
+    a bug, so the caller should skip the file before writing. Only a file
+    whose structure can't be parsed (a PNG chunk with a bad CRC, say) gets a
+    reason starting "its structure can't be checked". The structure gate
+    fails for it regardless."""
 
 
 @dataclass(frozen=True)
@@ -408,7 +432,14 @@ def snapshot(et: ExifTool, path: Path) -> Snapshot:
     """Record ``path`` before writing. Raises ``ExifToolError`` if exiftool can't read it."""
     tags, warnings = _dump_tags(et, path)
     with path.open("rb") as fh:
-        fmt = detect_format(fh.read(16)) or "other"
+        head = fh.read(16)
+    fmt = detect_format(head) or "other"
+    if structure.is_bigtiff(head) and tags.get("File:FileType") == "BTF":
+        # A BigTIFF exiftool reads as one: it can't write it at all (nor hash
+        # it), so there is nothing to prove. A format limit, not a sign the
+        # file is corrupt; one exiftool can't make sense of still is.
+        fp = fingerprint(path)
+        return Snapshot(fmt, "", fp.size, fp.sha256, tags, None, Counter(), BIGTIFF)
     unhashable: str | None = None
     try:
         image_hash = et.image_data_hash(path)
@@ -429,7 +460,7 @@ def snapshot(et: ExifTool, path: Path) -> Snapshot:
     xmp, unprovable = _inspect(path, fmt, data)
     unprovable = unprovable or unhashable or _exiftool_limit(fmt, tags, warnings)
     if unprovable is None and fmt == "jpeg" and data is not None:
-        unprovable = _preview_after_image(data, tags)
+        unprovable = _preview_after_image(data, tags) or _past_exif_segment(data, tags)
     if data is None:
         fp = fingerprint(path)
         return Snapshot(fmt, image_hash, fp.size, fp.sha256, tags, None, xmp, unprovable)
@@ -457,6 +488,11 @@ def _exiftool_limit(fmt: str, tags: dict[str, Any], warnings: list[str]) -> str 
         return (
             "it's a TIFF with an embedded preview that exiftool would move, which As If can't check"
         )
+    if fmt == "tiff" and any(_TIFF_UNWRITABLE.fullmatch(key.partition("#")[0]) for key in tags):
+        return (
+            "it's a TIFF with old-style JPEG tables (or shared data) stored by offset, "
+            "which exiftool can't write"
+        )
     return None
 
 
@@ -483,6 +519,34 @@ def _preview_after_image(data: bytes, tags: dict[str, Any]) -> str | None:
             # out. Found first after the image: nothing before it has the bytes.
             if len(preview) > 1 and data.find(preview[1:]) >= eoi:
                 return PREVIEW_AFTER_IMAGE
+    return None
+
+
+def _past_exif_segment(data: bytes, tags: dict[str, Any]) -> str | None:
+    """``PAST_EXIF_SEGMENT`` if a block the JPEG's EXIF points to starts inside
+    an EXIF segment and runs on past its end (see there); None if none does."""
+    try:
+        exif = [
+            (at, at + len(payload))
+            for at, payload in structure.jpeg_segments(data, 0xE1, b"Exif\x00\x00")
+        ]
+    except StructureError:
+        return None  # _inspect said so already
+    for key, value in tags.items():
+        base, sep, copy = key.partition("#")
+        group, _, name = base.partition(":")
+        if not _POINTER.fullmatch(name) or _NOT_EXIF.fullmatch(group):
+            continue
+        length = f"{group}:{_POINTER_END.sub('Length', name)}{sep}{copy}"  # the same copy
+        starts, lengths = _numbers(value), _numbers(tags.get(length))
+        if len(starts) != len(lengths):
+            continue
+        for start, size in zip(starts, lengths, strict=True):
+            if any(
+                begin <= start < end and start + size > end + _PAST_EXIF_ALLOWED
+                for begin, end in exif
+            ):
+                return PAST_EXIF_SEGMENT
     return None
 
 
@@ -515,6 +579,12 @@ def _inspect(path: Path, fmt: str, data: bytes | None) -> tuple[Counter[str], st
     if layout.unreferenced:
         unreferenced = f"the TIFF holds {layout.unreferenced} bytes nothing points to"
         return text.values, f"{unreferenced}, which exiftool would drop"
+    if layout.shared:
+        # exiftool writes each strip, tile and JPEG block out on its own, so
+        # shared bytes are written again for each: an old-style JPEG scan
+        # whose JPEG blocks are its strips doubles in size.
+        shared = f"the TIFF reuses {layout.shared} bytes of image data"
+        return text.values, f"{shared}, which exiftool would write out again for each use"
     return text.values, text.problem
 
 

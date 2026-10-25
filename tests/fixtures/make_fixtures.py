@@ -20,6 +20,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -433,6 +434,205 @@ def pentax_jpeg(seed: int) -> bytes:
     pentax = segment(0xE7, app7(len(app7(0))) + preview + b"\xff" * 32 + b"\xd8")
     exif = exif_segment("RICOH IMAGING COMPANY, LTD.", "PENTAX K-1 Mark II", note)
     return b"\xff\xd8" + exif + pentax + jpeg_body(scene_jpeg((640, 480), seed))
+
+
+# -- shaped like real photos that were once misjudged ----------------------------
+# Stand-ins for files in a real-image corpus (drewnoakes/metadata-extractor-images)
+# whose layout once made As If refuse a safe write, or find out only after
+# the model's work that a write couldn't be proven safe.
+
+XMP_HEADER = b"http://ns.adobe.com/xap/1.0/\x00"
+
+
+def xmp_packet(toolkit: str, body: str = "", *, end: str = "w") -> bytes:
+    """A whole XMP packet, wrapper and trailer included, stamped with ``toolkit``."""
+    return (
+        "<?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+        f"<x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='{toolkit}'>"
+        "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+        "<rdf:Description rdf:about='' xmlns:dc='http://purl.org/dc/elements/1.1/'"
+        " xmlns:xmp='http://ns.adobe.com/xap/1.0/'>"
+        f"{body}</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='{end}'?>"
+    ).encode()
+
+
+def fpxr_stub_jpeg(seed: int) -> bytes:
+    """A OnePlus 8 JPEG: XMP stamped with the toolkit Google's camera apps use,
+    and an empty FlashPix APP2 ("FPXR" and four zero bytes). exiftool warns
+    "FPXR segment too small" every time it reads the file, not when it
+    writes XMP: a write that makes it read the file again shows the warning."""
+    body = "<xmp:CreatorTool>OnePlus</xmp:CreatorTool>"
+    xmp = segment(0xE1, XMP_HEADER + xmp_packet("Adobe XMP Core 5.1.0-jc003", body))
+    fpxr = segment(0xE2, b"FPXR\x00\x00\x00\x00")
+    return b"\xff\xd8" + xmp + fpxr + jpeg_body(scene_jpeg((320, 240), seed))
+
+
+def thumbnail_overrun_jpeg(seed: int, overrun: int) -> bytes:
+    """A Sigma DP2 Quattro JPEG: the EXIF thumbnail's length (IFD1) counts
+    ``overrun`` bytes past the end of the EXIF segment, into the APP2 segment
+    after it. The DP2 Quattro counts two: the APP2's 0xFF and its marker,
+    which turns into new XMP's APP1 marker. Sony's DCR-PC110 counts one."""
+    thumb = scene_jpeg((48, 36), seed + 1)
+    main = (text(0x010F, "SIGMA"), text(0x0110, "dp2 Quattro"))
+    ifd0 = bytearray(ifd(8, *main))
+    ifd1_at = 8 + len(ifd0)
+    ifd0[2 + 12 * len(main) : 6 + 12 * len(main)] = struct.pack("<I", ifd1_at)  # next IFD
+
+    def ifd1(thumb_at: int) -> bytes:
+        compression = (0x0103, 3, 1, b"\x06\x00")  # JPEG
+        return ifd(ifd1_at, compression, long(0x0201, thumb_at), long(0x0202, len(thumb) + overrun))
+
+    thumb_at = ifd1_at + len(ifd1(0))
+    tiff = b"II*\x00\x08\x00\x00\x00" + bytes(ifd0) + ifd1(thumb_at) + thumb
+    exif = segment(0xE1, b"Exif\x00\x00" + tiff)
+    app2 = segment(0xE2, b"SIGMA\x00" + bytes(range(64)))  # a vendor block exiftool skips
+    return b"\xff\xd8" + exif + app2 + jpeg_body(scene_jpeg((320, 240), seed))
+
+
+def png_chunk(ctype: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", crc)
+
+
+def scene_png(size: tuple[int, int], seed: int, *chunks: bytes) -> bytes:
+    """The test scene as a Pillow PNG, with ``chunks`` added right after IHDR."""
+    buf = io.BytesIO()
+    _scene(size, seed).save(buf, "PNG")
+    data = buf.getvalue()
+    ihdr_end = 8 + 12 + int.from_bytes(data[8:12], "big")
+    return data[:ihdr_end] + b"".join(chunks) + data[ihdr_end:]
+
+
+def png_xmp_chunk(packet: bytes) -> bytes:
+    """An uncompressed iTXt chunk holding ``packet``, as Adobe's apps write it."""
+    return png_chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x00\x00\x00\x00" + packet)
+
+
+def bad_crc_png(seed: int) -> bytes:
+    """A PNG whose image data (IDAT) has a wrong CRC, like PngSuite's
+    xcsn0g01: decoders show it, exiftool refuses to write it."""
+    data = bytearray(scene_png((64, 48), seed))
+    at = data.index(b"IDAT") - 4
+    crc_at = at + 8 + int.from_bytes(data[at : at + 4], "big")
+    data[crc_at] ^= 0xFF
+    return bytes(data)
+
+
+def xmp_leftovers_png(seed: int, leftovers: bytes) -> bytes:
+    """A PNG edited in Photoshop or Lightroom: its XMP packet is followed, after
+    the trailer, by ``leftovers`` of a longer packet it was rewritten over (a
+    single ">" in one corpus photo, the end of an older face region in
+    another)."""
+    body = "<dc:title><rdf:Alt><rdf:li xml:lang='x-default'>Pier</rdf:li></rdf:Alt></dc:title>"
+    packet = xmp_packet("Adobe XMP Core 5.6-c145 79.163499, 2018/08/13-16:40:22        ", body)
+    return scene_png((320, 240), seed, png_xmp_chunk(packet + leftovers))
+
+
+STALE_PACKET = (
+    b"li>\n  <rdf:Description mwgrs:Name='Someone' mwgrs:Type='Face'/>\n </rdf:li>\n"
+    b"</rdf:Bag>\n</x:xmpmeta>\n<?xpacket end='r'?>"
+)
+"""The end of an older, longer packet: values (a face region's name) after the trailer."""
+
+
+def _tiff(entries: Callable[[int], list[IfdEntry]], data: bytes) -> bytes:
+    """A little-endian TIFF: the header, ``data`` at offset 8, then IFD0 with
+    ``entries(8)`` (the offset ``data`` starts at)."""
+    data += b"\x00" * (len(data) % 2)
+    return b"II*\x00" + struct.pack("<I", 8 + len(data)) + data + ifd(8 + len(data), *entries(8))
+
+
+def _short(tag: int, *values: int) -> IfdEntry:
+    return (tag, 3, len(values), struct.pack(f"<{len(values)}H", *values))
+
+
+def _longs(tag: int, *values: int) -> IfdEntry:
+    return (tag, 4, len(values), struct.pack(f"<{len(values)}I", *values))
+
+
+def _gray(width: int, height: int, seed: int) -> bytes:
+    return bytes((seed + 7 * i + i // width) % 251 for i in range(width * height))
+
+
+def jpeg_tables_tiff(seed: int) -> bytes:
+    """A TIFF holding TIFF 6.0's old-style JPEG tables (tags 0x207-0x209), as
+    old scanners wrote them (an HP Scanjet with Trapeze): they point into a
+    tables-only JPEG stream (tags 0x201/0x202) next to the strips. exiftool
+    refuses to write any TIFF with those tags, whatever its compression, so
+    the image here is plain gray strips that any decoder reads."""
+    width, height = 64, 48
+    pixels = _gray(width, height, seed)
+    dqt = segment(0xDB, b"\x00" + bytes(range(1, 65)))
+    dc = segment(0xC4, b"\x00" + bytes([0, 1, 5, 1, 1, 1, 1, 1, 1] + [0] * 7) + bytes(range(12)))
+    ac = segment(0xC4, b"\x10" + bytes([0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D]))
+    tables = b"\xff\xd8" + dqt + dc + ac + b"\xff\xd9"
+
+    def entries(at: int) -> list[IfdEntry]:
+        stream = at + len(pixels)
+        q, d, a = stream + 2 + 5, stream + 2 + len(dqt) + 5, stream + 2 + len(dqt) + len(dc) + 5
+        return [
+            long(0x0100, width),
+            long(0x0101, height),
+            _short(0x0102, 8),
+            _short(0x0103, 1),  # no compression
+            _short(0x0106, 1),  # black is zero
+            long(0x0111, at),
+            _short(0x0115, 1),
+            long(0x0116, height),
+            long(0x0117, len(pixels)),
+            long(0x0201, stream),  # JPEGInterchangeFormat: the tables-only stream
+            long(0x0202, len(tables)),
+            _longs(0x0207, q),  # JPEGQTables
+            _longs(0x0208, d),  # JPEGDCTables
+            _longs(0x0209, a),  # JPEGACTables
+        ]
+
+    return _tiff(entries, pixels + tables)
+
+
+def shared_strips_tiff(seed: int) -> bytes:
+    """A TIFF whose two strips are the same bytes: the top half of the image
+    repeats as the bottom half. Old-style JPEG scans share bytes the same way
+    (each page's JPEG block is its strips). exiftool writes each strip out on
+    its own, so the file grows by the shared bytes, here past the size gate."""
+    width, height = 512, 300
+    half = _gray(width, height // 2, seed)
+
+    def entries(at: int) -> list[IfdEntry]:
+        return [
+            long(0x0100, width),
+            long(0x0101, height),
+            _short(0x0102, 8),
+            _short(0x0103, 1),
+            _short(0x0106, 1),
+            _longs(0x0111, at, at),  # both strips start at the same byte
+            _short(0x0115, 1),
+            long(0x0116, height // 2),
+            _longs(0x0117, len(half), len(half)),
+        ]
+
+    return _tiff(entries, half)
+
+
+def bigtiff(seed: int) -> bytes:
+    """A small, valid BigTIFF (64-bit offsets): one uncompressed gray strip."""
+    width, height = 16, 12
+    pixels = _gray(width, height, seed)
+    data_at, ifd_at = 16, 16 + len(pixels)
+    entries = [
+        (0x0100, 3, 1, width),
+        (0x0101, 3, 1, height),
+        (0x0102, 3, 1, 8),
+        (0x0103, 3, 1, 1),
+        (0x0106, 3, 1, 1),
+        (0x0111, 16, 1, data_at),  # LONG8
+        (0x0115, 3, 1, 1),
+        (0x0116, 3, 1, height),
+        (0x0117, 16, 1, len(pixels)),
+    ]
+    table = struct.pack("<Q", len(entries))
+    table += b"".join(struct.pack("<HHQQ", *entry) for entry in entries)
+    return b"II+\x00" + struct.pack("<HHQ", 8, 0, ifd_at) + pixels + table + struct.pack("<Q", 0)
 
 
 def _sony_preview_jpg(out: Path) -> None:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import subprocess
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,8 @@ from asif.meta.writer import (
     read_existing,
 )
 from tests.conftest import HAVE_EXIFTOOL
+from tests.fixtures.make_fixtures import fpxr_stub_jpeg, png_xmp_chunk, scene_png
+from tests.fixtures.make_fixtures import xmp_packet as edited_packet
 
 HASH = "ab" * 32
 OTHER_HASH = "cd" * 32
@@ -634,10 +637,40 @@ def test_existing_xmp_toolkit_is_kept() -> None:
     )
     assert plan(ExistingMeta(xmp_toolkit="")).keep_xmp_toolkit is None
     assert plan().keep_xmp_toolkit is None
-    args = build_args(plan(ExistingMeta(xmp_toolkit="x\n-o")), PROV, lang="en")
-    # The value is copied inside exiftool; it never becomes an argument.
+    # Kept as a value, never as a copy: a copy makes exiftool read the whole
+    # file again and print that read's warnings with the write's.
+    args = build_args(plan(ExistingMeta(xmp_toolkit="Adobe XMP Core 7.0  ")), PROV, lang="en")
+    assert "-XMP-x:XMPToolkit=Adobe XMP Core 7.0  " in args
+    assert not any("<" in a for a in args)
+
+
+@pytest.mark.parametrize(
+    "toolkit",
+    [
+        pytest.param("x\n-o", id="line-break"),
+        pytest.param("x\r", id="carriage-return"),
+        pytest.param("nul\0", id="nul"),
+        pytest.param("\udcff", id="not-text"),
+        # exiftool drops one space right after "=" in its argument file.
+        pytest.param(" Adobe XMP Core", id="leading-space"),
+        pytest.param("\tAdobe XMP Core", id="leading-tab"),
+    ],
+)
+def test_xmp_toolkit_that_cant_be_an_argument_is_copied(toolkit: str) -> None:
+    args = build_args(plan(ExistingMeta(xmp_toolkit=toolkit)), PROV, lang="en")
     assert "-XMP-x:XMPToolkit<XMP-x:XMPToolkit" in args
-    assert not any("\n" in a or a.endswith("-o") for a in args)
+    assert not any(a.startswith("-XMP-x:XMPToolkit=") for a in args)
+
+
+@pytest.mark.parametrize("text", HOSTILE)
+def test_hostile_xmp_toolkit_stays_data(text: str) -> None:
+    # A downloaded photo's toolkit stamp is as untrusted as the model's output.
+    args = build_args(plan(ExistingMeta(xmp_toolkit=text)), PROV, lang="en")
+    toolkit = [a for a in args if a.startswith("-XMP-x:XMPToolkit")]
+    assert toolkit in (["-XMP-x:XMPToolkit<XMP-x:XMPToolkit"], [f"-XMP-x:XMPToolkit={text}"])
+    rest = [a for a in args if a not in toolkit]
+    assert_safe_arg_stream(rest, {"en"})
+    assert not any(ch in "".join(args) for ch in "\n\r\0")
 
 
 # -- plan_write: inputs ----------------------------------------------------------
@@ -728,7 +761,7 @@ def test_build_args_full() -> None:
         "-XMP-dc:Subject+=Garden",
         "-XMP-dc:Subject+=shed",
         "-XMP-dc:Subject+=sky",
-        "-XMP-x:XMPToolkit<XMP-x:XMPToolkit",
+        "-XMP-x:XMPToolkit=Adobe XMP Core 7.0",
         "-charset",
         "iptc=UTF8",
         "-IPTC:CodedCharacterSet=UTF8",
@@ -1560,6 +1593,26 @@ def test_nul_padded_xmp_still_gets_keywords(et: ExifTool, fixture_copy: Copy) ->
     assert read_existing(et, path).subjects == ("owner kw", "dog", "beach")
 
 
+@pytest.mark.parametrize(
+    ("items", "langs"),
+    [("<rdf:li>Pier</rdf:li>", False), ("<rdf:li xml:lang='de'>Steg</rdf:li>", True)],
+)
+def test_keywords_next_to_xmp_leftovers(
+    et: ExifTool, tmp_path: Path, items: str, langs: bool
+) -> None:
+    # Photoshop left a ">" of an older packet after the trailer: no XMP
+    # reader sees it, so it neither hides nor invents a language tag.
+    body = f"<dc:subject><rdf:Bag>{items}</rdf:Bag></dc:subject>"
+    path = tmp_path / "edited.png"
+    packet = edited_packet("Adobe", body) + b">"
+    path.write_bytes(scene_png((64, 48), 40, png_xmp_chunk(packet)))
+    assert et.execute("-b", "-XMP", str(path)).stdout.endswith("?>>")
+    assert read_existing(et, path).subject_langs is langs
+    _, record = run_writer(et, path, result(keywords=("dog",)))
+    assert record.subjects_added == (() if langs else ("dog",))
+    assert (record.subject_note is not None) is langs
+
+
 def test_owner_xmp_toolkit_is_kept(et: ExifTool, fixture_copy: Copy, tmp_path: Path) -> None:
     path = fixture_copy("plain.jpg")
     owner_xmp(et, path, tmp_path, "<rdf:li>Garden</rdf:li>")
@@ -1572,6 +1625,42 @@ def test_owner_xmp_toolkit_is_kept(et: ExifTool, fixture_copy: Copy, tmp_path: P
     bare = fixture_copy("exif.jpg")
     run_writer(et, bare)
     assert et.read_tags(bare, "-XMP-x:XMPToolkit")["XMP-x:XMPToolkit"].startswith("Image::ExifTool")
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_xmp_toolkit_is_kept_without_echoing_read_warnings(
+    et: ExifTool, tmp_path: Path, compat: str
+) -> None:
+    # A OnePlus 8 photo: exiftool warns about its empty FlashPix segment
+    # whenever it reads the file. Copying the toolkit stamp made exiftool
+    # read the whole file again during the write, and that read's warning
+    # refused a write that was clean (and stopped runs: a systematic failure).
+    path = tmp_path / "oneplus.jpg"
+    path.write_bytes(fpxr_stub_jpeg(30))
+    assert et.read_tags(path, "-ExifTool:Warning") == {"ExifTool:Warning": "FPXR segment too small"}
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    run_writer(et, path, compat=compat)
+    assert read_existing(et, path).xmp_toolkit == "Adobe XMP Core 5.1.0-jc003"
+    assert all_ok(check_written(et, before, path, compat=compat))  # type: ignore[arg-type]
+    # Why the copy was the problem: on its own, it brings the read's warning back.
+    copy = et.execute("-overwrite_original", "-XMP-x:XMPToolkit<XMP-x:XMPToolkit", str(path))
+    assert any("FPXR segment too small" in w for w in copy.warnings)
+
+
+@pytest.mark.parametrize("toolkit", [" Adobe XMP Core", "  ", "Core\twith a tab  "])
+def test_xmp_toolkit_exiftool_would_change_as_an_argument_is_copied(
+    et: ExifTool, fixture_copy: Copy, tmp_path: Path, toolkit: str
+) -> None:
+    # exiftool drops a space right after "=" in its argument file: such a
+    # value is copied inside exiftool instead, and kept exactly.
+    path = fixture_copy("plain.jpg")
+    # On exiftool's command line, where a space after "=" is kept.
+    owner = ["-XMP-dc:Creator=Owner", f"-XMP-x:XMPToolkit={toolkit}"]
+    subprocess.run(["exiftool", "-q", "-overwrite_original", *owner, str(path)], check=True)
+    assert read_existing(et, path).xmp_toolkit == toolkit
+    run_writer(et, path)
+    assert read_existing(et, path).xmp_toolkit == toolkit
 
 
 def test_created_iptc_record_is_labelled(et: ExifTool, fixture_copy: Copy) -> None:
@@ -1927,7 +2016,14 @@ DTD_BOMB = (
         ),
         # Anything that can't be read with certainty counts as tagged.
         ("not xml at all", True),
-        (xmp_packet("<rdf:li>Hund</rdf:li>") + "<junk/>", True),
+        (xmp_packet("<rdf:li>Hund</rdf:li>") + "<junk>x</junk>", True),
+        (xmp_packet("<rdf:li>Hund</rdf:li>") + "<rdf:li xml:lang='de'/>", True),
+        # Leftovers of an older packet that hold nothing: no reader sees them.
+        pytest.param(xmp_packet("<rdf:li>Hund</rdf:li>") + ">", False, id="leftover-bracket"),
+        pytest.param(
+            xmp_packet("<rdf:li xml:lang='de'>Hund</rdf:li>") + ">", True, id="leftover-tagged"
+        ),
+        pytest.param(xmp_packet("<rdf:li>Hund</rdf:li>") + "<junk/>", False, id="leftover-tag"),
         (DTD_BOMB + xmp_packet("<rdf:li>&b;</rdf:li>"), True),
         ("<?xml version='1.0' encoding='nonsense'?>" + xmp_packet("<rdf:li>x</rdf:li>"), True),
     ],

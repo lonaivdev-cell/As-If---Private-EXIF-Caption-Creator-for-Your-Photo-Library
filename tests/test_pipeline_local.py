@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,8 +20,8 @@ import pytest
 
 from asif.config import Config
 from asif.meta.exiftool import ExifTool
-from asif.meta.gates import Fingerprint, GateResult
-from asif.meta.structure import C2PA_LINK_PROBLEM
+from asif.meta.gates import BIGTIFF, PAST_EXIF_SEGMENT, Fingerprint, GateResult
+from asif.meta.structure import C2PA_LINK_PROBLEM, LEFTOVERS_PROBLEM
 from asif.pipeline import local
 from asif.pipeline.local import (
     CaptionError,
@@ -33,6 +34,16 @@ from asif.pipeline.local import (
 from asif.pipeline.states import State
 from asif.pipeline.timings import TimingsLog
 from tests.conftest import FIXTURE_EXPECT, requires_exiftool
+from tests.fixtures.make_fixtures import (
+    STALE_PACKET,
+    bad_crc_png,
+    bigtiff,
+    fpxr_stub_jpeg,
+    jpeg_tables_tiff,
+    shared_strips_tiff,
+    thumbnail_overrun_jpeg,
+    xmp_leftovers_png,
+)
 
 pytestmark = requires_exiftool
 
@@ -442,3 +453,79 @@ def test_a_folder_that_cant_be_opened_is_a_clean_refusal(
     monkeypatch.setattr(Path, "exists", exists)
     with pytest.raises(CaptionError, match="can't open the destination folder"):
         check_folders(src, dest)
+
+
+# Stand-ins for real photos the pipeline once misjudged: (file, builder,
+# state, start of the reason, whether the model looks at it).
+SHAPED: dict[str, tuple[Callable[[], bytes], State, str, bool]] = {
+    # The toolkit stamp kept by copying it made exiftool echo a read warning
+    # about the empty FlashPix segment: a systematic failure, on every photo.
+    "oneplus8.jpg": (lambda: fpxr_stub_jpeg(30), State.CLEAN, "empty", True),
+    "sony_dcr.jpg": (lambda: thumbnail_overrun_jpeg(31, 1), State.CLEAN, "empty", True),
+    "sigma_dp2.jpg": (
+        lambda: thumbnail_overrun_jpeg(31, 2),
+        State.SKIPPED_FORMAT,
+        f"can't be written safely: {PAST_EXIF_SEGMENT}",
+        False,
+    ),
+    "xcsn0g01.png": (
+        lambda: bad_crc_png(32),
+        State.QUARANTINE,
+        "its structure can't be checked: PNG IDAT chunk has a bad CRC",
+        False,
+    ),
+    "photoshop.png": (lambda: xmp_leftovers_png(33, b">"), State.CLEAN, "empty", True),
+    "lightroom.png": (
+        lambda: xmp_leftovers_png(33, STALE_PACKET),
+        State.SKIPPED_FORMAT,
+        f"can't be written safely: {LEFTOVERS_PROBLEM}",
+        False,
+    ),
+    "trapeze.tif": (
+        lambda: jpeg_tables_tiff(34),
+        State.SKIPPED_FORMAT,
+        "can't be written safely: it's a TIFF with old-style JPEG tables",
+        False,
+    ),
+    "kodak_i200.tif": (
+        lambda: shared_strips_tiff(35),
+        State.SKIPPED_FORMAT,
+        "can't be written safely: the TIFF reuses 76800 bytes of image data",
+        False,
+    ),
+    "gigapixel.tif": (
+        lambda: bigtiff(36),
+        State.SKIPPED_FORMAT,
+        f"can't be written safely: {BIGTIFF}",
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_photos_once_misjudged_get_the_right_state(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, compat: Literal["xmp", "wide"]
+) -> None:
+    # Before: two systematic gate failures, two refused writes and a size
+    # gate failure after the model's work (each counts towards stopping the
+    # run), and two files quarantined as corrupt that are only exiftool's limits.
+    src = tmp_path / "src"
+    src.mkdir()
+    for name, (build, *_rest) in SHAPED.items():
+        (src / name).write_bytes(build())
+    asked: list[str] = []
+    describe = local._describe
+    monkeypatch.setattr(
+        local, "_describe", lambda ctx, ram, img: asked.append(img) or describe(ctx, ram, img)
+    )
+    cfg.general.compat = compat
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is None
+    outcomes = {o.rel: o for o in summary.outcomes}
+    assert outcomes.keys() == SHAPED.keys()
+    for name, (_build, state, reason, _model) in SHAPED.items():
+        outcome = outcomes[name]
+        assert (outcome.state, outcome.systematic) == (state, False), (name, outcome)
+        assert outcome.reason.startswith(reason), (name, outcome.reason)
+        assert (tmp_path / "out" / name).exists() == (state == State.CLEAN), name
+    assert len(asked) == sum(model for *_rest, model in SHAPED.values())

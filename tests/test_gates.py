@@ -31,7 +31,9 @@ from asif.config import Config
 from asif.meta import structure
 from asif.meta.exiftool import ExecResult, ExifTool, ExifToolError
 from asif.meta.gates import (
+    BIGTIFF,
     MAX_GROWTH,
+    PAST_EXIF_SEGMENT,
     PREVIEW_AFTER_IMAGE,
     Fingerprint,
     GateResult,
@@ -44,7 +46,12 @@ from asif.meta.gates import (
     fingerprint,
     snapshot,
 )
-from asif.meta.structure import C2PA_LINK_PROBLEM, C2PA_PROBLEM, jpeg_eoi_offset
+from asif.meta.structure import (
+    C2PA_LINK_PROBLEM,
+    C2PA_PROBLEM,
+    LEFTOVERS_PROBLEM,
+    jpeg_eoi_offset,
+)
 from asif.pipeline import local
 from asif.pipeline.local import caption_folder, choose_model
 from asif.pipeline.states import State
@@ -52,14 +59,21 @@ from asif.pipeline.timings import TimingsLog
 from tests.conftest import HAVE_EXIFTOOL
 from tests.fixtures.make_fixtures import (
     PENTAX_APP7,
+    STALE_PACKET,
+    bad_crc_png,
+    bigtiff,
     exif_segment,
     ifd,
+    jpeg_tables_tiff,
     long,
     olympus_jpeg,
     pentax_jpeg,
     scene_jpeg,
+    shared_strips_tiff,
     sony_jpeg,
+    thumbnail_overrun_jpeg,
     with_mpf,
+    xmp_leftovers_png,
 )
 from tests.test_structure import (
     LITERAL,
@@ -2220,3 +2234,160 @@ def test_iptc_keywords_survive_real_writes(et: ExifTool, fixture_copy: FixtureCo
     et.execute("-overwrite_original", "-charset", "iptc=UTF8", "-IPTC:Keywords-=família", str(path))
     detail = by_name(check_written(et, before, path, compat="wide"))["protected"].detail
     assert detail == "lost values: IPTC:Keywords"
+
+
+# -- shaped like real photos that were once misjudged -------------------------------------
+# Each stands in for a photo of a real-image corpus that the gates failed
+# after the model's work (a systematic failure, which stops runs) or that
+# was refused as corrupt although it is only a limit of exiftool.
+
+
+@pytest.mark.parametrize(("overrun", "refused"), [(0, False), (1, False), (2, True)])
+def test_exif_thumbnail_running_past_its_segment(
+    et: ExifTool, tmp_path: Path, overrun: int, refused: bool
+) -> None:
+    # Sigma's DP2 Quattro: the thumbnail's length counts two bytes past the
+    # EXIF segment. The first, the next segment's 0xFF, is 0xFF after any
+    # write (Sony's DCR-PC110 counts just that one); the second, its marker,
+    # becomes new XMP's APP1 marker.
+    path = tmp_path / "SDIM0001.JPG"
+    path.write_bytes(thumbnail_overrun_jpeg(31, overrun))
+    before = snapshot(et, path)
+    assert before.unprovable == (PAST_EXIF_SEGMENT if refused else None)
+    legit_write(et, path, "xmp", before.image_hash)
+    unflagged = dataclasses.replace(before, unprovable=None)
+    results = check_written(et, unflagged, path, compat="xmp")
+    if refused:
+        # Why: the protected gate would fail after the model's work.
+        assert failing(results) == {"protected"}
+        assert by_name(results)["protected"].detail == "changed: IFD1:ThumbnailImage"
+    else:
+        assert all_ok(results), results
+
+
+def test_what_runs_past_the_exif_segment(tmp_path: Path) -> None:
+    # Dumps as exiftool gives them (-n: offsets from the start of the file),
+    # for a file laid out like the DP2 Quattro's.
+    path = tmp_path / "SDIM0001.JPG"
+    path.write_bytes(data := thumbnail_overrun_jpeg(31, 0))
+    [(begin, payload)] = structure.jpeg_segments(data, 0xE1, b"Exif\x00\x00")
+    end = begin + len(payload)
+    at = end - 100  # a block ending 100 bytes before the segment does
+    for dump in (
+        {"IFD1:ThumbnailOffset": at, "IFD1:ThumbnailLength": 102},
+        {"IFD1:ThumbnailOffset": at, "IFD1:ThumbnailLength": 100_000},
+        {"Olympus:PreviewImageStart": at, "Olympus:PreviewImageLength": 150},
+        {"Sigma:PreviewImageStart": f"{at} {at}", "Sigma:PreviewImageLength": "10 102"},
+        {"IFD1:ThumbnailOffset#2": at, "IFD1:ThumbnailLength#2": 102},
+    ):
+        assert _unprovable(path, dump) == PAST_EXIF_SEGMENT, dump
+    for dump in (
+        {"IFD1:ThumbnailOffset": at, "IFD1:ThumbnailLength": 100},  # ends where the segment does
+        {"IFD1:ThumbnailOffset": at, "IFD1:ThumbnailLength": 101},  # the next segment's 0xFF
+        {"IFD1:ThumbnailOffset": at, "IFD1:ThumbnailLength#2": 102},  # not this one's length
+        {"IFD1:ThumbnailOffset": at},  # no length: nothing to tell
+        {"IFD1:ThumbnailOffset": end, "IFD1:ThumbnailLength": 102},  # starts past the EXIF
+        {"MPImage2:MPImageStart": at, "MPImage2:MPImageLength": 102},  # counted from MPF
+        {"XMP-xmp:ThumbnailOffset": at, "XMP-xmp:ThumbnailLength": 102},
+        {"IFD1:ThumbnailOffset": "(none)", "IFD1:ThumbnailLength": 102},
+    ):
+        assert _unprovable(path, dump) is None, dump
+
+
+def test_png_with_a_bad_crc_is_refused_as_corrupt(et: ExifTool, tmp_path: Path) -> None:
+    # PngSuite's xcsn0g01: the image data's CRC is wrong. Decoders show it,
+    # a plain read finds nothing wrong, but exiftool refuses to write it.
+    path = tmp_path / "scan.png"
+    path.write_bytes(bad_crc_png(32))
+    before = snapshot(et, path)
+    assert before.unprovable == "its structure can't be checked: PNG IDAT chunk has a bad CRC"
+    with pytest.raises(ExifToolError, match=r"Error: \[minor\] Bad CRC for IDAT chunk"):
+        legit_write(et, path, "xmp", before.image_hash)
+
+
+def test_tiff_with_old_style_jpeg_tables_is_refused(et: ExifTool, tmp_path: Path) -> None:
+    path = tmp_path / "scan.tif"
+    path.write_bytes(jpeg_tables_tiff(34))
+    before = snapshot(et, path)
+    assert {"IFD0:JPEGQTables", "IFD0:JPEGDCTables", "IFD0:JPEGACTables"} <= before.tags.keys()
+    assert before.unprovable == (
+        "it's a TIFF with old-style JPEG tables (or shared data) stored by offset, "
+        "which exiftool can't write"
+    )
+    # Why: exiftool refuses every write to it.
+    with pytest.raises(ExifToolError, match="No size tag for IFD0:JPEG"):
+        legit_write(et, path, "xmp", before.image_hash)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["IFD0:JPEGQTables", "IFD3:JPEGDCTables", "SubIFD:JPEGACTables#2", "IFD0:SharedData"],
+)
+def test_every_tag_exiftool_cant_write_a_tiff_with(tmp_path: Path, key: str) -> None:
+    tiff = tmp_path / "scan.tif"
+    tiff.write_bytes(pillow_tiff())
+    expected = "it's a TIFF with old-style JPEG tables (or shared data) stored by offset"
+    assert (_unprovable(tiff, {key: "8"}) or "").startswith(expected)
+    jpeg = tmp_path / "photo.jpg"
+    jpeg.write_bytes(scene_jpeg((64, 48), 1))
+    assert _unprovable(jpeg, {key: "8"}) is None  # a JPEG's EXIF is copied, not rebuilt
+
+
+def test_tiff_reusing_image_data_is_refused(et: ExifTool, tmp_path: Path) -> None:
+    # Old-style JPEG scans point each page's JPEG block at its strips;
+    # here two strips are the same bytes. exiftool writes each out.
+    path = tmp_path / "scan.tif"
+    path.write_bytes(shared_strips_tiff(35))
+    before = snapshot(et, path)
+    shared = 512 * 150
+    assert before.unprovable == (
+        f"the TIFF reuses {shared} bytes of image data, which exiftool would write out again "
+        "for each use"
+    )
+    legit_write(et, path, "xmp", before.image_hash)
+    # Why: the size gate fails after the model's work; nothing else does.
+    results = check_written(et, dataclasses.replace(before, unprovable=None), path, compat="xmp")
+    assert failing(results) == {"size"}
+    assert path.stat().st_size - before.size > shared
+
+
+def test_bigtiff_is_a_format_limit_not_corrupt(et: ExifTool, tmp_path: Path) -> None:
+    path = tmp_path / "pano.tif"
+    path.write_bytes(bigtiff(36))
+    assert et.read_tags(path, "-File:FileType") == {"File:FileType": "BTF"}  # readable
+    with pytest.raises(ExifToolError):
+        et.image_data_hash(path)  # but not hashable, so it looked corrupt
+    before = snapshot(et, path)
+    assert before.unprovable == BIGTIFF
+    assert not BIGTIFF.startswith("its structure can't be checked")  # not quarantined
+    assert "structure" in failing(check_written(et, before, path, compat="xmp"))
+    with pytest.raises(ExifToolError, match="BigTIFF"):
+        legit_write(et, path, "xmp", "0" * 64)
+    # A damaged one exiftool can't read as a BigTIFF may well be corrupt.
+    header = bytearray(path.read_bytes())
+    header[4] = 9  # 64-bit offsets are 8 bytes, never 9
+    path.write_bytes(bytes(header))
+    with pytest.raises(ExifToolError):
+        snapshot(et, path)
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_xmp_leftovers_holding_nothing_pass(et: ExifTool, tmp_path: Path, compat: Compat) -> None:
+    # Photoshop CC 2019 left a ">" of an older packet after the trailer.
+    # exiftool drops it, which nothing that reads XMP can tell.
+    path = tmp_path / "edited.png"
+    path.write_bytes(xmp_leftovers_png(33, b">"))
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    assert before.xmp == Counter({"Pier": 1})
+    legit_write(et, path, compat, before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
+
+
+def test_xmp_leftovers_that_may_hold_values_are_refused(et: ExifTool, tmp_path: Path) -> None:
+    # Lightroom left the end of an older packet (a face region) after the trailer.
+    path = tmp_path / "scan.png"
+    path.write_bytes(xmp_leftovers_png(33, STALE_PACKET))
+    before = snapshot(et, path)
+    assert before.unprovable == LEFTOVERS_PROBLEM
+    assert not LEFTOVERS_PROBLEM.startswith("its structure can't be checked")  # not quarantined
