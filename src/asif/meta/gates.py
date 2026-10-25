@@ -9,7 +9,9 @@ writing, ``check_written`` runs, in order:
 
 1. ``equality``: exiftool's SHA-256 ``ImageDataHash`` is unchanged.
 2. ``protected``: every tag outside the ones As If writes is unchanged,
-   and the ones it writes only gained values (additive-only).
+   and the ones it writes only gained values (additive-only). With compat
+   "wide", a ``Photoshop:IPTCDigest`` in step with the IPTC stays in step,
+   so apps keep showing the XMP they showed.
 3. ``trailer``: a JPEG's bytes after the primary image are unchanged
    (motion-photo video, MPF images), and must be provably so.
 4. ``structure``: ``asif.meta.structure.compare``, byte for byte, and
@@ -101,6 +103,14 @@ _IPTC = frozenset(
         "File:CurrentIPTCDigest",
     }
 )
+# compat = "wide": Photoshop:IPTCDigest records the IPTC the XMP was last in
+# step with. Apps following the MWG guidelines show the XMP while it matches
+# the IPTC (or there is no IPTC), and the IPTC once it doesn't, so the writer
+# keeps it in step with the keywords it adds. It may change only from in
+# step (or no IPTC) to in step, and it must not go stale under new IPTC:
+# those apps would switch from the owner's XMP to the IPTC.
+_IPTC_DIGEST = "Photoshop:IPTCDigest"
+_CURRENT_IPTC_DIGEST = "File:CurrentIPTCDigest"
 
 # Format bookkeeping that legitimately changes, by exact key (copies included).
 _FORMAT_BOOKKEEPING: dict[str, frozenset[str]] = {
@@ -145,6 +155,9 @@ _TIFF_OFFSET = re.compile(
 # relative offset must not change: the structure gate compares the MPF
 # segment byte for byte, and the trailer gate the images themselves.
 _MPF_IMAGE_START = re.compile(r"MPImage\d+:MPImageStart")
+# XMP dcterms:provenance, as exiftool names it with the usual prefix (any
+# language of it): C2PA's link to Content Credentials kept outside the file.
+_C2PA_LINK = re.compile(r"XMP-dcterms:Provenance(?:-[\w-]+)?")
 
 # Allowed doesn't mean anything goes: the fields As If writes are
 # additive-only (§7), and the protected gate checks that itself rather than
@@ -213,6 +226,19 @@ def _owned(tags: dict[str, Any], compat: Literal["xmp", "wide"]) -> dict[str, An
         if key.partition("#")[0] in once
         or (_is_caption(key.partition("#")[0]) and not _ours_or_blank(value, digest))
     }
+
+
+def _xmp_shown(tags: dict[str, Any]) -> bool:
+    """Do apps following the MWG guidelines show the XMP rather than the IPTC?
+    They do while there is no IPTC, no IPTCDigest, or one that matches the IPTC."""
+    current, digest = tags.get(_CURRENT_IPTC_DIGEST), tags.get(_IPTC_DIGEST)
+    return current is None or digest is None or digest == current
+
+
+def _digest_kept_in_step(before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Was Photoshop:IPTCDigest in step with the IPTC (or there was none), and is it now?"""
+    now = after.get(_CURRENT_IPTC_DIGEST)
+    return _xmp_shown(before) and now is not None and after.get(_IPTC_DIGEST) == now
 
 
 def _list_values(tags: dict[str, Any], name: str) -> Counter[str]:
@@ -378,6 +404,8 @@ def _exiftool_limit(fmt: str, tags: dict[str, Any], warnings: list[str]) -> str 
         )
     if any(k.partition("#")[0] == "JUMBF:JUMDLabel" and v == "c2pa" for k, v in tags.items()):
         return structure.C2PA_PROBLEM  # read by exiftool, in case the bytes check misses it
+    if any(_C2PA_LINK.fullmatch(k.partition("#")[0]) for k in tags):
+        return structure.C2PA_LINK_PROBLEM  # the same, for the XMP check
     if fmt == "tiff" and any(
         _TIFF_OFFSET.fullmatch(base) and not _TIFF_MOVED.fullmatch(base)
         for base in (key.partition("#")[0] for key in tags)
@@ -443,6 +471,13 @@ def _protected(
     old = {k: v for k, v in before.tags.items() if not _allowed(k, before.fmt, compat)} | owned
     new = {k: v for k, v in tags.items() if k in owned or not _allowed(k, before.fmt, compat)}
     changed = [k for k in old.keys() & new.keys() if old[k] != new[k]]
+    out_of_step: list[str] = []
+    if compat == "wide":
+        if _IPTC_DIGEST in changed and _digest_kept_in_step(before.tags, tags):
+            changed.remove(_IPTC_DIGEST)
+        # An unchanged digest goes stale too when the IPTC changes under it.
+        if _xmp_shown(before.tags) and not _xmp_shown(tags):
+            out_of_step.append(_IPTC_DIGEST)
     added, removed = new.keys() - old.keys(), old.keys() - new.keys()
     lost = [
         name
@@ -456,6 +491,7 @@ def _protected(
             ("added", added),
             ("removed", removed),
             ("lost values", lost),
+            ("out of step with the IPTC", out_of_step),
         )
         if keys
     ]

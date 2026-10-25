@@ -15,6 +15,7 @@ import pytest
 
 from asif.infer.schema import CAPTION_MAX, CaptionResult
 from asif.meta.exiftool import ExecResult, ExifTool, ExifToolError
+from asif.meta.gates import all_ok, check_written, snapshot
 from asif.meta.writer import (
     IPTC_KEYWORD_MAX_BYTES,
     ExistingMeta,
@@ -255,6 +256,15 @@ def test_caption_deleted_by_owner_is_written_again() -> None:
         ("Agfa Isolette folding camera",),
         ("Kodak moment with the new camera",),
         ("Kodak and my old digital camera",),
+        # Any word before "digital camera", or after "Exif JPEG", is a caption
+        # unless it's firmware's own wording.
+        ("Vintage digital camera",),
+        ("Broken digital camera",),
+        ("A digital camera",),
+        ("My digital camera",),
+        ("Canon digital camera",),
+        ("Exif JPEG test",),
+        ("Exif jpeg export",),
     ],
 )
 def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
@@ -277,7 +287,10 @@ def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
         "SONY DSC",
         "DSC",
         "DIGITAL CAMERA",
+        "Digital Still Camera",
         "LEICA DIGITAL CAMERA",
+        "SANYO DIGITAL CAMERA",
+        "SAMSUNG DIGITAL CAMERA",
         "KODAK Digital Still Camera",
         "KODAK CX7530 ZOOM DIGITAL CAMERA",
         "KODAK EASYSHARE C813 ZOOM DIGITAL CAMERA",
@@ -287,6 +300,7 @@ def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
         "MINOLTA DIGITAL CAMERA",
         "Exif_JPEG_PICTURE",
         "EXIF_JPEG_422",
+        "EXIF JPEG",
     ],
 )
 def test_camera_filler_is_not_a_caption(filler: str) -> None:
@@ -514,6 +528,65 @@ def test_no_iptc_is_created_when_nothing_fits() -> None:
     assert p.iptc_note is not None and p.iptc_note.startswith("2 keywords")
 
 
+# Photoshop's IPTCDigest of no IPTC at all (the MD5 of nothing).
+EMPTY_MD5 = hashlib.md5(b"").hexdigest()
+DIGEST_A, DIGEST_B = "a" * 32, "b" * 32
+UTF8_IPTC = ExistingMeta(iptc_present=True, iptc_utf8=True, iptc_keywords=("Family",))
+
+
+@pytest.mark.parametrize(
+    ("existing", "update"),
+    [
+        # In step: apps following the MWG guidelines show the XMP, and must go on.
+        (replace(UTF8_IPTC, iptc_digest=DIGEST_A, current_iptc_digest=DIGEST_A), True),
+        # No IPTC yet (the digest of nothing, or of anything): XMP shown too.
+        (ExistingMeta(iptc_digest=EMPTY_MD5), True),
+        (ExistingMeta(iptc_digest="0" * 32), True),
+        # Already stale: the IPTC is shown either way.
+        (replace(UTF8_IPTC, iptc_digest=DIGEST_A, current_iptc_digest=DIGEST_B), False),
+        # No digest: apps show the XMP whatever the IPTC holds.
+        (UTF8_IPTC, False),
+        (ExistingMeta(), False),
+    ],
+    ids=["in-step", "no-iptc", "no-iptc-zeros", "stale", "no-digest", "nothing"],
+)
+def test_wide_keeps_an_in_step_iptc_digest_in_step(existing: ExistingMeta, update: bool) -> None:
+    p = plan(existing, compat="wide")
+    assert p.add_iptc == ("garden", "shed", "sky")  # the keywords go in either way
+    assert p.update_iptc_digest is update
+    args = build_args(p, PROV, lang="en")
+    assert ("-Photoshop:IPTCDigest=new" in args) is update
+    if update:  # after the IPTC it is computed from
+        assert args.index("-Photoshop:IPTCDigest=new") > args.index("-IPTC:Keywords+=sky")
+    assert not any(DIGEST_A in a or DIGEST_B in a or EMPTY_MD5 in a for a in args)
+
+
+def test_iptc_digest_is_only_updated_with_iptc_keywords() -> None:
+    in_step = replace(UTF8_IPTC, iptc_digest=DIGEST_A, current_iptc_digest=DIGEST_A)
+    assert not plan(in_step, compat="xmp").update_iptc_digest
+    assert not plan(in_step, result(keywords=("family",)), compat="wide").update_iptc_digest
+    assert not plan(in_step, result(keywords=("庭" * 30,)), compat="wide").update_iptc_digest
+    latin1 = replace(in_step, iptc_utf8=False)
+    assert not plan(latin1, compat="wide").update_iptc_digest
+    # Nothing written to IPTC, so no digest of it either.
+    p = replace(BASE_PLAN, add_iptc=(" ",), update_iptc_digest=True)
+    assert "-Photoshop:IPTCDigest=new" not in build_args(p, PROV, lang="en")
+
+
+@pytest.mark.parametrize("current", [None, DIGEST_A, DIGEST_B])
+def test_iptc_with_a_digest_exiftool_cant_update_is_left_alone(current: str | None) -> None:
+    # A TIFF: exiftool pads the IPTC after taking its digest.
+    existing = replace(
+        UTF8_IPTC, iptc_digest=DIGEST_A, current_iptc_digest=current, iptc_digest_writable=False
+    )
+    p = plan(existing, compat="wide")
+    assert p.add_iptc == () and not p.create_iptc and not p.update_iptc_digest
+    assert p.iptc_note is not None and "checksum" in p.iptc_note
+    assert p.add_subjects == ("garden", "shed", "sky")  # XMP keywords still go in
+    # Without a digest there's nothing to keep in step.
+    assert plan(replace(existing, iptc_digest=None), compat="wide").add_iptc
+
+
 # -- plan_write: the image hash ------------------------------------------------
 
 
@@ -621,10 +694,13 @@ def test_build_args_full() -> None:
         all_copied_subjects=("Garden",),
         created_iptc=True,
         keep_xmp_toolkit="Adobe XMP Core 7.0",
+        update_iptc_digest=True,
     )
     assert build_args(p, PROV, lang="en") == [
         "-overwrite_original",
         "-P",
+        "-api",
+        r"NoWarning=^IPTCDigest is not current\. XMP may be out of sync$",
         "-XMP-dc:Description-x-default=A red shed",
         "-XMP-dc:Description-en=A red shed",
         "-XMP-dc:Description-de=",
@@ -636,6 +712,7 @@ def test_build_args_full() -> None:
         "iptc=UTF8",
         "-IPTC:CodedCharacterSet=UTF8",
         "-IPTC:Keywords+=shed",
+        "-Photoshop:IPTCDigest=new",
         f"-XMP-et:OriginalImageHash={HASH}",
         "-XMP-et:OriginalImageHashType=SHA256",
         "-XMP-asif:ToolVersion=0.1",
@@ -660,6 +737,8 @@ def test_build_args_when_only_provenance_changes() -> None:
     assert build_args(BASE_PLAN, PROV2, lang="en") == [
         "-overwrite_original",
         "-P",
+        "-api",
+        r"NoWarning=^IPTCDigest is not current\. XMP may be out of sync$",
         "-XMP-asif:ToolVersion=0.2",
         "-XMP-asif:ModelId=qwen3.5-9b-q4km",
         f"-XMP-asif:ModelSHA256={'ef' * 32}",
@@ -685,15 +764,18 @@ def test_build_args_appending_to_existing_iptc_sets_no_charset() -> None:
 def test_build_args_skips_charset_when_no_iptc_keyword_survives() -> None:
     p = replace(BASE_PLAN, add_iptc=(" ", "\n"), create_iptc=True)
     args = build_args(p, PROV, lang="en")
-    assert not any("IPTC" in a or "iptc" in a for a in args if not a.startswith("-XMP-asif"))
+    fixed = ("-XMP-asif", "NoWarning=")  # provenance, and the one warning let through
+    assert not any("IPTC" in a or "iptc" in a for a in args if not a.startswith(fixed))
 
 
 def test_build_args_from_plan_write_round_trip() -> None:
     p = plan(ours("Old", "en"), result("Nova"), lang="pt-BR", compat="wide")
     args = build_args(p, PROV, lang="pt-BR")
-    assert args[:5] == [
+    assert args[:7] == [
         "-overwrite_original",
         "-P",
+        "-api",
+        r"NoWarning=^IPTCDigest is not current\. XMP may be out of sync$",
         "-XMP-dc:Description-x-default=Nova",
         "-XMP-dc:Description-pt-BR=Nova",
         "-XMP-dc:Description-en=",
@@ -767,6 +849,12 @@ def assert_safe_arg_stream(args: list[str], langs: set[str]) -> list[str]:
         assert not any(ch in arg for ch in "\n\r\0"), "a line break would split the argument"
         if arg in ("-overwrite_original", "-P", "-XMP-x:XMPToolkit<XMP-x:XMPToolkit"):
             i += 1
+            continue
+        if arg == "-api":
+            # Only ever the one warning exiftool may skip; never an option that
+            # changes what gets written.
+            assert args[i + 1].startswith("NoWarning=^IPTCDigest is not current")
+            i += 2
             continue
         if arg == "-charset":
             assert args[i + 1] == "iptc=UTF8"
@@ -1171,10 +1259,15 @@ def test_existing_original_hash_is_never_overwritten(et: ExifTool, fixture_copy:
     }
 
 
-def mwg(et: ExifTool, path: Path) -> dict[str, Any]:
+def mwg(path: Path) -> dict[str, Any]:
     """Caption and keywords as apps following the Metadata Working Group's
-    rules (Lightroom, Bridge, ...) choose them among XMP, IPTC and EXIF."""
-    rows = et.execute_json("-use", "MWG", "-MWG:Description", "-MWG:Keywords", str(path))
+    rules (Lightroom, Bridge, ...) choose them among XMP, IPTC and EXIF.
+
+    In an exiftool of its own: "-use MWG" stays loaded for the rest of a
+    process, adding MWG tags to every later read and changing how it reads.
+    """
+    with ExifTool() as tool:
+        rows = tool.execute_json("-use", "MWG", "-MWG:Description", "-MWG:Keywords", str(path))
     row = dict(rows[0])
     row.pop("SourceFile")
     return row
@@ -1197,7 +1290,7 @@ def test_owner_iptc_only_caption_and_keywords_stay_visible(
         "-IPTC:Keywords=Grandpa",
         "-IPTC:Keywords=lake",
     )
-    before = mwg(et, path)
+    before = mwg(path)
     assert read_existing(et, path).legacy_captions == ("Grandpa at the lake, 1998",)
     _, record = run_writer(et, path, result(keywords=("lake", "boat")))
     assert not record.caption_written and record.caption_reason == "kept-user"
@@ -1207,9 +1300,93 @@ def test_owner_iptc_only_caption_and_keywords_stay_visible(
     assert record.subjects_copied == ("Grandpa", "lake") and record.subjects_added == ("boat",)
     assert meta.asif["CopiedKeywords"] == ("Grandpa", "lake")
     assert meta.asif["AddedKeywords"] == ("boat",)
-    after = mwg(et, path)
+    after = mwg(path)
     assert after["Description"] == before["Description"] == "Grandpa at the lake, 1998"
     assert after["Keywords"] == ["Grandpa", "lake", "boat"]
+
+
+OWNER_XMP_CAPTION = "Grandma's 80th birthday"
+OWNER_XMP = (
+    f"-XMP-dc:Description={OWNER_XMP_CAPTION}",
+    "-XMP-dc:Subject=Family",
+    "-XMP-dc:Subject=Lisbon",
+)
+OWNER_UTF8_IPTC = (
+    "-charset",
+    "iptc=UTF8",
+    "-IPTC:CodedCharacterSet=UTF8",
+    "-IPTC:Caption-Abstract=Old caption",
+    "-IPTC:Keywords=Family",
+)
+
+
+def write_wide_and_check(et: ExifTool, path: Path) -> tuple[WritePlan, WriteRecord]:
+    """``run_writer`` with dog and beach in compat "wide", then every integrity gate."""
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    p, record = run_writer(et, path, result(keywords=("dog", "beach")), compat="wide")
+    results = check_written(et, before, path, compat="wide")
+    assert all_ok(results), results
+    return p, record
+
+
+@pytest.mark.parametrize(
+    "owner_iptc",
+    [
+        # What Photoshop-family apps store for a photo without IPTC.
+        (f"-Photoshop:IPTCDigest={EMPTY_MD5}",),
+        # In step with an older IPTC caption and keywords.
+        (*OWNER_UTF8_IPTC, "-Photoshop:IPTCDigest=new"),
+    ],
+    ids=["no-iptc", "in-step"],
+)
+def test_wide_write_keeps_apps_showing_the_owners_xmp(
+    et: ExifTool, fixture_copy: Copy, owner_iptc: tuple[str, ...]
+) -> None:
+    # Apps following the MWG guidelines (Lightroom, Bridge, exiftool's MWG
+    # tags) show the XMP only while the IPTCDigest matches the IPTC, and
+    # Adobe's copy the IPTC over the XMP on the next save once it doesn't.
+    path = fixture_copy("plain.jpg")
+    exiftool_set(et, path, *OWNER_XMP, *owner_iptc)
+    assert mwg(path) == {"Description": OWNER_XMP_CAPTION, "Keywords": ["Family", "Lisbon"]}
+    p, record = write_wide_and_check(et, path)
+    assert p.update_iptc_digest and record.iptc_added == ("dog", "beach")
+    assert record.caption_reason == "kept-user"
+    assert mwg(path) == {
+        "Description": OWNER_XMP_CAPTION,
+        "Keywords": ["Family", "Lisbon", "dog", "beach"],
+    }
+    meta = read_existing(et, path)
+    assert meta.iptc_digest == meta.current_iptc_digest is not None
+
+
+def test_wide_write_leaves_a_stale_iptc_digest_alone(et: ExifTool, fixture_copy: Copy) -> None:
+    # Already stale (the IPTC was edited since): apps show the IPTC, before
+    # the write and after it.
+    path = fixture_copy("plain.jpg")
+    exiftool_set(et, path, *OWNER_UTF8_IPTC, f"-Photoshop:IPTCDigest={DIGEST_A}")
+    assert mwg(path) == {"Description": "Old caption", "Keywords": "Family"}
+    p, record = write_wide_and_check(et, path)
+    assert not p.update_iptc_digest and record.iptc_added == ("dog", "beach")
+    assert read_existing(et, path).iptc_digest == DIGEST_A
+    assert mwg(path) == {"Description": "Old caption", "Keywords": ["Family", "dog", "beach"]}
+
+
+def test_tiff_iptc_with_a_digest_is_left_alone(et: ExifTool, fixture_copy: Copy) -> None:
+    # exiftool can't keep a TIFF's digest in step: its IPTC is left as it is.
+    path = fixture_copy("plain.tif")
+    exiftool_set(et, path, *OWNER_XMP, f"-Photoshop:IPTCDigest={EMPTY_MD5}")
+    assert mwg(path) == {"Description": OWNER_XMP_CAPTION, "Keywords": ["Family", "Lisbon"]}
+    _, record = write_wide_and_check(et, path)
+    assert record.iptc_added == () and not record.iptc_created
+    assert record.iptc_note is not None and "checksum" in record.iptc_note
+    assert record.subjects_added == ("dog", "beach")
+    meta = read_existing(et, path)
+    assert not meta.iptc_present and meta.iptc_digest == EMPTY_MD5
+    assert mwg(path) == {
+        "Description": OWNER_XMP_CAPTION,
+        "Keywords": ["Family", "Lisbon", "dog", "beach"],
+    }
 
 
 def test_owner_exif_caption_is_kept(et: ExifTool, fixture_copy: Copy) -> None:
@@ -1235,7 +1412,7 @@ def test_unmarked_latin1_iptc_keywords_get_no_xmp_keywords(
     _, record = run_writer(et, path, result(keywords=("garden", "café")))
     assert record.subjects_added == () and record.subjects_copied == ()
     assert record.subject_note is not None
-    assert mwg(et, path)["Keywords"] == ["café", "old"]  # still the owner's
+    assert mwg(path)["Keywords"] == ["café", "old"]  # still the owner's
 
 
 def owner_xmp(et: ExifTool, path: Path, tmp_path: Path, subject: str) -> None:
@@ -1599,6 +1776,28 @@ def test_apply_write_catches_keywords_labelled_with_a_language(ram_file: Path) -
     with pytest.raises(ExifToolError, match="XMP-dc:Subject") as info:
         scripted_write(tool, ram_file)
     assert "secret" not in str(info.value)
+
+
+def test_apply_write_checks_the_iptc_digest_is_in_step(ram_file: Path) -> None:
+    p = replace(
+        SECRET_PLAN,
+        add_iptc=("secretkeyword",),
+        all_added_iptc=("secretkeyword",),
+        update_iptc_digest=True,
+    )
+    row = {
+        **GOOD_ROW,
+        "IPTC:Keywords": ["secretkeyword"],
+        "XMP-asif:AddedIPTCKeywords": ["secretkeyword"],
+        "Photoshop:IPTCDigest": DIGEST_A,
+        "File:CurrentIPTCDigest": DIGEST_B,
+    }
+    tool = ScriptedExifTool(stdout="    1 image files updated\n", rows=marked(row))
+    with pytest.raises(ExifToolError, match="Photoshop:IPTCDigest") as info:
+        apply_write(cast(ExifTool, tool), ram_file, p, PROV, lang="en")
+    assert "secret" not in str(info.value) and DIGEST_A not in str(info.value)
+    tool.rows = marked({**row, "File:CurrentIPTCDigest": DIGEST_A})
+    assert apply_write(cast(ExifTool, tool), ram_file, p, PROV, lang="en").iptc_added
 
 
 def test_apply_write_checks_the_xmp_toolkit_was_kept(ram_file: Path) -> None:

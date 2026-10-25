@@ -18,7 +18,10 @@ What goes where:
   ``compat = "wide"``), skipping any already in either, in any letter case.
   When the photo's own keywords are only in IPTC, they are copied into the
   new XMP list first (recorded as copied, never as As If's), so apps that
-  read XMP first still show them;
+  read XMP first still show them. A ``Photoshop:IPTCDigest`` that matched
+  the IPTC (or the file had no IPTC) is updated along with it, so apps
+  following the MWG guidelines keep showing the XMP; where exiftool can't
+  do that (TIFF), the IPTC is left alone;
 - ``XMP-et:OriginalImageHash`` once, never overwritten;
 - provenance (``XMP-asif:*``), rewritten every time: tool, model, prompt,
   run, time, and exactly what As If added, including an IPTC record it
@@ -60,6 +63,10 @@ IPTC_KEYWORD_MAX_BYTES = 64
 # block into PNG (with a warning) and silently writes nothing into WebP, so
 # "wide" falls back to XMP-only there.
 _IPTC_FILE_TYPES = frozenset({"JPEG", "MPO", "TIFF"})
+# Formats where exiftool's Photoshop:IPTCDigest=new matches the IPTC it
+# writes. In a TIFF it pads the IPTC to whole 4-byte words after taking the
+# digest, so the digest it stores is never the one readers compute.
+_IPTC_DIGEST_FILE_TYPES = frozenset({"JPEG", "MPO"})
 
 # Provenance values are short identifiers. Keywords recorded by an earlier run
 # are re-recorded whole (undo must match them exactly), within reason.
@@ -93,6 +100,8 @@ _READ_TAGS = (
     "-XMP-et:OriginalImageHash",
     "-XMP-x:XMPToolkit",
     "-IPTC:all",  # any IPTC tag at all means the file has an IPTC record
+    "-Photoshop:IPTCDigest",
+    "-File:CurrentIPTCDigest",
     "-IFD0:ImageDescription",
     "-File:FileType",
 )
@@ -105,10 +114,12 @@ _ASIF_LISTS = frozenset({"AddedKeywords", "AddedIPTCKeywords", "CopiedKeywords"}
 # each one spells out the firmware's own wording.
 _CAMERA_FILLER = re.compile(
     r"""
-    # OLYMPUS DIGITAL CAMERA, LEICA DIGITAL CAMERA, KODAK Digital Still Camera
-    (?:\w+\s+)?digital\s+(?:still\s+)?camera
-    # KODAK CX7530 ZOOM DIGITAL CAMERA, KODAK EASYSHARE C813 ZOOM DIGITAL
-    # CAMERA, KONICA MINOLTA DIGITAL CAMERA: at most one model name, and it
+    # DIGITAL CAMERA, OLYMPUS DIGITAL CAMERA, LEICA DIGITAL CAMERA, SANYO
+    # DIGITAL CAMERA: only these brands ("Vintage digital camera" is a caption)
+    (?:(?:olympus|leica|sanyo)\s+)?digital\s+(?:still\s+)?camera
+    # KODAK Digital Still Camera, KODAK CX7530 ZOOM DIGITAL CAMERA, KODAK
+    # EASYSHARE C813 ZOOM DIGITAL CAMERA, KONICA MINOLTA DIGITAL CAMERA,
+    # SAMSUNG DIGITAL CAMERA: at most one model name, and it
     # has a digit ("Kodak Brownie, my grandfather's first camera" is a caption)
     | (?:agfa|kodak|konica|minolta|pentax|samsung)(?:\s+(?:minolta|easyshare))?
       (?:\s+[a-z-]*\d[\w-]*)?(?:\s+zoom)?\s+digital\s+(?:still\s+)?camera
@@ -116,8 +127,8 @@ _CAMERA_FILLER = re.compile(
     | samsung\s+camera\s+pictures?
     # SONY DSC
     | (?:sony\s+)?dsc
-    # Exif_JPEG_PICTURE, EXIF_JPEG_422
-    | exif[\s_]jpeg(?:[\s_]\w+)?
+    # Exif_JPEG_PICTURE, EXIF_JPEG_422 ("Exif JPEG test" is a caption)
+    | exif[\s_]jpeg(?:[\s_](?:picture|\d+))?
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -137,6 +148,16 @@ _NOTE_LANG_TAGGED = (
 _NOTE_IPTC_ONLY = (
     "XMP keywords skipped: they would hide the photo's own IPTC keywords in many "
     "apps, and those aren't marked as UTF-8, so they can't be copied over safely"
+)
+# exiftool warns while writing a file whose IPTCDigest no longer matches its
+# IPTC (an app changed the IPTC without updating it). That was already so,
+# and stays so: As If never touches a stale digest, and the protected gate
+# checks it. Only this exact warning is let through; any other still
+# refuses the write.
+_STALE_DIGEST_WARNING = r"^IPTCDigest is not current\. XMP may be out of sync$"
+_NOTE_IPTC_DIGEST = (
+    "IPTC skipped: the file has a checksum (IPTCDigest) that keeps apps showing "
+    "its XMP, and exiftool can't update it in this format"
 )
 
 
@@ -189,6 +210,14 @@ class ExistingMeta:
     be read to tell), which exiftool would copy onto As If's keywords."""
     xmp_toolkit: str | None = None
     """XMP-x:XMPToolkit, or None when the file has none."""
+    iptc_digest: str | None = None
+    """Photoshop:IPTCDigest: the MD5 of the IPTC the XMP was last in step
+    with. Apps following the MWG guidelines show the XMP only while it
+    matches the IPTC (or there is none). None when the file has none."""
+    current_iptc_digest: str | None = None
+    """File:CurrentIPTCDigest, exiftool's MD5 of the IPTC as it is; None without IPTC."""
+    iptc_digest_writable: bool = True
+    """exiftool can keep Photoshop:IPTCDigest in step with IPTC it writes (JPEG)."""
 
 
 @dataclass(frozen=True)
@@ -239,6 +268,10 @@ class WritePlan:
     keep_xmp_toolkit: str | None = None
     """The photo's XMP-x:XMPToolkit, kept as it is (exiftool would stamp its
     own); None when it has none."""
+    update_iptc_digest: bool = False
+    """Set Photoshop:IPTCDigest to the IPTC as written: it was in step (or
+    there was no IPTC), so apps following the MWG guidelines showed the XMP,
+    and must go on doing so rather than switch to the IPTC."""
 
 
 @dataclass(frozen=True)
@@ -275,6 +308,8 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
     asif: dict[str, Any] = {}
     original_hash: str | None = None
     toolkit: str | None = None
+    iptc_digest: str | None = None
+    current_digest: str | None = None
     legacy: tuple[str, ...] = ()
     file_type = ""
     for key, raw in rows[0].items():
@@ -299,6 +334,10 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
             legacy += (_one(value),)
         elif group == "File" and name == "FileType":
             file_type = _one(value)
+        elif group == "Photoshop" and name == "IPTCDigest":
+            iptc_digest = _one(value)
+        elif group == "File" and name == "CurrentIPTCDigest":
+            current_digest = _one(value)
         elif _IPTC_GROUP.fullmatch(group):
             iptc_present = True
             if name == "Keywords":
@@ -322,6 +361,9 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
         legacy_captions=legacy,
         subject_langs=langs,
         xmp_toolkit=toolkit,
+        iptc_digest=iptc_digest,
+        current_iptc_digest=current_digest,
+        iptc_digest_writable=file_type in _IPTC_DIGEST_FILE_TYPES,
     )
 
 
@@ -419,7 +461,7 @@ def plan_write(
     write_caption = reason in ("empty", "ours")
 
     copy_subjects, add_subjects, subject_note = _subject_rule(existing, keywords)
-    add_iptc, create_iptc, iptc_note = _iptc_rule(existing, keywords, compat)
+    add_iptc, create_iptc, update_digest, iptc_note = _iptc_rule(existing, keywords, compat)
     write_hash = existing.original_image_hash is None
 
     prev_subjects = _many(existing.asif.get("AddedKeywords"))
@@ -450,6 +492,7 @@ def plan_write(
         # Sticky: on the next run the record exists, so create_iptc is False.
         created_iptc=prev_created or create_iptc,
         keep_xmp_toolkit=existing.xmp_toolkit or None,
+        update_iptc_digest=update_digest,
     )
 
 
@@ -512,16 +555,21 @@ def _subject_rule(
 
 def _iptc_rule(
     existing: ExistingMeta, keywords: tuple[str, ...], compat: str
-) -> tuple[tuple[str, ...], bool, str | None]:
-    """IPTC keywords to add, whether to create the record, and why not, if not."""
+) -> tuple[tuple[str, ...], bool, bool, str | None]:
+    """IPTC keywords to add, whether to create the record, whether to update
+    Photoshop:IPTCDigest, and why not, if not."""
     if compat != "wide":
-        return (), False, None
+        return (), False, False, None
     if not existing.iptc_supported:
-        return (), False, "IPTC skipped: this file format has no standard place for it"
+        return (), False, False, "IPTC skipped: this file format has no standard place for it"
     if existing.iptc_present and not existing.iptc_utf8:
         # Old apps wrote Latin-1 IPTC without saying so. Adding UTF-8 to it, or
         # relabelling it as UTF-8, would garble the owner's keywords.
-        return (), False, "IPTC left alone: the file's IPTC isn't marked as UTF-8"
+        return (), False, False, "IPTC left alone: the file's IPTC isn't marked as UTF-8"
+    if existing.iptc_digest is not None and not existing.iptc_digest_writable:
+        # Changing the IPTC without its digest could make apps switch from
+        # the owner's XMP to the IPTC.
+        return (), False, False, _NOTE_IPTC_DIGEST
     have = {_key(k) for k in existing.iptc_keywords}
     new = [k for k in keywords if _key(k) not in have]
     fits = tuple(k for k in new if len(k.encode("utf-8")) <= IPTC_KEYWORD_MAX_BYTES)
@@ -529,7 +577,13 @@ def _iptc_rule(
     if skipped := len(new) - len(fits):
         plural = "keyword is" if skipped == 1 else "keywords are"
         note = f"{skipped} {plural} too long for IPTC (64 bytes max), so XMP only"
-    return fits, bool(fits) and not existing.iptc_present, note
+    # Apps following the MWG guidelines show the XMP while the digest matches
+    # the IPTC (or there is no IPTC), and the IPTC once it doesn't. Shown
+    # before, the XMP stays shown: the digest follows the new IPTC. Already
+    # stale, the IPTC is shown either way, so the digest is left as it is.
+    in_step = existing.current_iptc_digest in (None, existing.iptc_digest)
+    update = bool(fits) and existing.iptc_digest is not None and in_step
+    return fits, bool(fits) and not existing.iptc_present, update, note
 
 
 def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
@@ -540,7 +594,7 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
     ``=`` of an assignment, so to exiftool they are data, never options.
     """
     _check_lang(lang)
-    args = ["-overwrite_original", "-P"]
+    args = ["-overwrite_original", "-P", "-api", f"NoWarning={_STALE_DIGEST_WARNING}"]
 
     if plan.caption is not None:
         caption = _clean(plan.caption, CAPTION_MAX)
@@ -569,6 +623,11 @@ def build_args(plan: WritePlan, prov: Provenance, *, lang: str) -> list[str]:
         if plan.create_iptc:
             args += ["-charset", "iptc=UTF8", "-IPTC:CodedCharacterSet=UTF8"]
         args += [f"-IPTC:Keywords+={k}" for k in iptc]
+        if plan.update_iptc_digest:
+            # exiftool takes the MD5 of the IPTC it writes, so no value of
+            # the photo's becomes an argument. Not "-=old" as well: with no
+            # IPTC before there is no old digest, and nothing would change.
+            args.append("-Photoshop:IPTCDigest=new")
 
     if plan.write_original_hash:
         _check_hash(plan.image_hash)
@@ -766,6 +825,12 @@ def _verify(after: ExistingMeta, plan: WritePlan, lang: str) -> None:
         wrong.append("XMP-dc:Subject")
     if not set(_written_iptc(plan)) <= set(after.iptc_keywords):
         wrong.append("IPTC:Keywords")
+    if (
+        plan.update_iptc_digest
+        and _written_iptc(plan)
+        and (after.iptc_digest is None or after.iptc_digest != after.current_iptc_digest)
+    ):
+        wrong.append("Photoshop:IPTCDigest")
     if plan.write_original_hash and after.original_image_hash != plan.image_hash:
         wrong.append("XMP-et:OriginalImageHash")
     if plan.keep_xmp_toolkit is not None and after.xmp_toolkit != plan.keep_xmp_toolkit:

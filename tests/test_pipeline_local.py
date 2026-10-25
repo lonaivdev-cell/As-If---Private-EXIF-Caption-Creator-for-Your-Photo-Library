@@ -11,14 +11,16 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
 from asif.config import Config
 from asif.meta.exiftool import ExifTool
 from asif.meta.gates import Fingerprint, GateResult
+from asif.meta.structure import C2PA_LINK_PROBLEM
 from asif.pipeline import local
 from asif.pipeline.local import (
     CaptionError,
@@ -311,3 +313,71 @@ def test_device_cpu_means_no_gpu_layers(tmp_path: Path) -> None:
         "cpu",
     )
     assert choose_model(cfg).worker.gpu_layers == 0
+
+
+def _exiftool(photo: Path, *args: str) -> None:
+    subprocess.run(["exiftool", "-q", "-overwrite_original", *args, str(photo)], check=True)
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_a_stale_iptc_checksum_still_gets_captioned(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, compat: Literal["xmp", "wide"]
+) -> None:
+    # Photoshop's IPTCDigest, left stale by an app that edited the IPTC
+    # after it. exiftool warns about that on every write; it isn't a failure.
+    src = tmp_path / "src"
+    src.mkdir()
+    photo = src / "a.jpg"
+    shutil.copy2(fixtures_dir / "plain.jpg", photo)
+    _exiftool(
+        photo,
+        "-charset",
+        "iptc=UTF8",
+        "-IPTC:CodedCharacterSet=UTF8",
+        "-IPTC:Keywords=family",
+        "-XMP-dc:Subject=family",
+    )
+    _exiftool(photo, "-Photoshop:IPTCDigest=new")
+    _exiftool(photo, "-IPTC:Keywords+=lisbon")
+    cfg.general.compat = compat
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    assert [o.state for o in summary.outcomes] == [State.CLEAN]
+    with ExifTool() as et:
+        before = et.execute_json(
+            "-G1", "-Photoshop:IPTCDigest", "-File:CurrentIPTCDigest", str(photo)
+        )[0]
+        after = et.execute_json(
+            "-G1",
+            "-Photoshop:IPTCDigest",
+            "-File:CurrentIPTCDigest",
+            "-XMP-dc:Subject",
+            "-IPTC:Keywords",
+            str(tmp_path / "out" / "a.jpg"),
+        )[0]
+    assert after["Photoshop:IPTCDigest"] == before["Photoshop:IPTCDigest"]  # left as it was
+    assert after["Photoshop:IPTCDigest"] != after["File:CurrentIPTCDigest"]
+    assert "stub" in after["XMP-dc:Subject"]
+    assert ("stub" in after["IPTC:Keywords"]) == (compat == "wide")
+
+
+def test_content_credentials_linked_from_xmp_are_skipped(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    photo = src / "a.jpg"
+    shutil.copy2(fixtures_dir / "plain.jpg", photo)
+    packet = tmp_path / "packet.xmp"
+    packet.write_text(
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+        'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description '
+        'rdf:about="" xmlns:dcterms="http://purl.org/dc/terms/"><dcterms:provenance>'
+        "https://manifests.example.invalid/urn:uuid:1</dcterms:provenance>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>"
+    )
+    _exiftool(photo, f"-XMP<={packet}")
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    [outcome] = summary.outcomes
+    assert outcome.state == State.SKIPPED_FORMAT
+    assert outcome.reason == f"can't be written safely: {C2PA_LINK_PROBLEM}"
+    assert not (tmp_path / "out" / "a.jpg").exists()

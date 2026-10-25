@@ -40,7 +40,7 @@ from asif.meta.gates import (
     fingerprint,
     snapshot,
 )
-from asif.meta.structure import C2PA_PROBLEM, jpeg_eoi_offset
+from asif.meta.structure import C2PA_LINK_PROBLEM, C2PA_PROBLEM, jpeg_eoi_offset
 from tests.conftest import HAVE_EXIFTOOL
 from tests.test_structure import (
     LITERAL,
@@ -100,7 +100,8 @@ def legit_write(
     keywords: tuple[str, ...] = KEYWORDS,
     caption: str = CAPTION,
 ) -> None:
-    """Write like As If's writer: only XMP-dc, XMP-asif, XMP-et (and IPTC if wide).
+    """Write like As If's writer: only XMP-dc, XMP-asif, XMP-et (and IPTC if
+    wide, keeping a Photoshop:IPTCDigest that matched it in step).
 
     Like the writer, it leaves a caption alone unless it's blank or As If's
     own, and writes the original-image hash only once.
@@ -146,6 +147,11 @@ def legit_write(
         if iptc:  # the writer leaves non-UTF-8 IPTC alone
             iptc += [f"-IPTC:Keywords+={k}" for k in keywords]
             iptc += [f"-XMP-asif:AddedIPTCKeywords={k}" for k in keywords]
+            # A digest in step with the IPTC (or standing in for none) is kept in step.
+            digests = et.read_tags(path, "-Photoshop:IPTCDigest", "-File:CurrentIPTCDigest")
+            stored = digests.get("Photoshop:IPTCDigest")
+            if stored is not None and digests.get("File:CurrentIPTCDigest") in (None, stored):
+                iptc.append("-Photoshop:IPTCDigest=new")
     if not iptc:
         iptc = ["-XMP-asif:AddedIPTCKeywords="]
     et.execute("-overwrite_original", "-P", *args, *iptc, str(path))
@@ -226,7 +232,40 @@ def test_existing_utf8_iptc_gets_keywords_in_wide_mode(
     before = snapshot(et, path)
     legit_write(et, path, "wide", before.image_hash)
     assert et.read_tags(path, "-IPTC:Keywords")["IPTC:Keywords"][0] == "família"
+    # The digest followed the IPTC, so apps keep showing the XMP.
+    digests = et.read_tags(path, "-Photoshop:IPTCDigest", "-File:CurrentIPTCDigest")
+    assert digests["Photoshop:IPTCDigest"] == digests["File:CurrentIPTCDigest"]
+    assert digests["Photoshop:IPTCDigest"] != before.tags["Photoshop:IPTCDigest"]
     assert all_ok(check_written(et, before, path, compat="wide"))
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        ("-charset", "iptc=UTF8", "-IPTC:Keywords=família", "-Photoshop:IPTCDigest=new"),
+        (f"-Photoshop:IPTCDigest={hashlib.md5(b'').hexdigest()}",),  # no IPTC yet
+    ],
+    ids=["in-step", "no-iptc"],
+)
+def test_iptc_written_under_a_digest_that_goes_stale_fails(
+    et: ExifTool, fixture_copy: FixtureCopy, owner: tuple[str, ...]
+) -> None:
+    # Apps following the MWG guidelines would show the IPTC instead of the
+    # owner's XMP: the gate doesn't trust the writer to have updated it.
+    path = fixture_copy("plain.jpg")
+    et.execute("-overwrite_original", "-XMP-dc:Subject=Lisboa", *owner, str(path))
+    before = snapshot(et, path)
+    keywords = ["-charset", "iptc=UTF8", "-IPTC:Keywords+=praia"]
+    et.execute("-overwrite_original", *keywords, str(path))
+    detail = by_name(check_written(et, before, path, compat="wide"))["protected"].detail
+    assert detail == "out of step with the IPTC: Photoshop:IPTCDigest"
+    et.execute("-overwrite_original", f"-Photoshop:IPTCDigest={'0' * 32}", str(path))
+    detail = by_name(check_written(et, before, path, compat="wide"))["protected"].detail
+    assert detail == (
+        "changed: Photoshop:IPTCDigest; out of step with the IPTC: Photoshop:IPTCDigest"
+    )
+    et.execute("-overwrite_original", *keywords[:2], "-Photoshop:IPTCDigest=new", str(path))
+    assert all_ok(results := check_written(et, before, path, compat="wide")), results
 
 
 def test_iptc_changes_fail_in_xmp_mode(et: ExifTool, fixture_copy: FixtureCopy) -> None:
@@ -1479,6 +1518,26 @@ def test_content_credentials_are_refused(
     assert snapshot(et, path).unprovable == C2PA_PROBLEM
 
 
+@pytest.mark.parametrize("fmt", ["jpeg", "tiff"])
+def test_content_credentials_kept_elsewhere_are_refused(
+    et: ExifTool, fixture_copy: FixtureCopy, monkeypatch: pytest.MonkeyPatch, fmt: str
+) -> None:
+    # A remote manifest leaves only a link in the XMP, and its signature
+    # covers the whole file, XMP included.
+    link = "https://cai-manifests.example/manifests/urn:uuid:6f1c"
+    packet = xmp_packet(
+        f"<dcterms:provenance>{link}</dcterms:provenance>",
+        attrs='xmlns:dcterms="http://purl.org/dc/terms/"',
+    )
+    path = _with_xmp(fmt, fixture_copy("plain.jpg"), packet)
+    before = snapshot(et, path)
+    assert before.tags["XMP-dcterms:Provenance"] == link
+    assert before.unprovable == C2PA_LINK_PROBLEM
+    # exiftool's reading alone is enough, should the XMP check ever miss one.
+    monkeypatch.setattr(structure, "read_xmp", lambda data: structure.XmpText(Counter()))
+    assert snapshot(et, path).unprovable == C2PA_LINK_PROBLEM
+
+
 def _apple_png(path: Path, *, xmp_first: bool) -> None:
     """``path`` as Apple's ImageIO writes it: iDOT, then the image data in two
     IDAT chunks (and, with ``xmp_first``, XMP ahead of iDOT, as in a screenshot)."""
@@ -1640,6 +1699,78 @@ def test_fields_as_if_writes_are_additive_only(
     assert _protected_detail(before, after, "wide") == detail
     for value in ("Oma", OURS, "Dog", "old", "a" * 64):
         assert value not in detail
+
+
+IPTC_DIGEST, CURRENT_DIGEST = "Photoshop:IPTCDigest", "File:CurrentIPTCDigest"
+MD5_A, MD5_B, MD5_C = "a" * 32, "b" * 32, "c" * 32
+STALE = "out of step with the IPTC: Photoshop:IPTCDigest"
+# Apps following the MWG guidelines show the XMP while Photoshop:IPTCDigest
+# matches the IPTC (File:CurrentIPTCDigest), or there is no IPTC.
+DIGESTS = {
+    "kept-in-step": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_A},
+        {IPTC_DIGEST: MD5_B, CURRENT_DIGEST: MD5_B},
+        "",
+    ),
+    "no-iptc-before": ({IPTC_DIGEST: MD5_A}, {IPTC_DIGEST: MD5_B, CURRENT_DIGEST: MD5_B}, ""),
+    "iptc-untouched": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_A},
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_A},
+        "",
+    ),
+    "no-digest": ({CURRENT_DIGEST: MD5_A}, {CURRENT_DIGEST: MD5_B}, ""),
+    # Already stale, the IPTC is shown either way: the owner's digest stays.
+    "stale-left-alone": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_C},
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_B},
+        "",
+    ),
+    "stale-changed": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_C},
+        {IPTC_DIGEST: MD5_B, CURRENT_DIGEST: MD5_B},
+        "changed: Photoshop:IPTCDigest",
+    ),
+    # The XMP was shown, and the IPTC would be.
+    "left-stale": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_A},
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_B},
+        STALE,
+    ),
+    "left-stale-new-iptc": (
+        {IPTC_DIGEST: MD5_A},
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_B},
+        STALE,
+    ),
+    "made-stale": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_A},
+        {IPTC_DIGEST: MD5_C, CURRENT_DIGEST: MD5_B},
+        f"changed: Photoshop:IPTCDigest; {STALE}",
+    ),
+    "no-iptc-after": ({IPTC_DIGEST: MD5_A}, {IPTC_DIGEST: MD5_B}, "changed: Photoshop:IPTCDigest"),
+    "added": (
+        {CURRENT_DIGEST: MD5_A},
+        {IPTC_DIGEST: MD5_B, CURRENT_DIGEST: MD5_B},
+        "added: Photoshop:IPTCDigest",
+    ),
+    "removed": (
+        {IPTC_DIGEST: MD5_A, CURRENT_DIGEST: MD5_A},
+        {CURRENT_DIGEST: MD5_B},
+        "removed: Photoshop:IPTCDigest",
+    ),
+}
+
+
+@pytest.mark.parametrize(("before", "after", "detail"), DIGESTS.values(), ids=DIGESTS.keys())
+def test_iptc_digest_may_only_stay_in_step(
+    before: dict[str, Any], after: dict[str, Any], detail: str
+) -> None:
+    assert _protected_detail(before, after, "wide") == detail
+
+
+def test_iptc_digest_cant_change_at_all_in_xmp_mode() -> None:
+    before, after, _ = DIGESTS["kept-in-step"]
+    detail = _protected_detail(before, after, "xmp")
+    assert detail == "changed: File:CurrentIPTCDigest, Photoshop:IPTCDigest"
 
 
 def test_iptc_keywords_cant_change_at_all_in_xmp_mode() -> None:

@@ -588,6 +588,9 @@ _XMP_NOTE = "http://ns.adobe.com/xmp/note/"
 # As If's own namespace (asif_ns.config): its record is rewritten every time.
 _ASIF_NS = "http://ns.as-if.invalid/1.0/"
 _HAS_EXTENDED = f"{_XMP_NOTE} HasExtendedXMP"
+# Where C2PA puts the link to Content Credentials kept outside the file.
+# Matched by namespace, so any prefix counts.
+_DCTERMS_PROVENANCE = "http://purl.org/dc/terms/ provenance"
 # RDF syntax and bookkeeping exiftool rewrites on every write, so not values:
 # rdf:about/parseType/nodeID, xml:lang (it fixes the case), the toolkit name
 # (x:xmptk, and the x:xaptk of Photoshop 7-era XMP, which exiftool reads as
@@ -618,7 +621,8 @@ class XmpText:
     occurs. Excluded: RDF syntax, xml:lang, the toolkit name, the
     extended-XMP link, and everything in As If's own namespace."""
     problem: str | None = None
-    """Why exiftool can't carry this XMP over intact, in plain words; None if it can."""
+    """Why a write can't keep this XMP, or the Content Credentials it links
+    to, intact, in plain words; None if it can."""
 
 
 class _XmpReader:
@@ -627,6 +631,7 @@ class _XmpReader:
     def __init__(self, values: Counter[str], links: set[str]) -> None:
         self.values, self.links = values, links
         self.markup = False
+        self.c2pa_link = False
         # Per open element: ([skipped, has children, has text, parseType Literal], text so far).
         self.stack: list[tuple[list[bool], list[str]]] = []
         self.cdata: list[str] | None = None
@@ -661,6 +666,8 @@ class _XmpReader:
 
     def _start(self, name: str, attrs: dict[str, str]) -> None:
         skip = name.startswith(_ASIF_NS + " ") or name == _HAS_EXTENDED
+        if name == _DCTERMS_PROVENANCE or _DCTERMS_PROVENANCE in attrs:
+            self.c2pa_link = True
         if self.stack:
             self._flush()
             self.stack[-1][0][1] = True
@@ -711,8 +718,9 @@ def read_xmp(data: Buffer) -> XmpText:
 
     Read with an XML parser rather than exiftool's, so a value exiftool
     can't read (and so wouldn't write back) still counts. ``problem`` names
-    what exiftool would lose: markup inside a value, or JPEG extended XMP
-    the main packet doesn't link to. Raises ``StructureError`` when the
+    what exiftool would lose (markup inside a value, or JPEG extended XMP
+    the main packet doesn't link to) or what a write would break (Content
+    Credentials kept outside the file). Raises ``StructureError`` when the
     file can't be parsed, isn't one of those formats, or an XMP packet
     isn't well-formed XML (or has a DTD).
     """
@@ -751,6 +759,8 @@ def read_xmp(data: Buffer) -> XmpText:
         # exiftool rewrites that chunk along with the real XMP, so the
         # structure gate could never pass.
         problem = "its XMP is in ImageMagick's raw-profile form, which exiftool would rewrite"
+    elif reader.c2pa_link:
+        problem = C2PA_LINK_PROBLEM
     return XmpText(values, problem)
 
 
@@ -839,6 +849,14 @@ def _c2pa_box(box: bytes) -> bool:
 
 C2PA_PROBLEM = "it carries Content Credentials (C2PA), which any change to the file breaks"
 """Why a file with a C2PA manifest is never written, in plain words."""
+C2PA_LINK_PROBLEM = (
+    "its XMP may link to Content Credentials (C2PA) kept outside the file "
+    "(dcterms:provenance), which any change to the file would break"
+)
+"""Why a file whose XMP links to a C2PA manifest stored elsewhere is never
+written. That manifest's signature covers the whole file, XMP included.
+Any dcterms:provenance counts: the spec allows any URI, and skipping a file
+is the safe mistake."""
 
 
 def write_hazard(data: bytes) -> str | None:

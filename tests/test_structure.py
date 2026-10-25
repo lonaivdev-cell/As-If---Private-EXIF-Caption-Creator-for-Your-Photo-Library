@@ -19,6 +19,7 @@ import pytest
 from PIL import Image, ImageCms
 
 from asif.meta.structure import (
+    C2PA_LINK_PROBLEM,
     C2PA_PROBLEM,
     StructureError,
     compare,
@@ -1210,6 +1211,31 @@ def test_markup_inside_a_cdata_value_is_a_problem(cdata: str) -> None:
 )
 def test_plain_values_and_structures_are_no_problem(body: str) -> None:
     assert read_xmp(jpeg_xmp(std_xmp(xmp_packet(body)))).problem is None
+
+
+DCTERMS = 'xmlns:dcterms="http://purl.org/dc/terms/"'
+
+
+@pytest.mark.parametrize(
+    ("body", "attrs"),
+    [
+        ("<dcterms:provenance>https://cai.example/m/urn:uuid:1</dcterms:provenance>", DCTERMS),
+        ("", f'{DCTERMS} dcterms:provenance="https://cai.example/m/urn:uuid:2"'),
+        # Any prefix, and any URI: the spec allows a relative one.
+        ("<dct:provenance>signed.c2pa</dct:provenance>", 'xmlns:dct="http://purl.org/dc/terms/"'),
+    ],
+    ids=["element", "attribute", "other-prefix"],
+)
+def test_link_to_content_credentials_kept_elsewhere_is_a_problem(body: str, attrs: str) -> None:
+    # A C2PA manifest kept outside the file signs the whole file, XMP included.
+    text = read_xmp(jpeg_xmp(std_xmp(xmp_packet(body, attrs=attrs))))
+    assert text.problem == C2PA_LINK_PROBLEM
+
+
+def test_provenance_in_other_namespaces_is_no_problem() -> None:
+    body = "<photoshop:provenance>Estate of the artist</photoshop:provenance>"
+    attrs = 'xmlns:dc11="http://purl.org/dc/elements/1.1/" dc11:provenance="x"'
+    assert read_xmp(jpeg_xmp(std_xmp(xmp_packet(body, attrs=attrs)))).problem is None
 
 
 def test_old_adobe_toolkit_attribute_is_not_a_value() -> None:
