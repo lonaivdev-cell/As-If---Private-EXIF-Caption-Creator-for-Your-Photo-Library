@@ -1702,20 +1702,50 @@ def test_private_photos_arent_put_on_a_network_drive(
     assert not (mount / "new").exists()  # nothing named there is left behind
 
 
-def test_public_photos_can_go_on_a_network_drive(
+def test_only_photos_everyone_can_see_go_on_a_network_drive(
     open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A public library can still hold private photos and folders: each one counts.
     name = os.fsdecode(b"caf\xe9")  # a folder name that isn't UTF-8, too
-    src = _library(fixtures_dir, _folder(open_dir / "pub", 0o755), "open.jpg", f"{name}/team.jpg")
+    src = _library(
+        fixtures_dir,
+        _folder(open_dir / "pub", 0o755),
+        "open.jpg",
+        f"{name}/team.jpg",
+        "Private/kid.jpg",
+        "scan.jpg",
+    )
     (src / "open.jpg").chmod(0o644)
-    (src / name / "team.jpg").chmod(0o640)  # its group may read it, others not
+    (src / name / "team.jpg").chmod(0o644)
+    (src / "Private").chmod(0o700)
+    (src / "scan.jpg").chmod(0o600)  # only its owner can open it
     mount = _folder(open_dir / "nas", 0o755)
     _on_share(monkeypatch, mount)
+    runs = _count_model_runs(monkeypatch)
     summary = _run(src, mount / "captioned", cfg, tmp_path)
-    assert set(_states(summary).values()) == {State.CLEAN}
-    mode = stat.S_IMODE((mount / "captioned" / name / "team.jpg").stat().st_mode)
-    assert mode & 0o077 == 0  # a share's groups are the server's: no more than others get
-    assert stat.S_IMODE((mount / "captioned" / "open.jpg").stat().st_mode) == 0o644
+    assert _states(summary) == {
+        "open.jpg": State.CLEAN,
+        f"{name}/team.jpg": State.CLEAN,
+        "Private/kid.jpg": State.FAILED_UPLOAD,
+        "scan.jpg": State.FAILED_UPLOAD,
+    }
+    assert len(runs) == 2  # refused before the model ran
+    assert not (mount / "captioned" / "Private").exists()
+
+
+def test_a_network_drive_linked_inside_a_local_destination_counts_too(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, _folder(open_dir / "pub", 0o755), "2024/family/kids.jpg")
+    (src / "2024" / "family").chmod(0o700)
+    mount = _folder(open_dir / "nas", 0o755)
+    _folder(mount / "y2024", 0o700)
+    _on_share(monkeypatch, mount, fstype="nfs4")
+    dest = _folder(open_dir / "home" / "out", 0o700)
+    (dest / "2024").symlink_to(mount / "y2024")
+    summary = _run(src, dest, cfg, tmp_path)
+    assert _states(summary) == {"2024/family/kids.jpg": State.FAILED_UPLOAD}
+    assert not list((mount / "y2024").iterdir())
 
 
 @pytest.mark.parametrize(
@@ -1728,6 +1758,9 @@ def test_public_photos_can_go_on_a_network_drive(
         ("fuse.unknown", True),
         ("fuseblk", False),  # NTFS or exFAT on a USB drive
         ("fuse.gocryptfs", False),  # an encrypted vault on this disk
+        ("fuse.fuse-nio-adapter", False),  # a Cryptomator vault
+        ("smbfs", True),  # macOS
+        ("afpfs", True),
         ("fuse.mergerfs", False),  # local disks pooled into one
         ("ext4", False),
     ],

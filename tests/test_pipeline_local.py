@@ -381,3 +381,24 @@ def test_content_credentials_linked_from_xmp_are_skipped(
     assert outcome.state == State.SKIPPED_FORMAT
     assert outcome.reason == f"can't be written safely: {C2PA_LINK_PROBLEM}"
     assert not (tmp_path / "out" / "a.jpg").exists()
+
+
+def test_a_dry_run_shows_finished_photos_as_done(
+    library: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = tmp_path / "out"
+    done = _run(library, dest, cfg, tmp_path, limit=2)
+    finished = {o.rel for o in done.outcomes if o.state == State.CLEAN}
+    assert finished
+    calls: list[str] = []
+    real = local._describe
+
+    def counted(ctx: Any, ram: Path, img: str) -> Any:
+        calls.append(img)
+        return real(ctx, ram, img)
+
+    monkeypatch.setattr(local, "_describe", counted)
+    preview = _run(library, dest, cfg, tmp_path, dry_run=True)
+    states = {o.rel: o.state for o in preview.outcomes}
+    assert all(states[rel] == State.SKIPPED_DONE for rel in finished)
+    assert len(calls) == sum(1 for s in states.values() if s == State.DESCRIBED)

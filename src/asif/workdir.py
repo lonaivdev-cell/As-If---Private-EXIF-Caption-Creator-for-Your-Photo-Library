@@ -22,6 +22,7 @@ import re
 import secrets
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -221,12 +222,56 @@ _REMOTE_FSTYPES = (
     "davfs",
     "autofs",
     "lustre",
+    "afpfs",  # macOS, from here on
+    "webdav",
+    "macfuse",
+    "osxfuse",
 )
 
 
 def _unescape_mount(field: str) -> str:
     """A path from /proc/mounts, where spaces and the like are octal escapes."""
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _mount_table(mounts_file: Path) -> list[tuple[str, str, list[str]]] | None:
+    """Every mount as (mount point, type, options), in mount order; None if unknown.
+
+    Linux has /proc/mounts. macOS has none, so its ``mount`` command is
+    asked: it lists what the kernel already knows, without touching a
+    share that might not answer.
+    """
+    try:
+        lines = mounts_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        if sys.platform != "darwin":
+            return None
+        try:
+            out = subprocess.run(
+                ["/sbin/mount"], capture_output=True, text=True, timeout=10, check=True
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return parse_macos_mounts(out)
+    table = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 4:
+            table.append((_unescape_mount(parts[1]), parts[2], parts[3].split(",")))
+    return table
+
+
+def parse_macos_mounts(out: str) -> list[tuple[str, str, list[str]]]:
+    """``mount`` output on macOS: "//me@nas/photos on /Volumes/photos (smbfs, nodev, ...)"."""
+    table = []
+    for line in out.splitlines():
+        head, sep, tail = line.rpartition(" (")
+        _, on, mount_point = head.partition(" on ")
+        if not sep or not on or not tail.endswith(")"):
+            continue
+        fstype, *options = [part.strip() for part in tail[:-1].split(",")]
+        table.append((mount_point, fstype, options))
+    return table
 
 
 def mount_of(
@@ -236,24 +281,19 @@ def mount_of(
 
     ``entry`` must be an already-resolved path. Decided from the mount table
     alone, without touching the path, which could hang if the mount has
-    stopped answering. None if the table can't be read (not Linux).
+    stopped answering. None if the table can't be read.
     """
-    try:
-        lines = mounts_file.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    table = _mount_table(mounts_file)
+    if table is None:
         return None
     best: tuple[int, str, str, list[str]] | None = None
-    for line in lines:
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        mount_point = _unescape_mount(parts[1])
+    for mount_point, fstype, options in table:
         prefix = mount_point.rstrip("/") + "/"
         if entry == mount_point or entry.startswith(prefix):
             depth = len(Path(mount_point).parts)
             # ">=": the mount listed last on the same path is the one on top.
             if best is None or depth >= best[0]:
-                best = (depth, mount_point, parts[2], parts[3].split(","))
+                best = (depth, mount_point, fstype, options)
     return None if best is None else best[1:]
 
 

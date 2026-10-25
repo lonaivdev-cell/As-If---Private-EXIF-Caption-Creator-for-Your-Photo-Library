@@ -224,3 +224,17 @@ def test_remembered_folders_on_remote_mounts_are_skipped(
     parents = workdir._sweep_parents("")
     assert local_dir.resolve() in parents and remote.resolve() not in parents
     assert remote.resolve() in workdir._sweep_parents(str(remote))  # in use again: swept
+
+
+def test_macos_mount_output_is_read() -> None:
+    from asif import workdir
+
+    out = (
+        "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+        "//me@nas._smb._tcp.local/Photo Library on /Volumes/Photo Library "
+        "(smbfs, nodev, nosuid, mounted by me)\n"
+        "map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)\n"
+    )
+    table = workdir.parse_macos_mounts(out)
+    assert ("/Volumes/Photo Library", "smbfs", ["nodev", "nosuid", "mounted by me"]) in table
+    assert table[0][:2] == ("/", "apfs")

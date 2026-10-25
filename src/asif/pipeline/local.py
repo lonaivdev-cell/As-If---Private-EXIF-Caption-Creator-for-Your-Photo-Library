@@ -156,6 +156,8 @@ class RunSummary:
     """Files that aren't photos at all (or are hidden, links or special files)."""
     unreadable_dirs: list[str] = field(default_factory=list)
     """Folders under the source that couldn't be listed, relative to it."""
+    linked_dirs: list[str] = field(default_factory=list)
+    """Links to folders under the source, relative to it: never followed."""
     aborted: str | None = None
     interrupted: bool = False
     """Stopped by Ctrl+C or a stop signal."""
@@ -209,6 +211,7 @@ class Discovery:
     files: list[Path]
     ignored: int
     unreadable_dirs: list[str]
+    linked_dirs: list[str] = field(default_factory=list)
 
 
 def discover(src: Path) -> Discovery:
@@ -217,11 +220,13 @@ def discover(src: Path) -> Discovery:
     Hidden files and folders are skipped, and symlinks are never followed, so
     a link can't pull in files from outside the folder you chose. Only
     regular files count: a FIFO named ``x.jpg`` would block forever on read.
-    Folders that can't be listed are reported, not silently skipped.
+    Folders that can't be listed, and links to folders, are reported, not
+    silently skipped.
     """
     found: list[Path] = []
     ignored = 0
     unreadable: list[str] = []
+    linked: list[str] = []
 
     def on_error(exc: OSError) -> None:
         where = Path(exc.filename) if exc.filename else src
@@ -229,6 +234,9 @@ def discover(src: Path) -> Discovery:
 
     for root, dirs, files in os.walk(src, followlinks=False, onerror=on_error):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in dirs:
+            if os.path.islink(os.path.join(root, name)):
+                linked.append((Path(root) / name).relative_to(src).as_posix())
         for name in sorted(files):
             path = Path(root) / name
             suffix = path.suffix.lower()
@@ -243,7 +251,7 @@ def discover(src: Path) -> Discovery:
                 found.append(path)
             else:
                 ignored += 1
-    return Discovery(found, ignored, sorted(unreadable))
+    return Discovery(found, ignored, sorted(unreadable), linked)
 
 
 def sha256_file(path: Path) -> str:
@@ -477,13 +485,31 @@ def _modes_unenforced(mount: Mount) -> bool:
 # Filesystems that other computers' users get to as well: network shares,
 # and FUSE ones, which mostly are network or cloud storage. For a folder on
 # one, the folders above its mount point keep none of them out.
-_SHARED_FSTYPES = ("nfs", "cifs", "smb", "ceph", "gluster", "afs", "davfs", "lustre", "9p", "fuse")
+_SHARED_FSTYPES = (
+    "nfs",
+    "cifs",
+    "smb",
+    "ceph",
+    "gluster",
+    "afs",
+    "davfs",
+    "lustre",
+    "9p",
+    "fuse",
+    "afpfs",  # macOS, from here on
+    "webdav",
+    "macfuse",
+    "osxfuse",
+)
 _LOCAL_FUSE = (
     "fuseblk",
     "fuse.gocryptfs",
     "fuse.encfs",
     "fuse.cryfs",
     "fuse.securefs",
+    "fuse.fuse-nio-adapter",  # Cryptomator
+    "fuse.cryptomator",
+    "fuse.veracrypt",
     "fuse.mergerfs",
 )
 
@@ -1204,6 +1230,25 @@ def _source_problem(rel: str, exc: OSError, when: str) -> ItemOutcome:
     return ItemOutcome(rel, State.QUARANTINE, f"can't read the original ({exc.strerror or exc})")
 
 
+_PRIVATE_ON_SHARE = (
+    "it's private (not everyone on this computer can see it or its folder), and this part "
+    "of the destination is on a network drive, where As If doesn't put private photos yet"
+)
+
+
+def _private_photo_onto_share(ctx: _Ctx, src: Path, src_st: os.stat_result, dest: Path) -> bool:
+    """Would a private photo's copy land on a network drive?
+
+    Checked per photo, since a public library can hold private folders and
+    files, and a network drive can be mounted (or linked) anywhere under a
+    local destination.
+    """
+    nearest = _nearest_existing(dest.parent, ctx.dest_root).resolve()
+    if not _shared_mount(mount_of(str(nearest))):
+        return False
+    return not src_st.st_mode & _reach_mask(src) & 0o004 or _source_is_private(src.parent)
+
+
 def _copy_mode(ctx: _Ctx, src: Path, src_st: os.stat_result, dest: Path) -> int:
     """The mode a copy gets: no more than its original effectively had, and on
     a share, no more for the group than for everyone (its groups are the
@@ -1220,12 +1265,13 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
     if suffix in NOT_YET:
         return ItemOutcome(rel, State.SKIPPED_FORMAT, NOT_YET[suffix])
 
-    occupied = False
-    if not ctx.dry_run:
-        try:
-            occupied = dest.exists() or dest.is_symlink()
-        except OSError as exc:
+    # Read-only, so a dry run checks too: it shows what a real run would do.
+    try:
+        occupied = dest.exists() or dest.is_symlink()
+    except OSError as exc:
+        if not ctx.dry_run:
             return _destination_problem(ctx, rel, dest, exc)
+        occupied = False
     if occupied:
         done = _already_done(ctx.et, src, dest)
         if done == "done":
@@ -1255,6 +1301,11 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
     except OSError as exc:
         return _source_problem(rel, exc, "before As If got to it")
     size = src_st.st_size
+    try:
+        if _private_photo_onto_share(ctx, src, src_st, dest):
+            return ItemOutcome(rel, State.FAILED_UPLOAD, _PRIVATE_ON_SHARE)
+    except _SourceUnreadable as gone:
+        return _source_problem(rel, gone.exc, "before As If got to it")
     if not ctx.dry_run and ctx.forced:
         forced = ctx.forced.get(_nearest_existing(dest.parent, ctx.dest_root), 0)
         if forced & ~_copy_mode(ctx, src, src_st, dest):
@@ -1477,7 +1528,11 @@ def caption_folder(
     found = discover(src)
     files = found.files[:limit] if limit is not None else list(found.files)
     summary = RunSummary(
-        run_id=run_id, dry_run=dry_run, ignored=found.ignored, unreadable_dirs=found.unreadable_dirs
+        run_id=run_id,
+        dry_run=dry_run,
+        ignored=found.ignored,
+        unreadable_dirs=found.unreadable_dirs,
+        linked_dirs=found.linked_dirs,
     )
     if on_start:
         on_start(len(files))
