@@ -121,6 +121,8 @@ class _JpegSegment:
     """Everything from the segment's first 0xFF (fill bytes included) to its end."""
     payload: bytes
     """The bytes after the length field (empty for stand-alone markers)."""
+    payload_at: int
+    """Where ``payload`` starts in the file."""
 
 
 @dataclass(frozen=True)
@@ -174,7 +176,7 @@ def _jpeg_layout(data: bytes) -> _JpegLayout:
             raise StructureError(f"JPEG has an invalid marker at offset {start}")
         if marker in _STANDALONE:
             if scan_start is None:
-                header.append(_JpegSegment(marker, data[start:pos], b""))
+                header.append(_JpegSegment(marker, data[start:pos], b"", pos))
             continue
         if pos + 2 > end:
             raise StructureError(f"JPEG {_marker_name(marker)} segment runs past the end")
@@ -185,7 +187,9 @@ def _jpeg_layout(data: bytes) -> _JpegLayout:
         if marker == _SOS and scan_start is None:
             scan_start = start
         if scan_start is None:
-            header.append(_JpegSegment(marker, data[start:seg_end], data[pos + 2 : seg_end]))
+            header.append(
+                _JpegSegment(marker, data[start:seg_end], data[pos + 2 : seg_end], pos + 2)
+            )
         pos = seg_end
         if marker == _SOS:
             pos = _skip_entropy_data(data, pos)
@@ -208,6 +212,20 @@ def jpeg_eoi_offset(data: bytes) -> int:
 def jpeg_trailer(data: bytes) -> bytes:
     """The bytes after the primary image's EOI (motion-photo video, MPF images...)."""
     return data[jpeg_eoi_offset(data) :]
+
+
+def jpeg_segments(data: bytes, marker: int, prefix: bytes) -> list[tuple[int, bytes]]:
+    """Every segment ahead of the image data with this ``marker`` and a payload
+    starting with ``prefix``, in file order: where its payload (the bytes
+    after the length field) starts in the file, and the payload.
+
+    Raises ``StructureError`` when the JPEG can't be parsed.
+    """
+    return [
+        (seg.payload_at, seg.payload)
+        for seg in _jpeg_layout(data).header
+        if seg.marker == marker and seg.payload.startswith(prefix)
+    ]
 
 
 def _ignorable_jpeg_segment(seg: _JpegSegment, allow_iptc: bool) -> bool:

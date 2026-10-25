@@ -65,6 +65,11 @@ FIXTURES: tuple[Fixture, ...] = (
         "skip-format",
         "Olympus JPEG whose maker note points to a preview after the image",
     ),
+    Fixture(
+        "pentax_preview.jpg",
+        "ok",
+        "Pentax JPEG with its preview in an APP7 segment that new XMP moves",
+    ),
     Fixture("panorama.jpg", "ok", "50 MP panorama (slow; only with --with-panorama)"),
 )
 
@@ -398,12 +403,48 @@ def olympus_jpeg(seed: int, *, preview_at: int | None = None) -> bytes:
     return build(len(build(0)) if preview_at is None else preview_at) + preview
 
 
+PENTAX_APP7 = b"PENTAX \x00II"
+"""How Pentax's APP7 segment starts: its name, then the byte order."""
+
+
+def pentax_jpeg(seed: int) -> bytes:
+    """A Pentax K-1 Mark II JPEG: EXIF with Pentax's maker note, an APP7
+    "PENTAX" segment holding the preview, then the image, as the K-3 and later
+    write it. The preview's offset counts from the start of APP7's data
+    (exiftool's ProcessJPEG), so it holds wherever the segment moves."""
+    preview = scene_jpeg((320, 240), seed + 1)  # the camera's is 720x480
+
+    def note(at: int) -> bytes:
+        # MakerNotePentax5: "PENTAX \0", the byte order, then an IFD; its
+        # offsets count from the note's start.
+        version = (0x0000, 1, 4, bytes((12, 3, 2, 0)))  # PentaxVersion
+        return PENTAX_APP7 + ifd(10, version, long(0x0005, 0x13240))  # PentaxModelID
+
+    def app7(start: int) -> bytes:
+        return PENTAX_APP7 + ifd(
+            10,
+            (0x0002, 3, 2, struct.pack("<HH", 320, 240)),  # PreviewImageSize
+            long(0x0003, len(preview)),  # PreviewImageLength
+            long(0x0004, start),  # PreviewImageStart
+            (0x003E, 1, 4, b"\x00" * 4),  # PreviewImageBorders
+        )
+
+    # The camera fills the rest of the segment: 32 bytes of 0xFF, then 0xD8.
+    pentax = segment(0xE7, app7(len(app7(0))) + preview + b"\xff" * 32 + b"\xd8")
+    exif = exif_segment("RICOH IMAGING COMPANY, LTD.", "PENTAX K-1 Mark II", note)
+    return b"\xff\xd8" + exif + pentax + jpeg_body(scene_jpeg((640, 480), seed))
+
+
 def _sony_preview_jpg(out: Path) -> None:
     out.write_bytes(sony_jpeg(20, preview_pointer=True))
 
 
 def _olympus_preview_jpg(out: Path) -> None:
     out.write_bytes(olympus_jpeg(22))
+
+
+def _pentax_preview_jpg(out: Path) -> None:
+    out.write_bytes(pentax_jpeg(24))
 
 
 MAKERS: dict[str, Callable[[Path], None]] = {
@@ -427,6 +468,7 @@ MAKERS: dict[str, Callable[[Path], None]] = {
     "raw.dng": _raw_dng,
     "sony_preview.jpg": _sony_preview_jpg,
     "olympus_preview.jpg": _olympus_preview_jpg,
+    "pentax_preview.jpg": _pentax_preview_jpg,
     "panorama.jpg": _panorama_jpg,
 }
 

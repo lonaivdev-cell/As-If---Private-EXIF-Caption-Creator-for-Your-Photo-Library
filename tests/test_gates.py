@@ -51,10 +51,12 @@ from asif.pipeline.states import State
 from asif.pipeline.timings import TimingsLog
 from tests.conftest import HAVE_EXIFTOOL
 from tests.fixtures.make_fixtures import (
+    PENTAX_APP7,
     exif_segment,
     ifd,
     long,
     olympus_jpeg,
+    pentax_jpeg,
     scene_jpeg,
     sony_jpeg,
     with_mpf,
@@ -94,6 +96,7 @@ WRITABLE = [
     "lossy.webp",
     "lossless.webp",
     "plain.tif",
+    "pentax_preview.jpg",
 ]
 GATES = ["equality", "protected", "trailer", "structure", "size"]
 CAPTION = "Um cachorro na praia, ao pôr do sol"
@@ -1825,6 +1828,141 @@ def test_photos_with_a_preview_after_the_image_never_reach_the_model(
     assert len(asked) == 1  # plain.jpg alone
 
 
+# -- a Pentax preview in its own APP7 segment ------------------------------------------------
+
+PENTAX_START, PENTAX_LENGTH = "Pentax:PreviewImageStart", "Pentax:PreviewImageLength"
+# Where the fixture's (and the K-1 Mark II's) APP7 keeps the preview: past
+# "PENTAX \0II" and an IFD of four entries. And where it keeps that offset.
+IN_APP7, POINTER_IN_APP7 = 64, 44
+
+
+def _pentax_preview(et: ExifTool, path: Path) -> bytes:
+    """The preview, as ``exiftool -b -PreviewImage`` extracts it."""
+    value = et.read_tags(path, "-Pentax:PreviewImage", binary=True)["Pentax:PreviewImage"]
+    assert isinstance(value, str) and value.startswith("base64:")
+    return base64.b64decode(value[7:])
+
+
+def _app7(data: bytes | None) -> tuple[int, bytes]:
+    """Where the Pentax APP7 segment's data starts in the file, and the data."""
+    assert data is not None
+    (found,) = structure.jpeg_segments(data, 0xE7, b"PENTAX \x00")
+    return found
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_pentax_preview_moves_with_its_app7_segment_and_passes(
+    et: ExifTool, fixture_copy: FixtureCopy, compat: Compat
+) -> None:
+    path = fixture_copy("pentax_preview.jpg")
+    preview = _pentax_preview(et, path)
+    assert preview == scene_jpeg((320, 240), 25)  # the camera's preview, start to end
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    # The new XMP went in front of APP7, and exiftool's number moved with it...
+    (old_at, old_app7), (new_at, new_app7) = _app7(before.data), _app7(path.read_bytes())
+    assert new_at > old_at and new_app7 == old_app7
+    new_start = et.read_tags(path, "-n", f"-{PENTAX_START}")[PENTAX_START]
+    assert before.tags[PENTAX_START] - old_at == new_start - new_at == IN_APP7
+    # ...while the preview stayed where it was, as exiftool reads the written file.
+    assert _pentax_preview(et, path) == preview
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
+
+
+@pytest.mark.parametrize("where", [IN_APP7 + 100, POINTER_IN_APP7], ids=["preview", "pointer"])
+def test_pentax_app7_changes_still_fail(
+    et: ExifTool, fixture_copy: FixtureCopy, where: int
+) -> None:
+    path = fixture_copy("pentax_preview.jpg")
+    before = snapshot(et, path)
+    legit_write(et, path, "xmp", before.image_hash)
+    _flip(path, _app7(path.read_bytes())[0] + where)
+    results = check_written(et, before, path, compat="xmp")
+    assert failing(results) == {"protected", "structure"}
+    # A segment that changed carries no offset along: the new number counts too.
+    assert by_name(results)["protected"].detail == f"changed: Pentax:PreviewImage, {PENTAX_START}"
+    assert "APP7" in by_name(results)["structure"].detail
+
+
+def _xmp_after_exif(data: bytes) -> bytes:
+    """``data`` with an XMP segment right after its EXIF, where exiftool puts new XMP."""
+    end = 4 + int.from_bytes(data[4:6], "big")
+    return data[:end] + std_xmp(xmp_packet("")) + data[end:]
+
+
+def _pentax_protected(
+    before: dict[str, Any], after: dict[str, Any], data: bytes, written: bytes | None
+) -> str:
+    """The protected gate's verdict for two tag dumps and the files' bytes."""
+    snap = Snapshot("jpeg", "0" * 64, len(data), "", before, data, Counter(), None)
+    fake = FakeExifTool(json.dumps([{"SourceFile": "photo.jpg", **after}]))
+    result = _protected(fake, snap, Path("photo.jpg"), written, "xmp")  # type: ignore[arg-type]
+    return result.detail
+
+
+def test_only_an_offset_that_moved_with_its_unchanged_segment_may_change() -> None:
+    data = pentax_jpeg(60)
+    written = _xmp_after_exif(data)
+    (old_at, app7), (new_at, _) = _app7(data), _app7(written)
+    assert app7.startswith(PENTAX_APP7) and new_at > old_at
+    length = len(scene_jpeg((320, 240), 61))
+    old, new = old_at + IN_APP7, new_at + IN_APP7
+    tags = {PENTAX_START: old, PENTAX_LENGTH: length}
+    assert _pentax_protected(tags, {**tags, PENTAX_START: new}, data, written) == ""
+    # The second copy, after one from the maker note, which XMP doesn't move.
+    two = {
+        PENTAX_START: 100,
+        PENTAX_LENGTH: 10,
+        f"{PENTAX_START}#2": old,
+        f"{PENTAX_LENGTH}#2": length,
+    }
+    assert _pentax_protected(two, {**two, f"{PENTAX_START}#2": new}, data, written) == ""
+    full = {PENTAX_START: old, PENTAX_LENGTH: len(app7) - IN_APP7}  # up to the segment's end
+    assert _pentax_protected(full, {**full, PENTAX_START: new}, data, written) == ""
+    flipped = bytearray(written)
+    flipped[new_at + IN_APP7 + 100] ^= 1
+    renamed = PENTAX_APP7, b"PENTAX!\x00II"
+    olympus = {"Olympus:PreviewImageStart": old, "Olympus:PreviewImageLength": length}
+    for case, (before, after, before_data, after_data) in {
+        "moved by another amount": (tags, {**tags, PENTAX_START: new + 1}, data, written),
+        "a segment that changed": (tags, {**tags, PENTAX_START: new}, data, bytes(flipped)),
+        "not Pentax's segment": (
+            tags,
+            {**tags, PENTAX_START: new},
+            data.replace(*renamed),
+            written.replace(*renamed),
+        ),
+        "a preview running past the segment": (
+            {**tags, PENTAX_LENGTH: len(app7) - IN_APP7 + 1},
+            {PENTAX_START: new, PENTAX_LENGTH: len(app7) - IN_APP7 + 1},
+            data,
+            written,
+        ),
+        "no length": ({PENTAX_START: old}, {PENTAX_START: new}, data, written),
+        "a length that changed": (
+            tags,
+            {PENTAX_START: new, PENTAX_LENGTH: length - 1},
+            data,
+            written,
+        ),
+        "the written bytes unread": (tags, {**tags, PENTAX_START: new}, data, None),
+        "a start in the EXIF": (
+            {**tags, PENTAX_START: 20},
+            {**tags, PENTAX_START: 20 + new_at - old_at},
+            data,
+            written,
+        ),
+    }.items():
+        detail = _pentax_protected(before, after, before_data, after_data)
+        assert detail.startswith("changed: ") and PENTAX_START in detail, case
+    # Pentax's alone: another maker's offset doesn't move with a segment.
+    moved = {**olympus, "Olympus:PreviewImageStart": new}
+    assert _pentax_protected(olympus, moved, data, written) == (
+        "changed: Olympus:PreviewImageStart"
+    )
+
+
 @pytest.mark.parametrize("compat", ["xmp", "wide"])
 def test_photoshop_7_era_xmp_passes(
     et: ExifTool, fixture_copy: FixtureCopy, compat: Compat
@@ -1858,7 +1996,7 @@ def _protected_detail(before: dict[str, Any], after: dict[str, Any], compat: Com
     """The protected gate's verdict for two tag dumps, without exiftool."""
     snap = Snapshot("jpeg", "0" * 64, 0, "", before, None, Counter(), None)
     fake = FakeExifTool(json.dumps([{"SourceFile": "photo.jpg", **after}]))
-    result = _protected(fake, snap, Path("photo.jpg"), compat)  # type: ignore[arg-type]
+    result = _protected(fake, snap, Path("photo.jpg"), None, compat)  # type: ignore[arg-type]
     assert result.ok == (result.detail == "")
     return result.detail
 

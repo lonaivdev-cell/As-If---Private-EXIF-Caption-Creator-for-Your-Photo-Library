@@ -11,7 +11,9 @@ writing, ``check_written`` runs, in order:
 2. ``protected``: every tag outside the ones As If writes is unchanged,
    and the ones it writes only gained values (additive-only). With compat
    "wide", a ``Photoshop:IPTCDigest`` in step with the IPTC stays in step,
-   so apps keep showing the XMP they showed.
+   so apps keep showing the XMP they showed. Where exiftool reports an
+   offset from the start of a JPEG, it may move only with what it points to
+   (MPF images, a Pentax preview in its own APP7 segment), proven unchanged.
 3. ``trailer``: a JPEG's bytes after the primary image are unchanged
    (motion-photo video, MPF images), and must be provably so.
 4. ``structure``: ``asif.meta.structure.compare``, byte for byte, and
@@ -156,6 +158,19 @@ _TIFF_OFFSET = re.compile(
 # relative offset must not change: the structure gate compares the MPF
 # segment byte for byte, and the trailer gate the images themselves.
 _MPF_IMAGE_START = re.compile(r"MPImage\d+:MPImageStart")
+# Pentax (the K-3 and later: the K-1 Mark II, say) keeps a JPEG's preview in
+# an APP7 "PENTAX" segment after the EXIF, and counts its offset from the
+# start of that segment's data (exiftool's ProcessJPEG: DirStart(..., 10, 0)).
+# exiftool copies APP7 as it is but reports the offset from the start of the
+# file, so new XMP in front of APP7 changes the number, not the pointer. Such
+# a change is accepted only when, before and after, the preview lies start
+# to end at the same place in the same such segment, and that segment's
+# bytes are unchanged (``_moved_with_segment``): exiftool's view of bytes
+# that didn't change. The preview is still compared too, as Pentax:PreviewImage.
+# Offset tag -> (its length tag, the segment's marker, its payload's start).
+_IN_SEGMENT: dict[str, tuple[str, int, bytes]] = {
+    "Pentax:PreviewImageStart": ("Pentax:PreviewImageLength", 0xE7, b"PENTAX \x00"),
+}
 # XMP dcterms:provenance, as exiftool names it with the usual prefix (any
 # language of it): C2PA's link to Content Credentials kept outside the file.
 _C2PA_LINK = re.compile(r"XMP-dcterms:Provenance(?:-[\w-]+)?")
@@ -523,8 +538,48 @@ def _equality(et: ExifTool, before: Snapshot, after: Path) -> GateResult:
     return GateResult("equality", True)
 
 
+def _moved_with_segment(
+    key: str, before: Snapshot, tags: dict[str, Any], after_data: bytes | None
+) -> bool:
+    """Is the change to ``key`` only exiftool's view of an offset into a JPEG
+    segment that moved, its bytes unchanged (``_IN_SEGMENT``)? ``tags`` is
+    the written file's dump, ``after_data`` its bytes."""
+    base, sep, copy = key.partition("#")
+    rule = _IN_SEGMENT.get(base)
+    if before.fmt != "jpeg" or rule is None or before.data is None or after_data is None:
+        return False
+    length_tag, marker, prefix = rule
+    length_key = length_tag + sep + copy  # the same copy: Pentax:PreviewImageLength#2, say
+    numbers = [_numbers(d.get(k)) for d in (before.tags, tags) for k in (key, length_key)]
+    if any(len(n) != 1 for n in numbers):
+        return False
+    (old_start,), (old_length,), (new_start,), (new_length,) = numbers
+    if old_length != new_length:
+        return False
+    try:
+        old_segments = structure.jpeg_segments(before.data, marker, prefix)
+        new_segments = structure.jpeg_segments(after_data, marker, prefix)
+    except StructureError:
+        return False
+    # The n-th such segment before is the n-th after: the structure gate
+    # proves the segments are the same and in the same order.
+    if len(old_segments) != len(new_segments):
+        return False
+    for (old_at, old_payload), (new_at, new_payload) in zip(
+        old_segments, new_segments, strict=True
+    ):
+        inside = old_start - old_at
+        if 0 <= inside <= len(old_payload) - old_length:  # the whole preview
+            return new_start - new_at == inside and new_payload == old_payload
+    return False
+
+
 def _protected(
-    et: ExifTool, before: Snapshot, after: Path, compat: Literal["xmp", "wide"]
+    et: ExifTool,
+    before: Snapshot,
+    after: Path,
+    after_data: bytes | None,
+    compat: Literal["xmp", "wide"],
 ) -> GateResult:
     try:
         tags, _warnings = _dump_tags(et, after)
@@ -534,7 +589,11 @@ def _protected(
     owned = _owned(before.tags, compat)
     old = {k: v for k, v in before.tags.items() if not _allowed(k, before.fmt, compat)} | owned
     new = {k: v for k, v in tags.items() if k in owned or not _allowed(k, before.fmt, compat)}
-    changed = [k for k in old.keys() & new.keys() if old[k] != new[k]]
+    changed = [
+        k
+        for k in old.keys() & new.keys()
+        if old[k] != new[k] and not _moved_with_segment(k, before, tags, after_data)
+    ]
     out_of_step: list[str] = []
     if compat == "wide":
         if _IPTC_DIGEST in changed and _digest_kept_in_step(before.tags, tags):
@@ -663,7 +722,7 @@ def check_written(
             after_data = after.read_bytes()
     return [
         _equality(et, before, after),
-        _protected(et, before, after, compat),
+        _protected(et, before, after, after_data, compat),
         _trailer(before, after_data),
         _structure(before, after, after_data, compat),
         _size(before, after),
