@@ -8,9 +8,12 @@ smallest model that writes the caption language wins there (MiniCPM-V 4.6
 for English or Chinese, Gemma 4 E2B for everything else).
 
 The thresholds live in the manifest (``min_vram_gb``, ``min_ram_gb``), so the
-catalogue and the recommender can't drift apart. Only models that list the
-caption language are ever suggested, and every recommendation says why it
-was made.
+catalogue and the recommender can't drift apart. RAM thresholds are for RAM
+as the OS reports it, which is always a little less than is installed (Linux
+leaves out what the kernel and firmware keep), so they sit below the nominal
+size: 7 GB for an "8 GB" machine, 12 for "16 GB", 28 for "32 GB", 44 for
+"48 GB". Only models that list the caption language are ever suggested, and
+every recommendation says why it was made.
 """
 
 from __future__ import annotations
@@ -28,8 +31,9 @@ APPLE_MEMORY_SHARE = 0.65
 """macOS keeps part of unified memory for itself, so a model gets about this share (§10, §20)."""
 RUNTIME_OVERHEAD_GB = 2.0
 """Runtime plus a ~4k-token context on top of weights and projector (§9.1)."""
-HYBRID_MIN_RAM_GB = 32.0
-"""RAM from which a 6-10 GB GPU is offered a hybrid T3 setup: experts in RAM (§9.3, §10)."""
+VRAM_SLACK_GB = 64 / 1024
+"""GPUs report a few MiB less than their size (an RTX 4090 24564 MiB, a 6 GB laptop GPU
+6141 MiB, AMD cards 16 MiB short), so a reading this close under a whole GB counts as it."""
 
 _RANK = {tier: i for i, tier in enumerate(TIERS)}
 _WHERE: dict[Device, str] = {
@@ -59,17 +63,19 @@ def recommend(
     unified_memory_gb: float | None,
     lang: str,
     manifest: Sequence[ModelEntry] | None = None,
+    gpu_detected: bool = False,
 ) -> Recommendation:
     """Recommend a model from the catalogue for this machine and caption language.
 
     The branches of §10, in order: Apple Silicon (largest tier whose weights,
     projector and 2 GB of runtime fit in 65 % of unified memory, on Metal);
     a GPU with enough VRAM for a GPU-tier model (T2 from 10 GB, T1 from 6 GB,
-    with a hybrid T3 offer from 32 GB of RAM); otherwise the CPU by RAM (T3
-    from 28 or 48 GB, T1 from 12 GB, else T0). If the model those rules
-    prefer doesn't list ``lang``, the next smaller one that does is picked
-    and the reason says so. ``ram_total_gb <= 0`` means "unknown" and leads
-    to the smallest tier.
+    with a hybrid T3 offer once the RAM holds a T3 model); otherwise the CPU
+    by RAM (T3 from 28 or 44 GB, T1 from 12 GB, else T0). If the model those
+    rules prefer doesn't list ``lang``, the next smaller one that does is
+    picked and the reason says so. ``ram_total_gb <= 0`` means "unknown" and
+    leads to the smallest tier. ``gpu_detected`` says a GPU was found even
+    though ``vram_gb`` is unknown, so the reason doesn't claim there is none.
 
     Raises ``ValueError`` if no model in the catalogue lists ``lang``.
     """
@@ -80,7 +86,7 @@ def recommend(
             f"no model in the catalogue lists the caption language {lang!r}; "
             "see `asif models list` and set [general] caption_lang"
         )
-    budget = _budget(entries, ram_total_gb, vram_gb, apple_silicon, unified_memory_gb)
+    budget = _budget(entries, ram_total_gb, vram_gb, apple_silicon, unified_memory_gb, gpu_detected)
 
     preferred = _best(budget.pool(entries))
     pick = _best(budget.pool(candidates))
@@ -156,12 +162,22 @@ class _Budget:
             if _size(m) > _size(pick)
             and not self.eligible(m)
             and not (self.device == "cpu" and m.tier == "T2")
+            # In T0 the smallest model wins, so more memory never brings a bigger T0.
+            and not (m.tier == pick.tier == "T0")
         ]
         if not bigger:
             return "it's the biggest model in the catalogue for this setup"
         step = min(bigger, key=_size)
+        need_gb = self.need_gb(step)
+        if self.device == "gpu" and step.min_vram_gb is None and need_gb <= self.have_gb:
+            # Left out by tier, not by memory: quoting a need the GPU already meets
+            # would read as if it didn't fit.
+            return (
+                f"it's the biggest GPU-tier model ({step.name} would fit too, but As If "
+                "suggests it only for the CPU or for the GPU and CPU together)"
+            )
         exact = self.device == "cpu" or (self.device == "gpu" and step.min_vram_gb is not None)
-        need = _num(self.need_gb(step)) if exact else f"~{math.ceil(self.need_gb(step))}"
+        need = _num(need_gb) if exact else f"~{math.ceil(need_gb)}"
         return f"{step.name} would need {need} GB of {self.unit}"
 
     def shortfall(self, pick: ModelEntry) -> str:
@@ -179,7 +195,11 @@ def _budget(
     vram_gb: float | None,
     apple_silicon: bool,
     unified_gb: float | None,
+    gpu_detected: bool,
 ) -> _Budget:
+    if vram_gb and 0 < round(vram_gb) - vram_gb <= VRAM_SLACK_GB:
+        # A 6 GB card reporting 5.997 GB is a 6 GB card: compare (and print) it as one.
+        vram_gb = float(round(vram_gb))
     if apple_silicon:
         memory = unified_gb or ram_gb
         because = (
@@ -201,8 +221,10 @@ def _budget(
                 f" and the GPU's {_num(vram_gb)} GB of VRAM is less than the "
                 f"{_num(min(gpu_thresholds))} GB a GPU-tier model needs"
             )
+        elif gpu_thresholds and gpu_detected:
+            because += " and a GPU whose VRAM couldn't be read"
         elif gpu_thresholds:
-            because += " and no GPU it can use"
+            because += " and no GPU was detected"
     return _Budget("cpu", ram_gb, "RAM", because)
 
 
@@ -210,7 +232,9 @@ def _alternatives(
     pick: ModelEntry, budget: _Budget, candidates: Sequence[ModelEntry], ram_gb: float
 ) -> tuple[str, ...]:
     alts: list[str] = []
-    if budget.device == "gpu" and pick.tier == "T1" and ram_gb >= HYBRID_MIN_RAM_GB:
+    if budget.device == "gpu" and pick.tier == "T1":
+        # Hybrid keeps the experts in RAM, so the T3 model's own RAM threshold decides:
+        # from 28 GB, which a "32 GB" machine clears (§9.3, §10).
         moe = _best([m for m in candidates if m.tier == "T3" and m.min_ram_gb <= ram_gb])
         if moe is not None:
             alts.append(

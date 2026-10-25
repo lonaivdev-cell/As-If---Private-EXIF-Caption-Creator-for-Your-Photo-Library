@@ -79,7 +79,8 @@ Sources are listed at the end.
 
 Use full-disk encryption and a machine you trust.
 
-- **Swap:** RAM-disk pages can be swapped out. `asif doctor` warns if swap is unencrypted. zram, or swap inside LUKS, is fine.
+- **Swap:** RAM-disk pages can be swapped out. `asif doctor` warns if swap is unencrypted. zram without a writeback device, or swap inside LUKS, is fine (zram with a writeback device is only as safe as that device). On WSL2, swap is a file on the Windows drive: it's encrypted only if BitLocker or Device Encryption is on; `swap=0` in `.wslconfig` turns it off.
+- *As built (M1):* the work dir must be RAM-backed or As If refuses to run (`--allow-disk-workdir` accepts the weaker option). Core dumps are switched off for the whole process tree (a crash can't write pixels to disk), and Ctrl+C, SIGTERM, SIGHUP and SIGQUIT unwind cleanly, wiping the RAM copy and stopping every child. Children also get SIGTERM if the orchestrator is SIGKILLed (Linux), and the next run wipes any work dir whose run died without cleaning up.
 - **Non-E2EE clouds** (plain S3, WebDAV): the provider can see your files regardless of As If. Use `rclone crypt` there.
 
 ---
@@ -154,7 +155,7 @@ DISCOVERED → STAGED → OPENED → DESCRIBED → WRITTEN → VERIFIED → UPLO
 | Store | Default location (Linux) | Contents | Protection | Lifetime |
 |---|---|---|---|---|
 | Staging | `~/.cache/asif/staging/` | downloaded originals | `age` encryption with an **ephemeral session key held only in memory** | until `CONFIRMED`; leftovers wiped at next start |
-| RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only | seconds; overwritten then unlinked |
+| RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only; 0700, locked by its run | seconds; overwritten then unlinked; a dead run's leftovers are wiped by the next run |
 | Vault | `~/.local/share/asif/vault.db` | catalogue, captions, keywords, hashes, 256 px thumbnails, undo journal | SQLCipher; key from your passphrase via Argon2id | until `asif wipe vault` |
 | Telemetry | `~/.local/state/asif/telemetry.db` | timings, resources, errors — **no** names, paths or captions | SQLCipher; separate key (HKDF from master key, distinct context) | rolling, user-set retention |
 | Credentials | OS secret store | Proton session (owned by the Proton CLI), rclone config password | OS (libsecret / Keychain / Credential Manager) | per provider |
@@ -330,8 +331,8 @@ candidates = [m in manifest where m.languages covers cfg.caption_lang]
 
 if apple_silicon:   pick largest tier whose (weights + overhead) <= 0.65 * unified_memory
 elif vram >= 10 GB: T2 on GPU
-elif vram >= 6 GB:  T1 on GPU; offer hybrid T3 if ram >= 32 GB
-elif ram >= 48 GB:  T3 Qwen3.5-35B-A3B on CPU
+elif vram >= 6 GB:  T1 on GPU; offer hybrid T3 if ram >= 28 GB
+elif ram >= 44 GB:  T3 Qwen3.5-35B-A3B on CPU
 elif ram >= 28 GB:  T3 Gemma 4 26B-A4B on CPU
 elif ram >= 12 GB:  T1 on CPU
 else:               T0
@@ -340,7 +341,9 @@ bench 20 bundled images → projected hours for the library
 if projected > cfg.deadline: offer one tier down, and show the quality trade-off
 ```
 
-**Always print the reason**, e.g. "picked Qwen3.5-9B because 12 GB VRAM; Qwen3.5-35B-A3B would need ~22 GB".
+**Always print the reason**, e.g. "picked Qwen3.5-9B because 12 GB VRAM; Qwen3.5-35B-A3B would need ~22 GB". When a bigger model would fit but isn't a GPU pick (an MoE on a 19 GB+ GPU), the reason says so instead of quoting a memory figure.
+
+*As built:* RAM is compared as the OS reports it (Linux `MemTotal` is always a little under what's installed), so the thresholds sit below the nominal sizes: 7 GB for an "8 GB" machine, 12 for "16 GB", 28 for "32 GB", 44 for "48 GB". They live in the manifest (`min_ram_gb`), and the hybrid offer uses the T3 model's own threshold. GPUs report a few MiB under their size, so VRAM within 64 MiB of a whole GB counts as that GB.
 
 ---
 
@@ -492,7 +495,7 @@ bwrap --unshare-all --die-with-parent --new-session \
  "ms":4210,"ok":true,"model":"qwen3.5-9b-q4km","rss_mb":9120,"vram_mb":8740,"cpu_c":71.5}
 ```
 
-*Until M9* a minimal, unencrypted timings log stands in for this (`~/.local/state/asif/timings.jsonl`): same event shape, same "no names, paths or captions" rule, enforced by an allow-list of keys.
+*Until M9* a minimal, unencrypted timings log stands in for this (`~/.local/state/asif/timings.jsonl`): same event shape, same "no names, paths or captions" rule, enforced by an allow-list of keys. It records no file sizes either, and photos are processed in a random order, so an id says nothing about which file it was. Durations and outcomes could still loosely correlate with a file someone already knows about; the encrypted store replaces this log.
 
 ---
 
@@ -560,7 +563,7 @@ asif telemetry report [--since 7d]
 asif wipe staging | vault | telemetry | all
 ```
 
-*Available now (M0–M1):* `asif doctor`, `asif caption SRC DEST` (local folder in, captioned copies out), `asif models list | recommend`, `asif config path | show`, `asif version`. See the README.
+*Available now (M0–M1):* `asif doctor`, `asif caption SRC DEST` (local folder in, captioned copies out; `--dry-run`, `--limit`, `--lang`, `--compat`, `--max-edge`, `--allow-disk-workdir`), `asif models list | recommend`, `asif config path | show | init`, `asif version`. See the README.
 
 ```toml
 # ~/.config/asif/config.toml
@@ -579,6 +582,7 @@ staging_dir    = "~/.cache/asif/staging"
 staging_cap_gb = 50
 ram_scratch_mb = 1024
 max_edge_px    = 1024
+# allow_disk_workdir = false    # true = on-disk work dir when there's no tmpfs (weaker)
 
 [model]
 id     = "auto"                 # or a manifest id, e.g. "qwen3.5-9b-q4km"; "local"; "stub"
@@ -586,7 +590,8 @@ device = "auto"                 # "auto" | "cpu" | "gpu" | "hybrid"
 # Until `asif models pull` (M2), point at model files you downloaded yourself:
 # gguf         = "~/models/model.Q4_K_M.gguf"
 # mmproj       = "~/models/mmproj-F16.gguf"
-# llama_server = "llama-server"
+# llama_server = "llama-server"  # or a script that ends with: exec llama-server "$@"
+# server_args  = []              # allow-listed speed/memory/GPU/logging options only
 
 [upload]
 verify               = "sampled" # "full" | "sampled" | "fingerprint"
@@ -598,28 +603,38 @@ bandwidth            = "10M"
 cpu_temp_limit_c  = 90
 thermal_window_s  = 300
 max_failure_rate  = 0.02
-require_ac_power  = true
+require_ac_power  = true          # M7; not enforced yet (doctor only warns)
 
 [telemetry]
 enabled        = true
 retention_days = 90
 ```
 
-**Model manifest entry** (checked into the repo; hashes filled in when pinning):
+**Model manifest entry** (`src/asif/models/manifest.toml`; revision, names and hashes filled in when pinning):
 
 ```toml
 [[model]]
-id        = "qwen3.5-9b-q4km"
-tier      = "T2"
-repo      = "unsloth/Qwen3.5-9B-GGUF"
-revision  = "<pinned commit>"
-files     = [ { name = "<model>.Q4_K_M.gguf", sha256 = "<…>" },
-              { name = "<mmproj>-F16.gguf",   sha256 = "<…>" } ]
-licence   = "Apache-2.0"
-languages = "multilingual"
-min_vram_gb = 10
-min_ram_gb  = 12
+id           = "qwen3.5-9b-q4km"
+name         = "Qwen3.5-9B"
+tier         = "T2"
+arch         = "dense"
+params       = "9.6B"
+weights_gb   = 6.0
+projector_gb = 0.9
+min_vram_gb  = 10.0
+min_ram_gb   = 12.0
+languages    = ["*"]               # or primary subtags, e.g. ["en", "zh"]
+licence      = "Apache-2.0"
+repo         = "unsloth/Qwen3.5-9B-GGUF"
+revision     = "<pinned commit>"
+notes        = "Best accuracy that fits a mid-range GPU."
+files = [
+    { role = "weights",   name = "<model>.Q4_K_M.gguf", sha256 = "<…>" },
+    { role = "projector", name = "<mmproj>-F16.gguf",   sha256 = "<…>" },
+]
 ```
+
+A catalogue id is only written into `XMP-asif:ModelId` when the file's SHA-256 matches its pinned hash; otherwise the copy says `local:<file name>`.
 
 ---
 

@@ -28,11 +28,12 @@ a child's output can never corrupt the stream. Diagnostics go to stderr.
 
      {"type": "fatal", "error": "<short kind>", "detail": "<last log lines>"}
 
-   and then exits non-zero. Kinds: ``bad_config`` (including
-   ``server_args`` that would swap the model, move the address or key, or
-   download something), ``missing_binary``, ``missing_model``,
-   ``server_start``, ``server_exited`` (the model failed to load),
-   ``load_timeout``, ``port_taken`` and ``internal``.
+   and then exits non-zero. Kinds: ``bad_config`` (including a
+   ``server_args`` option that isn't on the list of known-safe speed,
+   memory, GPU, sampling and logging options, and a ``llama_server`` script
+   that doesn't ``exec`` llama-server), ``missing_binary``,
+   ``missing_model``, ``server_start``, ``server_exited`` (the model failed
+   to load), ``load_timeout``, ``port_taken`` and ``internal``.
 
 3. Requests, one at a time::
 
@@ -54,8 +55,8 @@ a child's output can never corrupt the stream. Diagnostics go to stderr.
    ``attempt`` > 0 means "retry": the temperature goes from 0 to 0.3 and
    the seed is the attempt number, so a retry can differ.
 
-4. ``{"type": "shutdown"}``, EOF on stdin or SIGTERM: stop llama-server,
-   exit (0 for the first two).
+4. ``{"type": "shutdown"}``, EOF on stdin, or SIGTERM, SIGHUP, SIGQUIT or
+   SIGINT: stop llama-server, exit (0 for the first two, 130 for a signal).
 
 Backends:
 
@@ -65,13 +66,16 @@ Backends:
   trying the pipeline and for tests.
 * ``llama``: ``llama-server`` from llama.cpp, bound to 127.0.0.1 on a free
   port, with a random API key passed through the environment (never argv),
-  so other local processes can't use it. On Linux the worker also checks
-  that the process answering on that port really is its llama-server
-  before sending it anything, and llama-server gets SIGTERM if the worker
-  dies, however it dies. llama-server's output goes to a bounded in-memory
-  ring buffer, never to our stdout; its tail goes into ``fatal`` details.
-  Requests go through ``http.client``, which, unlike ``urllib``, never
-  routes through a proxy from the environment.
+  so other local processes can't use it, and in offline mode. On Linux the
+  worker also checks that the process answering on that port really is its
+  llama-server before sending it anything, and llama-server gets SIGTERM if
+  the worker dies, however it dies. It runs in a process group of its own,
+  which the worker stops as a whole. Neither the worker nor llama-server
+  can write a core dump. llama-server's output goes to a bounded in-memory
+  ring buffer, never to our stdout, with any line that carries image data
+  hidden; its tail goes into ``fatal`` details. Requests go through
+  ``http.client``, which, unlike ``urllib``, never routes through a proxy
+  from the environment.
 """
 
 from __future__ import annotations
@@ -79,7 +83,7 @@ from __future__ import annotations
 import base64
 import collections
 import colorsys
-import ctypes
+import contextlib
 import http.client
 import io
 import json
@@ -93,16 +97,15 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from types import FrameType
 from typing import IO, Any, Protocol
 
 from PIL import Image, ImageStat
 
 from asif.infer.preprocess import ImageDecodeError, prepare_image
 from asif.infer.schema import PROMPT_VERSION, caption_schema, load_prompt
+from asif.proc import die_with_parent, disable_core_dumps, install_stop_signals
 
 LOOPBACK = "127.0.0.1"
 COMPLETIONS_PATH = "/v1/chat/completions"
@@ -116,30 +119,60 @@ FATAL_TAIL_LINES = 40
 """How much of that goes into a ``fatal`` detail."""
 _LOG_LINE_MAX = 4096
 _SHOWN_LINE_MAX = 500
+_IMAGE_MARK = b"data:image"
+_HIDDEN_LINE = "[line hidden: it contained image data]"
 _MAX_RESPONSE = 4 << 20
 _HEALTH_TIMEOUT_S = 2.0
 _STOP_GRACE_S = 3.0
 
-# Flags that would undo what the worker promises: the model the orchestrator
-# hashed for provenance, loopback only, our own key, and no downloads.
-_FORBIDDEN_SERVER_ARGS = (
-    "-m",
-    "--model",
-    "--mmproj",
-    "--mmproj-url",
-    "--host",
-    "--port",
-    "--api-key",
-    "--api-key-file",
-    "-hf",
-    "-hfr",
-    "--hf-repo",
-    "-hff",
-    "--hf-file",
-    "-mu",
-    "--model-url",
+# The only llama-server options server_args may carry: ones that change speed,
+# memory, GPU placement, sampling defaults or logging, and nothing else. An
+# allow-list, because llama.cpp keeps adding options that load other weights
+# (-mm, -md, --lora), download (-hf, -dr, the --*-default presets), reach other
+# machines (--rpc, --connect, --tools-runtime ssh:...), run tools or serve
+# files (--tools, --agent, --path, --media-path) or write prompts to disk
+# (--log-file, --slot-save-path): a list of what to forbid is always one
+# release behind. Every spelling llama.cpp accepts for an option is listed.
+_ALLOWED_SERVER_ARGS = frozenset(
+    " ".join(
+        (
+            # CPU threads, affinity and priority
+            "-t --threads -tb --threads-batch -C --cpu-mask -Cr --cpu-range --cpu-strict",
+            "--prio --poll -Cb --cpu-mask-batch -Crb --cpu-range-batch --cpu-strict-batch",
+            "--prio-batch --poll-batch --numa",
+            # context, batching, slots and the KV cache (all in memory)
+            "-c --ctx-size -np --parallel -b --batch-size -ub --ubatch-size",
+            "-cb --cont-batching -nocb --no-cont-batching -fa --flash-attn",
+            "-ctk --cache-type-k -ctv --cache-type-v -kvo --kv-offload -nkvo --no-kv-offload",
+            "-kvu --kv-unified -no-kvu --no-kv-unified --kv-unified-per-slot --swa-full",
+            "-ctxcp --ctx-checkpoints --swa-checkpoints -cms --checkpoint-min-step",
+            "-cram --cache-ram --cache-idle-slots --no-cache-idle-slots --cache-prompt",
+            "--no-cache-prompt --cache-reuse --context-shift --no-context-shift",
+            "-sps --slot-prompt-similarity",
+            # how the model file As If chose is loaded, and where its layers go
+            "-lm --load-mode -lzm --lazy-mode --mlock --mmap --no-mmap -dio --direct-io",
+            "-ndio --no-direct-io --repack -nr --no-repack --no-host --check-tensors",
+            "--warmup --no-warmup --op-offload --no-op-offload",
+            "-ngl --gpu-layers --n-gpu-layers -dev --device -sm --split-mode",
+            "-ts --tensor-split -mg --main-gpu -ot --override-tensor",
+            "-cmoe --cpu-moe -ncmoe --n-cpu-moe --moe-cache-mib -ncffn --n-cpu-ffn",
+            "-fit --fit -fitt --fit-target -fitc --fit-ctx",
+            # the vision projector As If chose
+            "--mmproj-offload --no-mmproj-offload -mmdev --mmproj-device",
+            "--image-min-tokens --image-max-tokens --mtmd-batch-max-tokens",
+            # chat template and sampling defaults (each request sets its own too)
+            "--jinja --no-jinja --chat-template --reasoning-format -rea --reasoning",
+            "--reasoning-budget -bs --backend-sampling --perf --no-perf",
+            "--temp --temperature --top-k --top-p --min-p --repeat-penalty --repeat-last-n",
+            "--presence-penalty --frequency-penalty",
+            # logging (into the in-memory tail, never a file) and the HTTP side
+            "-v --verbose --log-verbose -lv --verbosity --log-verbosity --log-disable",
+            "--log-colors --log-prefix --no-log-prefix --log-timestamps --no-log-timestamps",
+            "--log-jsonl --no-log-jsonl --offline -to --timeout --threads-http",
+            "--no-webui --no-ui --no-slots",
+        )
+    ).split()
 )
-_PR_SET_PDEATHSIG = 1
 
 
 class _WorkerError(Exception):
@@ -301,11 +334,22 @@ class _LogTail:
         self._thread.start()
 
     def _pump(self, stream: IO[bytes]) -> None:
+        # A verbose llama-server logs whole request bodies, the photo's base64
+        # included, on one line. Only the first chunk of a line is kept, and
+        # the base64 always comes after "data:image" on its line: so either
+        # that chunk holds the marker and is hidden, or none of the photo is
+        # in it. The rest of the line is still read, so the pipe never fills.
+        continuing = False
         with stream:
             while chunk := stream.readline(_LOG_LINE_MAX):
-                line = chunk.decode("utf-8", "replace").rstrip()
-                with self._lock:
-                    self._lines.append(line)
+                if not continuing:
+                    if _IMAGE_MARK in chunk:
+                        line = _HIDDEN_LINE
+                    else:
+                        line = chunk.decode("utf-8", "replace").rstrip()[:_SHOWN_LINE_MAX]
+                    with self._lock:
+                        self._lines.append(line)
+                continuing = not chunk.endswith(b"\n")
 
     def join(self, timeout: float) -> None:
         if self._thread is not None:
@@ -313,13 +357,7 @@ class _LogTail:
 
     def tail(self, n: int = FATAL_TAIL_LINES) -> str:
         with self._lock:
-            lines = list(self._lines)[-n:]
-        # A verbose llama-server may log request bodies: never pass an image on.
-        shown = (
-            "[line hidden: it contained image data]" if "data:image" in line else line
-            for line in lines
-        )
-        return "\n".join(line[:_SHOWN_LINE_MAX] for line in shown)
+            return "\n".join(list(self._lines)[-n:])
 
 
 def _free_port() -> int:
@@ -327,6 +365,41 @@ def _free_port() -> int:
         sock.bind((LOOPBACK, 0))
         port: int = sock.getsockname()[1]
         return port
+
+
+def _listening_sockets(port: int) -> set[str] | None:
+    """The sockets listening on ``port``, named as ``/proc/<pid>/fd`` links
+    name them. None where the kernel can't be asked (not Linux)."""
+    tables = (Path("/proc/net/tcp"), Path("/proc/net/tcp6"))
+    if not tables[0].exists():
+        return None
+    listeners = set()
+    for table in tables:
+        try:
+            rows = table.read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()  # sl, local_address, rem_address, st, ..., inode
+            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
+                listeners.add(f"socket:[{fields[9]}]")
+    return listeners
+
+
+def _held_by(pid: int) -> set[str]:
+    """What process ``pid``'s file descriptors point at (empty if we can't look)."""
+    fd_dir = Path(f"/proc/{pid}/fd")
+    held: set[str] = set()
+    try:
+        fds = os.listdir(fd_dir)
+    except OSError:
+        return held
+    for fd in fds:
+        try:
+            held.add(os.readlink(fd_dir / fd))
+        except OSError:
+            continue
+    return held
 
 
 def _owns_port(pid: int, port: int) -> bool:
@@ -338,65 +411,72 @@ def _owns_port(pid: int, port: int) -> bool:
     can't tell and says yes (the M3 sandbox gives llama-server a private
     loopback anyway).
     """
-    tables = (Path("/proc/net/tcp"), Path("/proc/net/tcp6"))
-    if not tables[0].exists():
+    listeners = _listening_sockets(port)
+    if listeners is None:
         return True
-    listeners = set()
-    for table in tables:
-        try:
-            rows = table.read_text().splitlines()[1:]
-        except OSError:
-            continue
-        for row in rows:
-            fields = row.split()  # sl, local_address, rem_address, st, ..., inode
-            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
-                listeners.add(f"socket:[{fields[9]}]")
-    held = set()
-    fd_dir = Path(f"/proc/{pid}/fd")
-    try:
-        fds = os.listdir(fd_dir)
-    except OSError:
-        return False
-    for fd in fds:
-        try:
-            held.add(os.readlink(fd_dir / fd))
-        except OSError:
-            continue
-    return bool(listeners) and listeners <= held
+    return bool(listeners) and listeners <= _held_by(pid)
 
 
-def _die_with_parent() -> Callable[[], None] | None:
-    """A ``preexec_fn`` that makes the child get SIGTERM when we die (Linux).
+def _group_owns_port(pgid: int, port: int) -> bool:
+    """Is every socket listening on ``port`` held by processes in group ``pgid``?
 
-    The kernel sends the signal even if this worker is SIGKILLed, so
-    llama-server can't outlive it. It fires when the *thread* that spawned
-    the child exits; the worker only ever spawns from its main thread.
+    llama-server leads a session of its own, so no outside process can join
+    its group: a listener in it is a child of whatever ``llama_server`` ran.
     """
-    if not sys.platform.startswith("linux"):
+    listeners = _listening_sockets(port)
+    if not listeners:
+        return False
+    held: set[str] = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            if os.getpgid(int(entry)) != pgid:
+                continue
+        except OSError:
+            continue
+        held |= _held_by(int(entry))
+    return listeners <= held
+
+
+def _signal_group(pgid: int, sig: signal.Signals) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, sig)
+
+
+def _option_name(arg: str) -> str | None:
+    """The llama-server option ``arg`` names, as llama.cpp reads it; None for a value.
+
+    llama.cpp treats every argument that starts with ``-`` as an option
+    (unless an option before it takes it as its value), and turns ``_`` into
+    ``-`` in ``--`` options before looking them up.
+    """
+    if not arg.startswith("-"):
         return None
     try:
-        prctl = ctypes.CDLL(None, use_errno=True).prctl
-    except (OSError, AttributeError):
+        float(arg)  # a negative number, as in ``--prio -1``
+    except ValueError:
+        pass
+    else:
         return None
-    parent = os.getpid()
-    sig = int(signal.SIGTERM)
-
-    def preexec() -> None:
-        prctl(_PR_SET_PDEATHSIG, sig, 0, 0, 0)
-        if os.getppid() != parent:  # the worker died before prctl took effect
-            os._exit(1)
-
-    return preexec
+    # No llama.cpp option name holds "=" or a space: cutting there keeps a
+    # value (an API key, say) out of the error message.
+    name = arg.split("=", 1)[0].split(None, 1)[0]
+    return name.replace("_", "-") if name.startswith("--") else name
 
 
 def _check_server_args(args: tuple[str, ...]) -> None:
     for arg in args:
-        flag = arg.split("=", 1)[0]
-        if flag in _FORBIDDEN_SERVER_ARGS:
+        name = _option_name(arg)
+        if name is not None and name not in _ALLOWED_SERVER_ARGS:
             raise _Fatal(
                 "bad_config",
-                f"server_args may not contain {flag}: As If sets the model, address and key "
-                "itself, and llama-server never downloads anything.",
+                f"[model] server_args can't include {name[:60]!r}. As If passes on only "
+                "the llama-server options it knows are safe (speed, memory, GPU, sampling "
+                "and logging settings): it chooses the model, the projector, the address "
+                "and the key itself, and llama-server must never download anything, reach "
+                "another machine, run tools or serve files. If this option is harmless, "
+                "please report it so it can be added.",
             )
 
 
@@ -453,6 +533,9 @@ class _LlamaBackend:
             if not k.startswith("LLAMA_ARG_") and k != "LLAMA_API_KEY"
         }
         env["LLAMA_API_KEY"] = env["LLAMA_ARG_API_KEY"] = self.key
+        # --offline as a variable: a build that predates it ignores the
+        # variable, where it would refuse the flag. No option turns it off.
+        env["LLAMA_ARG_OFFLINE"] = "1"
         try:
             self.proc = subprocess.Popen(
                 argv,
@@ -461,8 +544,12 @@ class _LlamaBackend:
                 stderr=subprocess.STDOUT,
                 env=env,
                 close_fds=True,
-                # preexec_fn is only unsafe with other threads running; none exist yet.
-                preexec_fn=_die_with_parent(),
+                # Its own session and process group, which nothing outside can
+                # join: close() stops the whole group, wrapper scripts' children too.
+                start_new_session=True,
+                # No other thread runs yet (the log reader starts below), so
+                # die_with_parent can safely hand over its preexec_fn.
+                preexec_fn=die_with_parent(),
             )
         except OSError as exc:
             raise _Fatal(
@@ -497,13 +584,13 @@ class _LlamaBackend:
         proc, self.proc = self.proc, None
         if proc is None:
             return
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=_STOP_GRACE_S)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+        # The whole group, even if llama-server itself is gone: a wrapper
+        # script may have left a child behind.
+        _signal_group(proc.pid, signal.SIGTERM)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=_STOP_GRACE_S)
+        _signal_group(proc.pid, signal.SIGKILL)
+        proc.wait()
         self.log.join(timeout=1)
 
     # -- requests --
@@ -528,6 +615,17 @@ class _LlamaBackend:
         if code is not None:
             raise self._exited(code, "unexpectedly")
         if not _owns_port(self.proc.pid, self.port):
+            if _group_owns_port(self.proc.pid, self.port):
+                # A shell script that runs llama-server without exec: the
+                # death signal would reach only the script, so llama-server
+                # could outlive us. close() stops it; refuse to go on.
+                raise _Fatal(
+                    "bad_config",
+                    "[model] llama_server points at a script that starts llama-server "
+                    "without exec, so As If can't make sure llama-server stops when it "
+                    "does. In that script, put exec in front of the llama-server command, "
+                    "or point llama_server at llama-server itself.",
+                )
             raise _Fatal(
                 "port_taken",
                 "another program answered on the port meant for llama-server, so As If "
@@ -710,14 +808,14 @@ def _serve(backend: _Backend, stdin: IO[bytes], out: _Out) -> int:
     return 0
 
 
-def _on_sigterm(signum: int, frame: FrameType | None) -> None:
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)  # let the cleanup finish
-    raise SystemExit(128 + signum)
-
-
 def main() -> int:
+    # Before any photo is read: a core dump would write its pixels to disk.
+    # llama-server inherits the limit, and can't raise it again.
+    disable_core_dumps()
     out = _Out()
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    # llama-server has a session of its own, so a closed terminal or Ctrl+\
+    # no longer reaches it: these signals must unwind into close() instead.
+    install_stop_signals()
     stdin = sys.stdin.buffer
     backend: _Backend | None = None
     try:

@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
-from asif import __version__, netguard, paths
+from asif import __version__, netguard, paths, proc
 from asif.config import Config, ConfigError, load_config
 from asif.infer.client import InferenceError
 from asif.pipeline.states import State
@@ -44,6 +44,7 @@ err = Console(stderr=True)
 EXIT_ITEMS_FAILED = 1
 EXIT_USAGE = 2
 EXIT_ABORTED = 3
+EXIT_INTERRUPTED = 130  # the shell convention for "stopped by Ctrl+C"
 
 
 class _State:
@@ -59,6 +60,9 @@ _state = _State()
 
 
 def _load() -> Config:
+    if _state.config_path is not None and not _state.config_path.is_file():
+        err.print(f"[red]Config problem:[/] {escape(str(_state.config_path))} doesn't exist.")
+        raise typer.Exit(EXIT_USAGE)
     try:
         return load_config(_state.config_path)
     except ConfigError as exc:
@@ -95,7 +99,7 @@ def doctor(
     else:
         render_report(report, console)
     if any(check.status == "fail" for check in report.checks):
-        raise typer.Exit(EXIT_ITEMS_FAILED)
+        raise typer.Exit(EXIT_USAGE)
 
 
 @app.command()
@@ -126,7 +130,10 @@ def caption(
     ] = None,
     compat: Annotated[
         Compat | None,
-        typer.Option(help="xmp (default), or wide to also write IPTC keywords for older apps."),
+        typer.Option(
+            help="xmp (default), or wide to also write IPTC keywords for older apps "
+            "(JPEG and TIFF only, and only where existing IPTC is UTF-8)."
+        ),
     ] = None,
     max_edge: Annotated[
         int | None, typer.Option(help="Longest edge, in pixels, the model gets to see.")
@@ -135,6 +142,14 @@ def caption(
         bool, typer.Option("--dry-run", help="Show the captions; write nothing.")
     ] = False,
     limit: Annotated[int | None, typer.Option(min=1, help="Only do the first N photos.")] = None,
+    allow_disk_workdir: Annotated[
+        bool,
+        typer.Option(
+            "--allow-disk-workdir",
+            help="If no RAM-backed folder exists, work on photos in an on-disk temp folder "
+            "instead of refusing. Weaker: copies can survive in disk blocks.",
+        ),
+    ] = False,
 ) -> None:
     """Caption the photos in SOURCE into copies in DEST. Originals are never modified.
 
@@ -164,6 +179,8 @@ def caption(
             cfg.general.compat = compat.value
         if max_edge is not None:
             cfg.resources.max_edge_px = max_edge
+        if allow_disk_workdir:
+            cfg.resources.allow_disk_workdir = True
     except ValidationError as exc:
         problem = exc.errors()[0]
         err.print(f"[red]Invalid option:[/] {escape(str(problem['msg']))}")
@@ -209,6 +226,7 @@ def caption(
     def on_progress(_outcome: ItemOutcome, index: int, total: int) -> None:
         progress.update(task_id, completed=index, description="Captioning")
 
+    notices: list[str] = []
     try:
         with progress:
             summary = caption_folder(
@@ -222,9 +240,20 @@ def caption(
                 limit=limit,
                 on_progress=on_progress,
                 on_start=on_start,
+                notice=notices.append,
             )
+    except KeyboardInterrupt as exc:
+        err.print("Stopped before any photo was started.")
+        raise typer.Exit(EXIT_INTERRUPTED) from exc
     except CaptionError as exc:
         err.print(f"[red]Can't start:[/] {escape(str(exc))}")
+        if "RAM-backed" in str(exc):
+            err.print(
+                "As If keeps photos in RAM while it works on them. On Linux that needs a "
+                "tmpfs (/dev/shm or $XDG_RUNTIME_DIR); you can point [bold]work_dir[/] under "
+                "[resources] at one. To accept the weaker option, pass "
+                "[bold]--allow-disk-workdir[/]."
+            )
         raise typer.Exit(EXIT_USAGE) from exc
     except InferenceError as exc:
         err.print(f"[red]The model couldn't start[/] ({exc.kind}).")
@@ -235,27 +264,41 @@ def caption(
         err.print("Run [bold]asif doctor[/] to check llama-server and your model files.")
         raise typer.Exit(EXIT_USAGE) from exc
 
+    for message in notices:
+        err.print(f"[yellow]Note:[/] {escape(message)}")
     _print_summary(summary, list(iter_problems(summary)))
+    if summary.interrupted:
+        raise typer.Exit(EXIT_INTERRUPTED)
     if summary.aborted:
         raise typer.Exit(EXIT_ABORTED)
-    if summary.failed:
+    if summary.failed or summary.unreadable_dirs:
         raise typer.Exit(EXIT_ITEMS_FAILED)
 
 
 def _print_summary(summary: RunSummary, problems: list[ItemOutcome]) -> None:
     if summary.dry_run:
-        table = Table(title="Dry run: what the model would write", show_lines=True)
+        table = Table(title="Dry run: what would be written", show_lines=True)
         table.add_column("Photo", overflow="fold")
         table.add_column("Caption")
-        table.add_column("Keywords")
+        table.add_column("New keywords")
         for o in summary.outcomes:
-            if o.result is not None:
-                table.add_row(
-                    escape(o.rel), escape(o.result.caption), escape(", ".join(o.result.keywords))
-                )
+            if o.plan is None:
+                continue
+            caption_cell = (
+                escape(o.plan.caption)
+                if o.plan.caption is not None
+                else "[dim](your caption is kept)[/]"
+            )
+            keywords = ", ".join(o.plan.add_subjects) or "[dim](none new)[/]"
+            table.add_row(escape(o.rel), caption_cell, escape(keywords))
         if table.row_count:
             console.print(table)
 
+    kept = sum(
+        1
+        for o in summary.outcomes
+        if o.state in (State.CLEAN, State.DESCRIBED) and o.reason.startswith("kept")
+    )
     labels: list[tuple[State, str, str]] = [
         (State.CLEAN, "captioned", "green"),
         (State.DESCRIBED, "described (dry run)", "green"),
@@ -271,21 +314,34 @@ def _print_summary(summary: RunSummary, problems: list[ItemOutcome]) -> None:
         n = summary.count(state)
         if n:
             counts.add_row(f"[{style}]{n}[/]", label)
+    if kept:
+        counts.add_row(f"[dim]{kept}[/]", "of those kept your own caption (keywords only)")
     if summary.ignored:
         counts.add_row(
-            f"[dim]{summary.ignored}[/]", "other files ignored (not photos, hidden or links)"
+            f"[dim]{summary.ignored}[/]",
+            "other files ignored (not photos, hidden, links or special files)",
         )
     if not summary.outcomes:
         console.print("No photos found.")
     else:
         console.print(Panel(counts, title=f"Run {summary.run_id}", expand=False))
 
-    if problems:
+    if problems or summary.unreadable_dirs:
         table = Table(title="Needs a look")
         table.add_column("Photo", overflow="fold")
         table.add_column("What happened")
+        for folder in summary.unreadable_dirs:
+            table.add_row(escape(folder + "/"), "folder couldn't be read (permission denied?)")
         for item in problems:
             table.add_row(escape(item.rel), escape(item.reason))
+        console.print(table)
+    notes = [o for o in summary.outcomes if o.note]
+    if notes:
+        table = Table(title="Notes")
+        table.add_column("Photo", overflow="fold")
+        table.add_column("Note")
+        for item in notes:
+            table.add_row(escape(item.rel), escape(item.note))
         console.print(table)
     if summary.aborted:
         err.print(f"[red bold]Run stopped:[/] {escape(summary.aborted)}")
@@ -316,20 +372,12 @@ def models_list() -> None:
 @models_app.command("recommend")
 def models_recommend() -> None:
     """Suggest a model for this machine, and say why."""
-    from asif.doctor import detect_specs
-    from asif.models.recommend import recommend
+    from asif.doctor import detect_specs, recommend_for
 
     cfg = _load()
     specs = detect_specs(cfg)
-    vram = max((g.vram_total_mb or 0 for g in specs.gpus), default=0) / 1024 or None
     try:
-        rec = recommend(
-            ram_total_gb=(specs.ram_total_mb or 0) / 1024,
-            vram_gb=vram,
-            apple_silicon=specs.apple_silicon,
-            unified_memory_gb=(specs.unified_memory_mb or 0) / 1024 or None,
-            lang=cfg.general.caption_lang,
-        )
+        rec = recommend_for(specs, cfg.general.caption_lang)
     except ValueError as exc:
         err.print(f"[red]{escape(str(exc))}[/]")
         raise typer.Exit(EXIT_ITEMS_FAILED) from exc
@@ -376,6 +424,7 @@ compat       = "xmp"    # "xmp", or "wide" to also write IPTC keywords for older
 [resources]
 max_edge_px = 1024      # longest edge the model sees; lower is faster on CPU
 # work_dir  = ""        # RAM work dir; empty = auto-detect a tmpfs
+# allow_disk_workdir = false  # true = use an on-disk folder if there's no tmpfs (weaker)
 
 [model]
 id     = "auto"         # "auto", "local", "stub", or an id from `asif models list`
@@ -383,8 +432,9 @@ device = "auto"         # "auto", "cpu", "gpu" or "hybrid"
 # Until `asif models pull` exists (M2), point at files you downloaded:
 # gguf         = "~/models/your-model.Q4_K_M.gguf"
 # mmproj       = "~/models/your-model-mmproj-F16.gguf"
-# llama_server = "llama-server"
+# llama_server = "llama-server"  # or a script that ends with: exec llama-server "$@"
 # threads      = 0      # 0 = let llama.cpp decide
+# server_args  = []     # extra llama-server options: speed, memory, GPU, logging only
 
 [guards]
 max_failure_rate = 0.02 # stop if more than 2% of the last 200 photos fail
@@ -397,5 +447,9 @@ retention_days = 90
 
 def main() -> None:
     """Entry point for the ``asif`` script."""
+    # Before anything reads a photo: no core files with pixels in them (for
+    # this process and every child), and stop signals that unwind cleanly.
+    proc.disable_core_dumps()
+    proc.install_stop_signals()
     netguard.install()
     app()

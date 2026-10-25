@@ -21,6 +21,7 @@ from rich.console import Console
 from asif import doctor, workdir
 from asif.config import Config
 from asif.doctor import (
+    MIB,
     Check,
     DoctorReport,
     SystemProbe,
@@ -414,6 +415,70 @@ def test_nvidia_gpu_drives_the_recommendation() -> None:
     assert "12 GB of VRAM" in rec.reason
 
 
+def rocm_smi(total_bytes: int) -> str:
+    return ROCM_SMI.replace("25753026560", str(total_bytes))
+
+
+@pytest.mark.parametrize(
+    ("tool", "output", "size_gb", "expected"),
+    [
+        ("nvidia-smi", "NVIDIA GeForce RTX 4050 Laptop GPU, 6141, 5900\n", 6, "gemma-4-e4b-q4"),
+        ("rocm-smi", rocm_smi(6 * 1024**3 - 16 * MIB), 6, "gemma-4-e4b-q4"),
+        ("rocm-smi", rocm_smi(10 * 1024**3 - 16 * MIB), 10, "qwen3.5-9b-q4km"),
+    ],
+)
+def test_gpus_reporting_a_few_mib_less_than_their_size_get_the_gpu_pick(
+    tool: str, output: str, size_gb: int, expected: str
+) -> None:
+    probe = linux()
+    probe.commands[tool] = (0, output)
+    rec = run_doctor(Config(), probe).recommendation
+    assert rec is not None
+    assert (rec.model_id, rec.device) == (expected, "gpu")
+    assert f"the GPU has {size_gb} GB of VRAM" in rec.reason
+
+
+def test_a_gpu_whose_vram_is_unknown_is_not_called_missing() -> None:
+    probe = linux()
+    probe.commands["nvidia-smi"] = (0, "NVIDIA GB10, [N/A], [N/A]\n")
+    report = run_doctor(Config(), probe)
+    assert [(g.name, g.vram_total_mb) for g in report.specs.gpus] == [("NVIDIA GB10", None)]
+    rec = report.recommendation
+    assert rec is not None and rec.device == "cpu"
+    assert "a GPU whose VRAM couldn't be read" in rec.reason
+    assert "no GPU" not in rec.reason
+    # `asif models recommend` goes through the same helper.
+    assert doctor.recommend_for(report.specs, "en") == rec
+
+
+def test_no_gpu_at_all_says_none_was_detected() -> None:
+    rec = run_doctor(Config(), linux()).recommendation
+    assert rec is not None and "no GPU was detected" in rec.reason
+
+
+@pytest.mark.parametrize(
+    ("memtotal_kb", "gpu", "expected", "device"),
+    [
+        (7990140, None, "minicpm-v-4.6-q4", "cpu"),  # "8 GB"
+        (49250000, None, "qwen3.5-35b-a3b-q4", "cpu"),  # "48 GB"
+        (32803612, "NVIDIA GeForce RTX 3070, 8192, 7900\n", "gemma-4-e4b-q4", "gpu"),  # "32 GB"
+    ],
+)
+def test_ram_as_linux_reports_it_meets_the_thresholds_for_its_size(
+    memtotal_kb: int, gpu: str | None, expected: str, device: str
+) -> None:
+    probe = linux()
+    probe.files["/proc/meminfo"] = f"MemTotal: {memtotal_kb} kB\nMemAvailable: 4000000 kB\n"
+    if gpu:
+        probe.commands["nvidia-smi"] = (0, gpu)
+    rec = run_doctor(Config(), probe).recommendation
+    assert rec is not None
+    assert (rec.model_id, rec.device) == (expected, device)
+    assert "slow" not in rec.reason
+    if gpu:  # an 8 GB GPU and 32 GB of RAM: the hybrid offer from §10
+        assert any("hybrid" in alt for alt in rec.alternatives)
+
+
 # -- swap -------------------------------------------------------------------------
 
 
@@ -544,6 +609,83 @@ def test_unreadable_proc_swaps_is_unknown() -> None:
     assert detect_specs(Config(), probe).swap.kind == "unknown"
 
 
+def test_zram_without_a_writeback_device_never_touches_a_disk() -> None:
+    report = run_doctor(
+        Config(), swap_probe(SWAPS_ZRAM, **{"/sys/block/zram0/backing_dev": "none\n"})
+    )
+    assert report.specs.swap.kind == "zram"
+    assert check(report, "Swap").status == "ok"
+
+
+def test_zram_with_a_plain_writeback_device_warns() -> None:
+    # zram-generator's writeback-device= pages idle or incompressible memory (photos
+    # are JPEG: incompressible) out to this partition, unencrypted.
+    probe = swap_probe(
+        SWAPS_ZRAM,
+        **{
+            "/sys/block/zram0/backing_dev": "/dev/nvme0n1p4\n",
+            "/sys/class/block/nvme0n1p4/dev": "259:4\n",
+        },
+    )
+    report = run_doctor(Config(), probe)
+    assert report.specs.swap.kind == "plain"
+    assert "/dev/nvme0n1p4" in report.specs.swap.detail
+    swap = check(report, "Swap")
+    assert swap.status == "warn" and "writeback" in swap.hint
+
+
+def test_zram_writing_back_to_dm_crypt_is_encrypted() -> None:
+    probe = swap_probe(
+        SWAPS_ZRAM,
+        **{
+            "/sys/block/zram0/backing_dev": "/dev/dm-1\n",
+            "/sys/class/block/dm-1/dev": "253:1\n",
+            "/sys/dev/block/253:1/dm/uuid": "CRYPT-PLAIN-zram-writeback\n",
+        },
+    )
+    assert detect_specs(Config(), probe).swap.kind == "encrypted"
+
+
+SWAPS_WSL = SWAPS_HEADER + "/dev/sdb                                partition\t4194304\t\t0\t\t-2\n"
+
+
+def wsl_swap_probe(swaps: str) -> FakeProbe:
+    """Stock WSL2: swap.vhdx on the Windows drive, attached as a whole disk."""
+    return swap_probe(
+        swaps, **{"/proc/version": PROC_VERSION_WSL, "/sys/class/block/sdb/dev": "8:16\n"}
+    )
+
+
+@pytest.mark.parametrize("swaps", [SWAPS_WSL, SWAPS_ZRAM + "/dev/sdb partition 4194304 0 -2\n"])
+def test_wsl_swap_is_a_windows_disk_file_and_points_at_bitlocker(swaps: str) -> None:
+    report = run_doctor(Config(), wsl_swap_probe(swaps))
+    assert report.specs.swap.kind == "unknown"
+    swap = check(report, "Swap")
+    assert swap.status == "info" and "Windows" in swap.summary
+    assert "BitLocker" in swap.hint and "swap=0" in swap.hint and ".wslconfig" in swap.hint
+    assert "zram" not in swap.hint  # Linux advice that doesn't work on WSL
+
+
+def test_wsl_swap_file_on_the_wsl_disk_is_unknown_too() -> None:
+    probe = wsl_swap_probe(SWAPS_FILE)
+    probe.devs["/swapfile"] = (8, 32)
+    probe.files["/sys/class/block/sdc/dev"] = "8:32\n"
+    assert detect_specs(Config(), probe).swap.kind == "unknown"
+
+
+def test_dm_integrity_swap_is_not_encrypted() -> None:
+    probe = swap_probe(
+        SWAPS_HEADER + "/dev/dm-3 partition 8388604 0 -2\n",
+        **{
+            "/sys/class/block/dm-3/dev": "253:3\n",
+            "/sys/dev/block/253:3/dm/uuid": "CRYPT-INTEGRITY-int_swap\n",
+        },
+    )
+    report = run_doctor(Config(), probe)
+    assert report.specs.swap.kind == "plain"
+    assert check(report, "Swap").status == "warn"
+
+
 # -- disk encryption --------------------------------------------------------------
 
 
@@ -565,6 +707,46 @@ def test_plain_root_warns() -> None:
     assert report.specs.root_encrypted is False
     enc = check(report, "Disk encryption")
     assert enc.status == "warn" and "LUKS" in enc.hint
+
+
+def verity_root(*slaves: str) -> FakeProbe:
+    """'/' on dm-verity (systemd's roothash=): libcryptsetup names it CRYPT-VERITY-..."""
+    probe = linux(devs={"/": (253, 5)})
+    probe.files["/sys/dev/block/253:5/dm/uuid"] = (
+        "CRYPT-VERITY-3f2a9c0d1e2b4a5c8d7e6f0a1b2c3d4e-root\n"
+    )
+    probe.dirs["/sys/dev/block/253:5/slaves"] = list(slaves)
+    probe.files["/sys/class/block/nvme0n1p2/dev"] = "259:2\n"
+    probe.files["/sys/class/block/nvme0n1p3/dev"] = "259:3\n"
+    return probe
+
+
+def test_dm_verity_root_is_not_encryption() -> None:
+    report = run_doctor(Config(), verity_root("nvme0n1p2", "nvme0n1p3"))
+    assert report.specs.root_encrypted is False
+    assert check(report, "Disk encryption").status == "warn"
+
+
+def test_dm_verity_on_top_of_luks_is_encrypted() -> None:
+    assert detect_specs(Config(), verity_root("dm-0")).root_encrypted is True
+
+
+def test_root_on_raid_over_dm_integrity_is_not_encrypted() -> None:
+    probe = linux(devs={"/": (9, 0)})
+    probe.dirs["/sys/dev/block/9:0/slaves"] = ["dm-1", "dm-2"]
+    for n in (1, 2):
+        probe.files[f"/sys/class/block/dm-{n}/dev"] = f"253:{n}\n"
+        probe.files[f"/sys/dev/block/253:{n}/dm/uuid"] = f"CRYPT-INTEGRITY-int_{n}\n"
+    assert detect_specs(Config(), probe).root_encrypted is False
+
+
+@pytest.mark.parametrize(
+    "kind", ["LUKS1", "LUKS2", "PLAIN", "LOOPAES", "TCRYPT", "BITLK", "FVAULT2"]
+)
+def test_every_encrypting_dm_crypt_type_counts(kind: str) -> None:
+    probe = linux()
+    probe.files["/sys/dev/block/253:0/dm/uuid"] = f"CRYPT-{kind}-0123abcd-root\n"
+    assert detect_specs(Config(), probe).root_encrypted is True
 
 
 def test_zfs_root_is_unknown() -> None:
@@ -619,17 +801,19 @@ def test_laptop_on_ac() -> None:
     assert check(report, "Power").status == "ok"
 
 
-def test_laptop_on_battery_warns_when_ac_is_required() -> None:
-    report = run_doctor(Config(), laptop("0", "Discharging"))
+@pytest.mark.parametrize("require_ac_power", [True, False])
+def test_laptop_on_battery_warns_without_claiming_a_guard(require_ac_power: bool) -> None:
+    cfg = Config()
+    cfg.guards.require_ac_power = require_ac_power
+    report = run_doctor(cfg, laptop("0", "Discharging"))
     assert (report.specs.power.on_ac, report.specs.power.has_battery) == (False, True)
     power = check(report, "Power")
-    assert power.status == "warn" and "require_ac_power" in power.hint
-
-
-def test_laptop_on_battery_only_informs_when_ac_is_not_required() -> None:
-    cfg = Config()
-    cfg.guards.require_ac_power = False
-    assert check(run_doctor(cfg, laptop("0", "Discharging")), "Power").status == "info"
+    assert power.status == "warn"
+    # Nothing stops a run on battery until the M7 guards: the doctor says so, and
+    # doesn't point at a setting that nothing reads yet.
+    assert "doesn't stop" in power.summary and "M7" in power.summary
+    assert "require_ac_power" not in power.summary + power.hint
+    assert "Plug in the charger" in power.hint
 
 
 def test_usb_c_charger_counts_as_mains() -> None:
@@ -788,6 +972,25 @@ def test_dependencies_with_versions_trimmed_to_one_line() -> None:
     assert not any("proton-drive" in argv[0] for argv in probe.ran)
 
 
+def test_llama_server_version_skips_backend_loading_lines() -> None:
+    # Release builds load their backends before handling --version, and log it.
+    probe = linux()
+    probe.programs["llama-server"] = "/usr/local/bin/llama-server"
+    probe.commands["llama-server --version"] = (
+        0,
+        "load_backend: loaded RPC backend from /opt/llama/libggml-rpc.so\n"
+        "ggml_cuda_init: found 1 CUDA devices:\n"
+        "  Device 0: NVIDIA GeForce RTX 3060, compute capability 8.6, VMM: yes\n"
+        "load_backend: loaded CUDA backend from /opt/llama/libggml-cuda.so\n"
+        "version: 6123 (abc1234)\n"
+        "built with cc (Ubuntu 13.3.0) 13.3.0 for x86_64-linux-gnu\n",
+    )
+    report = run_doctor(Config(), probe)
+    deps = {d.name: d for d in report.deps}
+    assert deps["llama-server"].version == "version: 6123 (abc1234)"
+    assert check(report, "llama-server").summary == "llama-server found (version: 6123 (abc1234))."
+
+
 def test_llama_server_from_the_config_path() -> None:
     cfg = Config()
     cfg.model.llama_server = "/opt/llama/bin/llama-server"
@@ -899,7 +1102,7 @@ def test_configured_work_dir_is_passed_to_find_ram_dir(monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize(
-    ("free", "status"), [(5_000, "warn"), (10_239, "warn"), (10_240, "ok"), (None, "info")]
+    ("free", "status"), [(5_000, "info"), (10_239, "info"), (10_240, "ok"), (None, "info")]
 )
 def test_staging_disk(free: int | None, status: str, tmp_path: Path) -> None:
     cfg = Config()
@@ -910,6 +1113,13 @@ def test_staging_disk(free: int | None, status: str, tmp_path: Path) -> None:
     assert disk.status == status
     if status != "ok":
         assert "staging_dir" in disk.hint
+
+
+def test_low_staging_space_only_informs_because_nothing_uses_the_folder_yet() -> None:
+    disk = check(run_doctor(Config(), linux(free_mb=5_000)), "Staging disk")
+    assert disk.status == "info"
+    assert "Nothing uses this folder yet" in disk.hint and "M5" in disk.hint
+    assert "wait there (encrypted)" not in disk.hint  # not true before M4/M5
 
 
 def test_model_check_appears_when_no_model_fits_the_language(

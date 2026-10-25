@@ -120,8 +120,11 @@ def test_thresholds_match_section_10_and_the_section_17_example() -> None:
     assert (m["qwen3.5-9b-q4km"].min_vram_gb, m["qwen3.5-9b-q4km"].min_ram_gb) == (10, 12)
     assert m["gemma-4-e4b-q4"].min_vram_gb == 6
     assert m["gemma-4-e4b-q4"].min_ram_gb == 12
+    # RAM thresholds sit below the nominal size, because Linux reports less than
+    # is installed: 7 for "8 GB", 12 for "16 GB", 28 for "32 GB", 44 for "48 GB".
+    assert m["minicpm-v-4.6-q4"].min_ram_gb == m["gemma-4-e2b-q4"].min_ram_gb == 7
     assert m["gemma-4-26b-a4b-q4"].min_ram_gb == 28
-    assert m["qwen3.5-35b-a3b-q4"].min_ram_gb == 48
+    assert m["qwen3.5-35b-a3b-q4"].min_ram_gb == 44
     # Only the GPU tiers have a VRAM threshold.
     assert {e.id for e in m.values() if e.min_vram_gb is not None} == {
         "gemma-4-e4b-q4",
@@ -272,6 +275,7 @@ def rec(
     unified: float | None = None,
     lang: str = "en",
     manifest: list[ModelEntry] | None = None,
+    gpu_detected: bool = False,
 ) -> Recommendation:
     return recommend(
         ram_total_gb=ram,
@@ -280,7 +284,13 @@ def rec(
         unified_memory_gb=unified,
         lang=lang,
         manifest=manifest,
+        gpu_detected=gpu_detected,
     )
+
+
+def memtotal_gb(kb: int) -> float:
+    """/proc/meminfo's MemTotal as the doctor hands it over: kB -> MiB -> GiB."""
+    return kb // 1024 / 1024
 
 
 @pytest.mark.parametrize(
@@ -310,13 +320,22 @@ def test_apple_silicon_beats_the_gpu_branch_and_falls_back_to_ram() -> None:
     assert "Qwen3.5-35B-A3B would need ~36 GB of unified memory" in r.reason
 
 
-@pytest.mark.parametrize("vram", [10, 12, 16, 24, 48])
+@pytest.mark.parametrize("vram", [10, 12, 16])
 def test_10_gb_of_vram_or_more_means_t2_on_the_gpu(vram: float) -> None:
     r = rec(vram=vram, ram=16)
     assert (r.model_id, r.device) == ("qwen3.5-9b-q4km", "gpu")
     assert f"the GPU has {vram} GB of VRAM" in r.reason
     assert "Gemma 4 26B-A4B would need ~19 GB of VRAM" in r.reason
     assert any("gemma-4-e4b-q4" in alt and "one tier down" in alt for alt in r.alternatives)
+
+
+@pytest.mark.parametrize("vram", [19, 20, 24, 48, 80])
+def test_a_big_gpu_is_not_told_the_next_model_needs_less_vram_than_it_has(vram: float) -> None:
+    r = rec(vram=vram, ram=16)
+    assert (r.model_id, r.device) == ("qwen3.5-9b-q4km", "gpu")
+    assert f"the GPU has {vram} GB of VRAM" in r.reason
+    assert "would need" not in r.reason
+    assert "biggest GPU-tier model" in r.reason and "Gemma 4 26B-A4B would fit" in r.reason
 
 
 @pytest.mark.parametrize("vram", [6, 8, 9.9])
@@ -328,8 +347,46 @@ def test_6_to_10_gb_of_vram_means_t1_on_the_gpu(vram: float) -> None:
 
 
 @pytest.mark.parametrize(
+    ("vram", "expected"),
+    [
+        (6141 / 1024, "gemma-4-e4b-q4"),  # a 6 GB RTX 4050 Laptop, as nvidia-smi reports it
+        (6 - 16 / 1024, "gemma-4-e4b-q4"),  # a 6 GB AMD card, 16 MiB short like the 7900 XTX
+        (8188 / 1024, "gemma-4-e4b-q4"),  # an 8 GB RTX 4060
+        (10 - 16 / 1024, "qwen3.5-9b-q4km"),  # a 10 GB AMD card
+        (24564 / 1024, "qwen3.5-9b-q4km"),  # an RTX 4090
+    ],
+)
+def test_vram_a_few_mib_short_of_a_whole_gb_counts_as_that_gb(vram: float, expected: str) -> None:
+    r = rec(vram=vram, ram=16)
+    assert (r.model_id, r.device) == (expected, "gpu")
+    assert f"the GPU has {round(vram)} GB of VRAM" in r.reason
+
+
+@pytest.mark.parametrize(("vram", "shown"), [(5.5, "5.5"), (5.9, "5.9"), (5.93, "5.9")])
+def test_vram_well_short_of_6_gb_still_means_the_cpu(vram: float, shown: str) -> None:
+    r = rec(vram=vram, ram=16)
+    assert r.device == "cpu"
+    assert f"GPU's {shown} GB of VRAM is less than the 6 GB" in r.reason
+
+
+def test_the_vram_reason_never_contradicts_itself() -> None:
+    manifest = load_manifest()
+    for mib in range(5 * 1024, 26 * 1024, 3):
+        reason = rec(vram=mib / 1024, ram=16, manifest=manifest).reason
+        assert "GPU's 6 GB of VRAM is less than the 6 GB" not in reason, mib
+        assert "has 10 GB of VRAM; Qwen3.5-9B would need 10 GB" not in reason, mib
+        assert "would need ~19 GB" not in reason or mib / 1024 < 19, mib
+
+
+@pytest.mark.parametrize(
     ("ram", "moe"),
-    [(32, "gemma-4-26b-a4b-q4"), (40, "gemma-4-26b-a4b-q4"), (64, "qwen3.5-35b-a3b-q4")],
+    [
+        (28, "gemma-4-26b-a4b-q4"),
+        (memtotal_gb(32803612), "gemma-4-26b-a4b-q4"),  # a "32 GB" machine as Linux reports it
+        (40, "gemma-4-26b-a4b-q4"),
+        (memtotal_gb(49250000), "qwen3.5-35b-a3b-q4"),  # a "48 GB" machine
+        (64, "qwen3.5-35b-a3b-q4"),
+    ],
 )
 def test_6_gb_gpu_with_32_gb_ram_is_offered_hybrid_t3(ram: float, moe: str) -> None:
     r = rec(vram=8, ram=ram)
@@ -338,22 +395,26 @@ def test_6_gb_gpu_with_32_gb_ram_is_offered_hybrid_t3(ram: float, moe: str) -> N
     assert len(hybrid) == 1 and moe in hybrid[0]
 
 
-def test_no_hybrid_offer_just_below_32_gb() -> None:
-    assert not any("hybrid" in alt for alt in rec(vram=8, ram=31.9).alternatives)
+def test_no_hybrid_offer_below_what_a_32_gb_machine_reports() -> None:
+    assert not any("hybrid" in alt for alt in rec(vram=8, ram=27.9).alternatives)
+    assert not any("hybrid" in alt for alt in rec(vram=8, ram=0).alternatives)  # unknown RAM
 
 
 @pytest.mark.parametrize(
     ("ram", "expected"),
     [
         (256, "qwen3.5-35b-a3b-q4"),
-        (48, "qwen3.5-35b-a3b-q4"),
-        (47.9, "gemma-4-26b-a4b-q4"),
+        (46.9, "qwen3.5-35b-a3b-q4"),  # a "48 GB" machine as Linux reports it
+        (44, "qwen3.5-35b-a3b-q4"),
+        (43.9, "gemma-4-26b-a4b-q4"),
+        (31.3, "gemma-4-26b-a4b-q4"),  # a "32 GB" machine
         (28, "gemma-4-26b-a4b-q4"),
         (27.9, "gemma-4-e4b-q4"),
-        (15.6, "gemma-4-e4b-q4"),  # a "16 GB" machine as Linux reports it
+        (15.6, "gemma-4-e4b-q4"),  # a "16 GB" machine
         (12, "gemma-4-e4b-q4"),
         (11.9, "minicpm-v-4.6-q4"),
         (8, "minicpm-v-4.6-q4"),
+        (7.6, "minicpm-v-4.6-q4"),  # an "8 GB" machine
         (4, "minicpm-v-4.6-q4"),
     ],
 )
@@ -363,6 +424,23 @@ def test_cpu_branches_by_ram(ram: float, expected: str) -> None:
     assert f"{ram:g} GB of RAM" in r.reason
 
 
+@pytest.mark.parametrize(
+    ("kb", "lang", "expected"),
+    [
+        (7990140, "en", "minicpm-v-4.6-q4"),
+        (7849000, "en", "minicpm-v-4.6-q4"),  # 8 GB with some of it kept for an iGPU
+        (7990140, "pt-BR", "gemma-4-e2b-q4"),
+    ],
+)
+def test_an_8_gb_machine_is_not_told_its_t0_model_will_be_slow(
+    kb: int, lang: str, expected: str
+) -> None:
+    r = rec(ram=memtotal_gb(kb), lang=lang)
+    assert (r.model_id, r.device) == (expected, "cpu")
+    assert "slow" not in r.reason
+    assert "Gemma 4 E4B would need 12 GB of RAM" in r.reason
+
+
 @pytest.mark.parametrize("vram", [None, 0, 4, 5.9])
 def test_a_small_or_missing_gpu_means_the_cpu(vram: float | None) -> None:
     r = rec(vram=vram, ram=16)
@@ -370,7 +448,14 @@ def test_a_small_or_missing_gpu_means_the_cpu(vram: float | None) -> None:
     if vram:
         assert f"GPU's {vram:g} GB of VRAM is less than the 6 GB" in r.reason
     else:
-        assert "no GPU" in r.reason
+        assert "no GPU was detected" in r.reason
+
+
+def test_a_gpu_whose_vram_is_unknown_is_not_called_missing() -> None:
+    r = rec(vram=None, ram=16, gpu_detected=True)
+    assert (r.model_id, r.device) == ("gemma-4-e4b-q4", "cpu")
+    assert "a GPU whose VRAM couldn't be read" in r.reason
+    assert "no GPU" not in r.reason
 
 
 def test_t2_is_never_the_cpu_pick() -> None:
@@ -382,8 +467,16 @@ def test_t2_is_never_the_cpu_pick() -> None:
 
 def test_the_reason_names_the_next_step_up_or_says_it_is_the_biggest() -> None:
     assert "Gemma 4 E4B would need 12 GB of RAM" in rec(ram=8).reason
-    assert "Qwen3.5-35B-A3B would need 48 GB of RAM" in rec(ram=32).reason
+    assert "Qwen3.5-35B-A3B would need 44 GB of RAM" in rec(ram=32).reason
     assert "biggest model in the catalogue" in rec(ram=64).reason
+
+
+def test_a_bigger_t0_is_never_the_step_up() -> None:
+    # In T0 the smallest model wins, so more RAM would never get English Gemma 4 E2B.
+    r = rec(ram=4, lang="en")
+    assert r.model_id == "minicpm-v-4.6-q4"
+    assert "Gemma 4 E2B" not in r.reason
+    assert "Gemma 4 E4B would need 12 GB of RAM" in r.reason
 
 
 def test_pt_br_on_a_small_machine_never_gets_minicpm() -> None:
@@ -406,7 +499,7 @@ def test_no_language_note_when_the_language_never_mattered() -> None:
 def test_too_little_ram_says_it_will_be_slow() -> None:
     r = rec(ram=4, lang="pt-BR")
     assert r.model_id == "gemma-4-e2b-q4"
-    assert "sized for 8 GB of RAM" in r.reason and "slow" in r.reason
+    assert "sized for 7 GB of RAM" in r.reason and "slow" in r.reason
 
 
 def test_unknown_ram_picks_the_smallest_tier_and_says_so() -> None:

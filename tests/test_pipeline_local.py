@@ -84,6 +84,7 @@ def cfg(tmp_path: Path) -> Config:
     config = Config()
     config.model.id = "stub"
     config.resources.work_dir = str(tmp_path / "ram")
+    config.resources.allow_disk_workdir = True  # tmp_path is on disk; tested on purpose
     return config
 
 
@@ -239,16 +240,27 @@ def test_timings_log_never_mentions_files_or_captions(
     for outcome in summary.outcomes:
         assert Path(outcome.rel).stem not in text
     assert "Pictures" not in text and "summer" not in text
+    with ExifTool() as et:
+        for outcome in summary.outcomes:
+            if outcome.state != State.CLEAN:
+                continue
+            tags = et.read_tags(tmp_path / "out" / outcome.rel, "-XMP-dc:Description")
+            caption = str(tags["XMP-dc:Description"])
+            assert caption and caption not in text
+            assert caption.split(":")[0] not in text  # not even a fragment ("Stub caption")
     stages = {json.loads(line)["stage"] for line in text.splitlines()}
     assert {"run_start", "model_load", "open", "infer", "write", "gates", "commit"} <= stages
 
 
-def test_discover_ignores_hidden_files_and_links(library: Path) -> None:
-    files, ignored = discover(library)
-    names = {p.name for p in files}
-    assert "link.jpg" not in names and ".hidden.jpg" not in names
+def test_discover_ignores_hidden_files_links_and_special_files(library: Path) -> None:
+    os.mkfifo(library / "pipe.jpg")  # reading it would block forever
+    found = discover(library)
+    names = {p.name for p in found.files}
+    assert "link.jpg" not in names and ".hidden.jpg" not in names and "pipe.jpg" not in names
     assert "photo.heic" in names and "raw.dng" in names
-    assert ignored == 3  # notes.txt, .hidden.jpg, link.jpg (.thumbnails is never entered)
+    # notes.txt, .hidden.jpg, link.jpg, pipe.jpg (.thumbnails is never entered)
+    assert found.ignored == 4
+    assert found.unreadable_dirs == []
 
 
 def test_folder_checks(tmp_path: Path) -> None:

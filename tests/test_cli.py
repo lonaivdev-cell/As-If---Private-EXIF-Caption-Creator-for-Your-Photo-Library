@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from asif.cli import EXIT_ITEMS_FAILED, EXIT_USAGE, app
+from asif.cli import EXIT_INTERRUPTED, EXIT_ITEMS_FAILED, EXIT_USAGE, app
 from tests.conftest import requires_exiftool
 
 runner = CliRunner()
@@ -115,6 +115,58 @@ def test_caption_dry_run_shows_captions(fixtures_dir: Path, tmp_path: Path) -> N
 @pytest.mark.parametrize("args", [["doctor", "--json"]])
 def test_doctor_json(args: list[str]) -> None:
     result = runner.invoke(app, args)
-    assert result.exit_code in (0, EXIT_ITEMS_FAILED), result.output
+    assert result.exit_code in (0, EXIT_USAGE), result.output
     report = json.loads(result.stdout)
     assert "specs" in report and "checks" in report
+
+
+def test_a_missing_config_file_is_an_error_not_silent_defaults(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["--config", str(tmp_path / "typo.toml"), "config", "show"])
+    assert result.exit_code == EXIT_USAGE
+    assert "doesn't exist" in " ".join(result.output.split())
+
+
+def test_doctor_failure_is_a_setup_problem(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asif.doctor as doctor_mod
+
+    real = doctor_mod.run_doctor
+
+    def failing(cfg: object, probe: object = None) -> object:
+        report = real(cfg)  # type: ignore[arg-type]
+        report.checks.append(doctor_mod.Check("exiftool", "fail", "missing", "install it"))
+        return report
+
+    monkeypatch.setattr(doctor_mod, "run_doctor", failing)
+    assert runner.invoke(app, ["doctor"]).exit_code == EXIT_USAGE
+
+
+@requires_exiftool
+def test_dry_run_preview_says_when_the_owners_caption_is_kept(
+    fixtures_dir: Path, tmp_path: Path
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy2(fixtures_dir / "user_xmp.jpg", src / "owner.jpg")
+    result = runner.invoke(
+        app, ["caption", str(src), str(tmp_path / "out"), "-m", "stub", "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "your caption is kept" in result.output
+
+
+@requires_exiftool
+def test_ctrl_c_exits_130_after_cleaning_up(
+    fixtures_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from asif.pipeline import local
+
+    def interrupted(ctx: object, ram: Path, img: str) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(local, "_describe", interrupted)
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "a.jpg")
+    result = runner.invoke(app, ["caption", str(src), str(tmp_path / "out"), "-m", "stub"])
+    assert result.exit_code == EXIT_INTERRUPTED, result.output
+    assert "stopped" in result.output.lower()

@@ -61,6 +61,8 @@ class ResourcesConfig(_Section):
     """Longest edge sent to the model. The #1 speed lever on CPU (§9.3)."""
     work_dir: str = ""
     """Override for the RAM work dir. Empty means auto-detect a tmpfs."""
+    allow_disk_workdir: bool = False
+    """Work on photos in an on-disk folder when no RAM-backed one exists (weaker)."""
 
     def staging_path(self) -> Path:
         if self.staging_dir:
@@ -77,14 +79,19 @@ class ModelConfig(_Section):
     mmproj: str = ""
     """Path to the vision projector (.gguf) that goes with ``gguf``."""
     llama_server: str = "llama-server"
-    """The ``llama-server`` binary from llama.cpp (name on PATH, or a full path)."""
+    """The ``llama-server`` binary from llama.cpp (name on PATH, or a full path).
+
+    A wrapper script is fine if it ``exec``s llama-server; one that doesn't is
+    refused, because llama-server could then outlive As If."""
     threads: int = Field(0, ge=0)
     """CPU threads for inference. 0 lets llama.cpp decide."""
     gpu_layers: int | None = Field(None, ge=0)
     """Layers to offload to the GPU. None follows ``device``."""
     ctx: int = Field(4096, ge=1024)
     server_args: list[str] = Field(default_factory=list)
-    """Extra arguments for llama-server, for flags this version doesn't know about."""
+    """Extra llama-server options for speed, memory, GPU placement, sampling defaults or
+    logging (the allow-list in ``asif/infer/worker.py``). Anything that would load other
+    files, download, reach another machine, run tools or serve files is refused."""
     load_timeout_s: int = Field(300, ge=5)
     request_timeout_s: int = Field(600, ge=5)
 
@@ -101,6 +108,7 @@ class GuardsConfig(_Section):
     thermal_window_s: int = Field(300, ge=1)
     max_failure_rate: float = Field(0.02, ge=0, le=1)
     require_ac_power: bool = True
+    """Not read yet: the power guard arrives in M7. Until then ``asif doctor`` only warns."""
 
 
 class TelemetryConfig(_Section):

@@ -3,7 +3,7 @@
 **Private, offline AI captions for your photo library.**
 A model on *your* machine describes each photo, and the description and keywords go into the photo's own metadata (XMP), so any photo app can search them. Your photos, and everything said about them, never reach a third party. *As if.*
 
-- 🔒 **Offline by design.** The model runs locally. The main `asif` process can't even open a network socket: it crashes if anything tries.
+- 🔒 **Offline by design.** The model runs locally, in its own process. The main `asif` process has no network code at all, and any Python code in it that tries to open a socket crashes it.
 - 🧾 **Your data stays yours.** It only *adds* to empty fields and never overwrites your own captions or keywords. Everything it adds is labelled, so it can be removed cleanly.
 - 🛡️ **Your pixels stay as they are.** Before any copy is written, As If proves the image data, dates, GPS, orientation, colour profile, previews, and every other byte outside the caption are unchanged.
 
@@ -40,7 +40,7 @@ Your originals in `~/Pictures/test` are only read. The captioned copies go to `~
 
 ### Use a real model
 
-1. Install **llama.cpp** so you have `llama-server` (on macOS: `brew install llama.cpp`; on Linux: a release build from the llama.cpp project, matching your GPU).
+1. Install **llama.cpp** so you have `llama-server` (on macOS: `brew install llama.cpp`; on Linux: a release build from the llama.cpp project, matching your GPU). If you point As If at a wrapper script instead, it must end with `exec llama-server "$@"`.
 2. Ask As If what fits your machine: `uv run asif models recommend`.
 3. Download that model's **`.gguf` weights and its `mmproj` `.gguf`** (the vision part) from Hugging Face. `asif models list` shows the catalogue. Automatic, checksum-verified downloads arrive in M2.
 4. Preview first; `--dry-run` writes nothing:
@@ -82,14 +82,17 @@ Each one is a rule enforced by code and checked by the test suite, not just a pr
 | Motion photos and multi-picture files survive | The data after a JPEG's end marker (motion-photo video, Ultra HDR gain maps) must be byte-identical, or the photo is skipped. |
 | Nothing is clobbered | If the original changes while As If works on it, the photo is skipped. |
 | The copy on disk is the copy that was checked | It's written atomically, then read back and compared. |
-| Plaintext stays in RAM | Photos are worked on in a private RAM folder (tmpfs), overwritten and deleted after each one. |
-| No network in the main process | CI fails if any orchestrator module imports networking code. At runtime an audit hook turns any socket use into a crash. |
-| The model can't be used by other programs | `llama-server` listens on 127.0.0.1 only, behind a random API key passed through the environment (not the command line). |
+| Plaintext stays in RAM | Photos are worked on in a private RAM folder (tmpfs), overwritten and deleted after each one. No RAM folder? As If refuses to start unless you pass `--allow-disk-workdir`. |
+| Stopping is safe | Ctrl+C, `kill`, closing the terminal: the RAM copy is wiped and every helper process stops before As If exits. Core dumps are off, so a crash can't write a photo to disk. If As If is killed outright, the next run wipes what it left in RAM. |
+| Private photos stay private | A copy never gets more permissions than its original effectively had: photos from a `0700` folder are copied into `0700` folders. |
+| No network in the main process | CI fails if orchestrator code imports networking modules (checked by importing all of it and by reading the source). At runtime an audit hook turns any socket use by Python code into a crash. Native code could get around a Python hook; the real wall is the sandbox in M3. |
+| The model can't be used by other programs | `llama-server` listens on 127.0.0.1 only, behind a random API key passed through the environment (not the command line), and the worker checks that the port really is its own server's before sending a photo. |
+| The model can't fetch or send anything | llama-server runs in offline mode, and extra `server_args` must be on an allow-list of speed, memory, GPU and logging options. Anything that downloads, loads other files, opens tunnels, runs tools or serves files is refused. |
 | A bad model answer can't do damage | Output must match a strict JSON schema, and control characters are stripped, so a caption can't smuggle options into exiftool. |
 | Systematic bugs stop the run | More than 2 % failures in the last 200 photos stops everything. |
-| Telemetry stays home | The only log is a local timings file with stage durations. No file names, paths or captions; an allow-list enforces it. |
+| Telemetry stays home | The only log is a local timings file with stage durations. No file names, paths, sizes or captions (an allow-list enforces it), and photos are processed in a random order, so a log line doesn't point at a file. |
 
-**Not yet** (honest list): the model isn't sandboxed yet (M3: no network at all). Nothing is encrypted yet (M4), so the timings log is plain text, though it holds no personal data. There's no cloud sync (M5) and no search (M8). As If assumes your disk is encrypted and your machine is yours: `asif doctor` warns about unencrypted swap and disks.
+**Not yet** (honest list): the model isn't sandboxed yet (M3: no network at all). Nothing is encrypted yet (M4), so the timings log is plain text, though it holds no file names or captions. There's no battery or thermal guard yet (M7): a long run on battery keeps going until the battery is flat. There's no cloud sync (M5) and no search (M8). As If assumes your disk is encrypted and your machine is yours: `asif doctor` warns about unencrypted swap and disks.
 
 ---
 
@@ -100,12 +103,13 @@ asif doctor [--json]              check this machine (read-only)
 asif caption SRC DEST [options]   caption a folder into copies
     -m, --model stub|local|<id>   --gguf FILE --mmproj FILE   --llama-server PATH
     --lang TAG   --compat xmp|wide   --max-edge PX   --dry-run   --limit N
+    --allow-disk-workdir          (weaker) use an on-disk work dir if there's no tmpfs
 asif models list | recommend      the model catalogue; a pick for this machine
 asif config path | show | init    where settings live; what's in effect; a starter file
 asif version
 ```
 
-Exit codes: `0` all good · `1` some photos failed or were quarantined · `2` bad options or setup · `3` run stopped by the failure budget.
+Exit codes: `0` all good · `1` some photos failed or were quarantined (or a folder couldn't be read) · `2` bad options or setup (including a failed `asif doctor` check) · `3` run stopped early (failure budget, full destination, model worker gone) · `130` stopped by Ctrl+C or a signal.
 
 Settings live in `~/.config/asif/config.toml`; `asif config init` writes a commented starter file. Set `ASIF_HOME` to keep everything (config, logs, later the vault) in one folder, such as an encrypted volume.
 
@@ -138,7 +142,7 @@ The full plan is in **[docs/DESIGN.md](docs/DESIGN.md)**, one milestone at a tim
 uv sync                      # Python deps, pinned by uv.lock
 uv run pytest                # all tests (needs exiftool); -m "not slow" skips the 50 MP panorama
 uv run ruff check . && uv run ruff format --check . && uv run mypy
-python tests/fixtures/make_fixtures.py /tmp/fixtures   # look at the synthetic test photos
+uv run python tests/fixtures/make_fixtures.py /tmp/fixtures   # look at the synthetic test photos
 ```
 
 The test photos are generated, never real: `tests/fixtures/make_fixtures.py` draws them with Pillow and tags them with exiftool (EXIF, GPS, rotation, motion-photo trailer, multi-picture, truncated, corrupt...). `tests/fake_llama_server.py` stands in for llama-server, so the whole pipeline is tested without downloading a model.

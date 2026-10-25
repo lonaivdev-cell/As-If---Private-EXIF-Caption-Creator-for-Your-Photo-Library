@@ -250,7 +250,7 @@ def detect_specs(cfg: Config, probe: Probe | None = None) -> Specs:
         cpu_model, logical, physical, flags = _linux_cpu(probe)
         ram_total, ram_available = _linux_memory(probe)
         gpus = _nvidia_gpus(probe) + _amd_gpus(probe)
-        swap = _linux_swap(probe)
+        swap = _linux_swap(probe, is_wsl)
         power = _linux_power(probe, is_wsl)
         # WSL's disk is a file on the Windows side; BitLocker is invisible from here.
         root_encrypted = None if is_wsl else _linux_root_encrypted(probe)
@@ -431,10 +431,17 @@ def _amd_gpus(probe: Probe) -> list[GpuInfo]:
 # Swap and disk encryption both come down to one question: is this block
 # device dm-crypt, or stacked on top of dm-crypt (LVM inside LUKS)?
 
+_ENCRYPTING_DM_UUIDS = tuple(
+    f"CRYPT-{kind}-"
+    for kind in ("LUKS1", "LUKS2", "PLAIN", "LOOPAES", "TCRYPT", "BITLK", "FVAULT2")
+)
+"""libcryptsetup names every device it sets up CRYPT-<type>-..., but VERITY and
+INTEGRITY only check data, they don't encrypt it; those are looked through instead."""
+
 
 def _on_dm_crypt(probe: Probe, devnum: str, depth: int = 0) -> bool:
     base = f"/sys/dev/block/{devnum}"
-    if _read(probe, f"{base}/dm/uuid").startswith("CRYPT-"):
+    if _read(probe, f"{base}/dm/uuid").startswith(_ENCRYPTING_DM_UUIDS):
         return True
     if depth >= 8:  # device stacks are shallow; this only guards against loops
         return False
@@ -481,11 +488,27 @@ def _devnum_of_path(probe: Probe, path: str) -> str | None:
     return _devnum_of_block(probe, source)
 
 
+def _zram_writeback(probe: Probe, name: str) -> str | None:
+    """The disk a zram swap device pages out to; None if it isn't zram or has none."""
+    base = os.path.basename(probe.realpath(name))
+    if not base.startswith("zram"):
+        return None
+    backing = _read(probe, f"/sys/block/{base}/backing_dev")
+    # "none" when unset; the file is missing on kernels without CONFIG_ZRAM_WRITEBACK.
+    return None if backing in ("", "none") else backing
+
+
 def _swap_entry_kind(probe: Probe, name: str, swap_type: str) -> SwapKind:
     if swap_type == "partition":
         if os.path.basename(probe.realpath(name)).startswith("zram"):
-            return "zram"
-        devnum = _devnum_of_block(probe, name)
+            backing = _zram_writeback(probe, name)
+            if backing is None:
+                return "zram"
+            # Writeback pages idle and incompressible memory (photos are JPEG, so
+            # incompressible) out to that disk: zram is then only as safe as it is.
+            devnum = _devnum_of_block(probe, backing)
+        else:
+            devnum = _devnum_of_block(probe, name)
     else:
         # A swap file is as safe as the filesystem it lives on.
         devnum = _devnum_of_path(probe, name)
@@ -494,7 +517,7 @@ def _swap_entry_kind(probe: Probe, name: str, swap_type: str) -> SwapKind:
     return "encrypted" if _on_dm_crypt(probe, devnum) else "plain"
 
 
-def _linux_swap(probe: Probe) -> SwapInfo:
+def _linux_swap(probe: Probe, is_wsl: bool = False) -> SwapInfo:
     text = probe.read_text("/proc/swaps")
     if text is None:
         return SwapInfo("unknown", "couldn't read /proc/swaps")
@@ -504,7 +527,14 @@ def _linux_swap(probe: Probe) -> SwapInfo:
         if len(parts) < 2:
             continue
         name = parts[0].replace("\\040", " ").removesuffix(" (deleted)")
-        entries.append((name, _swap_entry_kind(probe, name, parts[1])))
+        entry_kind = _swap_entry_kind(probe, name, parts[1])
+        if is_wsl and entry_kind == "plain":
+            # WSL's disks (swap.vhdx, ext4.vhdx) are files on the Windows drive, so
+            # they're encrypted exactly when BitLocker is on there: invisible from here.
+            entry_kind = "unknown"
+        if parts[1] == "partition" and (backing := _zram_writeback(probe, name)):
+            name += f" writing back to {backing}"
+        entries.append((name, entry_kind))
     if not entries:
         return SwapInfo("none", "no swap configured")
     kinds = {kind for _, kind in entries}
@@ -660,12 +690,20 @@ def find_dependencies(cfg: Config, probe: Probe | None = None) -> list[Dependenc
         if path is not None and version_args is not None:
             out = probe.run([path, *version_args], timeout=10.0)
             if out is not None:
-                version = _first_line(out[1])
+                version = _version_line(out[1])
         deps.append(Dependency(name, path is not None, path, version, required, purpose))
     return deps
 
 
-def _first_line(text: str) -> str | None:
+def _version_line(text: str) -> str | None:
+    """The "version: ..." line if there is one, else the first line.
+
+    llama.cpp release builds log "load_backend: ..." and GPU init lines before
+    their version; the other tools print the version first.
+    """
+    for line in text.splitlines():
+        if line.strip().lower().startswith("version:"):
+            return line.strip()[:80]
     for line in text.splitlines():
         if line.strip():
             return line.strip()[:80]
@@ -798,22 +836,38 @@ def _encryption_check(specs: Specs) -> Check:
 
 _SWAP_HINT = (
     "Photos held in RAM could be paged out to disk unencrypted. Switch to zram "
-    "(e.g. the zram-generator or zram-tools package) or put swap inside LUKS. "
-    "As a stopgap, `sudo swapoff -a` turns swap off until the next reboot."
+    "(e.g. the zram-generator or zram-tools package) without a writeback device, or put "
+    "swap inside LUKS. As a stopgap, `sudo swapoff -a` turns swap off until the next reboot."
 )
 
 
-def _swap_check(swap: SwapInfo) -> Check:
+def _swap_check(swap: SwapInfo, is_wsl: bool = False) -> Check:
     if swap.kind == "none":
         return Check("Swap", "ok", "No swap, so memory is never written to disk.", "")
     if swap.kind == "zram":
-        return Check("Swap", "ok", "Swap is zram (compressed RAM); it never touches a disk.", "")
+        return Check(
+            "Swap",
+            "ok",
+            "Swap is zram (compressed RAM) with no writeback device; it never touches a disk.",
+            "",
+        )
     if swap.kind == "encrypted":
         return Check("Swap", "ok", f"Swap is encrypted ({swap.detail}).", "")
     if swap.kind == "plain":
         return Check("Swap", "warn", f"Swap isn't encrypted ({swap.detail}).", _SWAP_HINT)
     if swap.kind == "mixed":
         return Check("Swap", "warn", f"Some swap isn't encrypted ({swap.detail}).", _SWAP_HINT)
+    if is_wsl:
+        # WSL attaches swap itself (not via fstab), so the Linux advice above doesn't apply.
+        return Check(
+            "Swap",
+            "info",
+            f"Swap is a disk file on Windows ({swap.detail}); it's encrypted only if "
+            "BitLocker or Device Encryption is on for that drive.",
+            "Turn on BitLocker or Device Encryption (Windows Settings > Privacy & security), "
+            "or turn WSL's swap off: add `swap=0` under `[wsl2]` in %UserProfile%\\.wslconfig, "
+            "then run `wsl --shutdown` from Windows.",
+        )
     return Check(
         "Swap",
         "info",
@@ -858,27 +912,29 @@ def _disk_check(specs: Specs) -> Check:
         )
     free = _gb(specs.disk_free_mb)
     if specs.disk_free_mb < LOW_DISK_MB:
+        # Only "info" until cloud sync (M5) puts something there: nothing to fix today.
         return Check(
             "Staging disk",
-            "warn",
+            "info",
             f"Only {free} free for the staging folder ({where}).",
-            "Downloaded photos wait there (encrypted) before captioning. Free up space, or "
-            "set staging_dir under [resources] to a folder on a drive with 10 GB or more free.",
+            "Nothing uses this folder yet. From M5, photos downloaded from your cloud will "
+            "wait there, encrypted, before captioning; by then that drive needs about 10 GB "
+            "free, or set staging_dir under [resources] to a folder on a drive that has it.",
         )
     return Check("Staging disk", "ok", f"{free} free for the staging folder ({where}).", "")
 
 
-def _power_check(cfg: Config, power: PowerInfo) -> Check:
+def _power_check(power: PowerInfo) -> Check:
     if power.on_ac is False:
-        if cfg.guards.require_ac_power:
-            return Check(
-                "Power",
-                "warn",
-                "Running on battery, and As If is set to need mains power for long runs.",
-                "Plug in the charger. To allow battery runs anyway, set "
-                "require_ac_power = false under [guards].",
-            )
-        return Check("Power", "info", "Running on battery; a long run will drain it.", "Plug in.")
+        # Nothing reads [guards] require_ac_power before the M7 guards, so don't point
+        # at it, and don't suggest a run would stop: it won't.
+        return Check(
+            "Power",
+            "warn",
+            "Running on battery. As If doesn't stop on battery yet (that guard comes in M7), "
+            "so a long run will drain it.",
+            "Plug in the charger before a long run.",
+        )
     if power.on_ac:
         return Check("Power", "ok", "Plugged in." if power.has_battery else "On mains power.", "")
     return Check(
@@ -905,10 +961,10 @@ def _checks(cfg: Config, specs: Specs, deps: list[Dependency], probe: Probe) -> 
         _exiftool_check(probe, by_name["exiftool"]),
         _llama_check(cfg, by_name["llama-server"]),
         _encryption_check(specs),
-        _swap_check(specs.swap),
+        _swap_check(specs.swap, specs.is_wsl),
         _ram_dir_check(specs),
         _disk_check(specs),
-        _power_check(cfg, specs.power),
+        _power_check(specs.power),
     ]
     if specs.is_wsl:
         checks.append(_wsl_check())
@@ -925,19 +981,9 @@ def run_doctor(cfg: Config, probe: Probe | None = None) -> DoctorReport:
     deps = find_dependencies(cfg, probe)
     checks = _checks(cfg, specs, deps, probe)
 
-    vram_mb = max(
-        (g.vram_total_mb for g in specs.gpus if g.vendor != "apple" and g.vram_total_mb),
-        default=None,
-    )
     recommendation = None
     try:
-        recommendation = recommend(
-            ram_total_gb=(specs.ram_total_mb or 0) / 1024,
-            vram_gb=vram_mb / 1024 if vram_mb else None,
-            apple_silicon=specs.apple_silicon,
-            unified_memory_gb=specs.unified_memory_mb / 1024 if specs.unified_memory_mb else None,
-            lang=cfg.general.caption_lang,
-        )
+        recommendation = recommend_for(specs, cfg.general.caption_lang)
     except ValueError as exc:
         checks.append(
             Check(
@@ -949,6 +995,24 @@ def run_doctor(cfg: Config, probe: Probe | None = None) -> DoctorReport:
             )
         )
     return DoctorReport(specs, deps, checks, recommendation)
+
+
+def recommend_for(specs: Specs, lang: str) -> Recommendation:
+    """``recommend()`` for detected specs, as `asif doctor` and `asif models recommend` show it.
+
+    Raises ``ValueError`` like ``recommend()`` when no model lists ``lang``.
+    """
+    gpus = [g for g in specs.gpus if g.vendor != "apple"]  # Apple goes by unified memory
+    vram_mb = max((g.vram_total_mb for g in gpus if g.vram_total_mb), default=None)
+    return recommend(
+        ram_total_gb=(specs.ram_total_mb or 0) / 1024,
+        vram_gb=vram_mb / 1024 if vram_mb else None,
+        apple_silicon=specs.apple_silicon,
+        unified_memory_gb=specs.unified_memory_mb / 1024 if specs.unified_memory_mb else None,
+        lang=lang,
+        # A GPU whose VRAM nvidia-smi can't read ([N/A] on unified-memory parts) is still there.
+        gpu_detected=bool(gpus),
+    )
 
 
 def report_to_dict(report: DoctorReport) -> dict[str, Any]:

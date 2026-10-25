@@ -3,22 +3,39 @@
 On Linux this is a private directory on a tmpfs (``$XDG_RUNTIME_DIR`` first,
 it's per-user; then ``/dev/shm``). Files there never touch a disk, so they
 can't end up in snapshots or backups, and they vanish on power loss. If no
-tmpfs is available (macOS before the RAM-disk support in M10), As If falls
-back to an on-disk temp dir and says so.
+tmpfs is available (macOS before the RAM-disk support in M10), As If refuses
+to work unless you explicitly allow an on-disk work dir.
+
+Each run holds a lock on its own work dir. A run that was killed outright
+(SIGKILL, power loss on an on-disk dir) can't wipe its leftovers itself, so
+the next run wipes every work dir whose lock nobody holds any more.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
+import re
 import secrets
 import shutil
+import stat
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
 _RAM_FSTYPES = frozenset({"tmpfs", "ramfs"})
+_DIR_NAME = re.compile(r"asif-[0-9a-f]{12}")
+_LOCK = ".lock"
+# A work dir without a lock file is either being created right now or was
+# left by a run that died between mkdir and taking the lock.
+_UNLOCKED_GRACE_S = 600
+
+
+class NotInRamError(RuntimeError):
+    """The work dir would be on disk and that wasn't explicitly allowed."""
 
 
 @dataclass(frozen=True)
@@ -46,7 +63,9 @@ def _mount_fstype(path: Path, mounts_file: Path = Path("/proc/mounts")) -> str |
         mount_point = Path(parts[1].replace("\\040", " "))
         if target == mount_point or mount_point in target.parents:
             depth = len(mount_point.parts)
-            if best is None or depth > best[0]:
+            # ">=": when several filesystems are mounted on the same path, the
+            # one listed last is on top and is the one files actually land on.
+            if best is None or depth >= best[0]:
                 best = (depth, parts[2])
     return best[1] if best else None
 
@@ -101,18 +120,81 @@ def wipe_file(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-class RamWorkDir:
-    """A private (0700) directory in RAM, wiped on exit."""
+def _wipe_tree(path: Path) -> None:
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            wipe_file(Path(root) / name)
+    shutil.rmtree(path, ignore_errors=True)
 
-    def __init__(self, override: str = "") -> None:
+
+def sweep_stale(parent: Path) -> int:
+    """Wipe this user's work dirs left by runs that are gone. Returns how many.
+
+    A live run holds an exclusive lock on its dir's lock file, so taking the
+    lock proves nobody is using the dir; another ``asif`` running at the
+    same time is never touched.
+    """
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return 0
+    removed = 0
+    for entry in entries:
+        if not _DIR_NAME.fullmatch(entry.name):
+            continue
+        try:
+            st = entry.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            continue
+        try:
+            fd: int | None = os.open(entry / _LOCK, os.O_RDWR | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if time.time() - st.st_mtime < _UNLOCKED_GRACE_S:
+                continue
+            fd = None
+        except OSError:
+            continue
+        try:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue  # a live run
+            _wipe_tree(entry)
+            removed += 1
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return removed
+
+
+class RamWorkDir:
+    """A private (0700) directory in RAM, locked while in use and wiped on exit."""
+
+    def __init__(self, override: str = "", *, allow_disk: bool = False) -> None:
         self.choice = find_ram_dir(override)
+        self.allow_disk = allow_disk
         self.path: Path | None = None
+        self.swept = 0
+        """How many dead runs' leftovers were wiped on entry."""
+        self._lock_fd: int | None = None
 
     def __enter__(self) -> RamWorkDir:
+        if not self.choice.in_ram and not self.allow_disk:
+            raise NotInRamError(
+                f"no RAM-backed folder for the work dir ({self.choice.reason}), so photos "
+                "would be written to disk while they're processed"
+            )
         parent = self.choice.path
         parent.mkdir(parents=True, exist_ok=True)
+        self.swept = sweep_stale(parent)
         path = parent / f"asif-{secrets.token_hex(6)}"
         path.mkdir(mode=0o700)
+        fd = os.open(path / _LOCK, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self._lock_fd = fd
         self.path = path
         return self
 
@@ -133,8 +215,10 @@ class RamWorkDir:
     ) -> None:
         if self.path is None:
             return
-        for child in self.path.iterdir():
-            if child.is_file():
-                wipe_file(child)
-        shutil.rmtree(self.path, ignore_errors=True)
-        self.path = None
+        try:
+            _wipe_tree(self.path)
+        finally:
+            self.path = None
+            if self._lock_fd is not None:
+                os.close(self._lock_fd)
+                self._lock_fd = None

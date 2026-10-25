@@ -1,8 +1,11 @@
 """The minimal timings log (M1). Replaced by the encrypted telemetry store in M9.
 
 One JSON object per line, in the shape of §14 of docs/DESIGN.md. It never
-contains file names, paths, captions or keywords: an image is only ever a
-per-run counter (``i_000123``), and nothing maps that back to a file.
+contains file names, paths, sizes, captions or keywords: an image is only
+ever a per-run counter (``i_000123``) over a randomly shuffled processing
+order, and nothing records which file got which number. Durations and
+outcomes could still loosely correlate with a file someone already knows
+about; the encrypted telemetry store (M9) replaces this log.
 """
 
 from __future__ import annotations
@@ -19,9 +22,7 @@ from typing import Any
 
 # Keys an event may carry. Anything else is dropped, so a careless caller
 # can't leak a path into the log by passing it as an extra field.
-_ALLOWED = frozenset(
-    {"ts", "run", "img", "stage", "ms", "ok", "model", "error", "state", "bytes", "n"}
-)
+_ALLOWED = frozenset({"ts", "run", "img", "stage", "ms", "ok", "model", "error", "state", "n"})
 
 
 def new_run_id() -> str:

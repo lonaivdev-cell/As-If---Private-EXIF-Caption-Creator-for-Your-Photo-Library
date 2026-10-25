@@ -3,7 +3,9 @@
 # weights_gb    the 4-bit (Q4) GGUF, as §9.2 gives it
 # projector_gb  the vision projector, where §9.2 gives it separately (else 0.0)
 # min_vram_gb   VRAM from which this is the GPU pick (§10); absent = not a GPU-tier model
-# min_ram_gb    RAM from which this is the CPU pick (§10)
+# min_ram_gb    RAM from which this is the CPU pick (§10), as the OS reports it: Linux
+#               always reports less than is installed, so these sit below the nominal
+#               size (7 for an "8 GB" machine, 12 for "16 GB", 28 for "32 GB", 44 for "48 GB")
 # languages     primary language subtags, or ["*"] for multilingual
 #
 # Nothing is pinned yet. `revision`, file names and `sha256` stay empty until
@@ -19,7 +21,7 @@ arch         = "dense"
 params       = "1.3B (SigLIP2-400M encoder + Qwen3.5-0.8B)"
 weights_gb   = 1.6
 projector_gb = 0.0                  # not given separately in §9.2; measured when pinning (M2)
-min_ram_gb   = 8.0                  # "any 8 GB machine, CPU"
+min_ram_gb   = 7.0                  # "any 8 GB machine, CPU", as Linux reports it (~7.6)
 languages    = ["en", "zh"]         # the only listed languages
 licence      = "Apache-2.0"
 repo         = "ggml-org/MiniCPM-V-4.6-GGUF"
@@ -39,7 +41,7 @@ arch         = "dense"
 params       = "2.3B effective"
 weights_gb   = 3.1
 projector_gb = 0.0                  # not given separately in §9.2; measured when pinning (M2)
-min_ram_gb   = 8.0                  # "8 GB RAM, CPU"
+min_ram_gb   = 7.0                  # "8 GB RAM, CPU", as Linux reports it (~7.6)
 languages    = ["*"]
 licence      = "Apache-2.0"
 repo         = ""                   # not named in the design; chosen when pinning (M2)
@@ -121,7 +123,7 @@ arch         = "moe"
 params       = "35B total / 3B active"
 weights_gb   = 20.0
 projector_gb = 0.86
-min_ram_gb   = 48.0                 # "48 GB+ RAM comfortable; 32 GB tight"
+min_ram_gb   = 44.0                 # "48 GB+ RAM comfortable; 32 GB tight"; Linux reports ~47
 languages    = ["*"]
 licence      = "Apache-2.0"
 repo         = ""                   # not named in the design; chosen when pinning (M2)

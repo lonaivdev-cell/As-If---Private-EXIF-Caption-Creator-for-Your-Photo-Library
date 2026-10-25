@@ -2,8 +2,9 @@
 
 It takes llama-server's command line (``-m``, ``--mmproj``, ``--host``,
 ``--port``, ``-c``, ``-np``, ``-t``, ``-ngl``; unknown extras are accepted),
-refuses a non-loopback ``--host`` and any ``--api-key`` on the command line,
-and serves ``GET /health`` (503 "Loading model" for the first
+refuses a non-loopback ``--host``, any ``--api-key`` on the command line and
+a start without offline mode (``LLAMA_ARG_OFFLINE=1``), and serves
+``GET /health`` (503 "Loading model" for the first
 ``FAKE_LLAMA_LOADING_POLLS`` polls, default 2, then 200) and
 ``POST /v1/chat/completions`` in OpenAI format.
 
@@ -415,6 +416,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if os.environ["LLAMA_API_KEY"] != os.environ["LLAMA_ARG_API_KEY"]:
         print("error: fake llama-server: LLAMA_API_KEY != LLAMA_ARG_API_KEY", flush=True)
+        return 2
+    if os.environ.get("LLAMA_ARG_OFFLINE") != "1":  # what --offline reads
+        print("error: fake llama-server: not in offline mode", flush=True)
         return 2
 
     mode = pick_mode(args.model)

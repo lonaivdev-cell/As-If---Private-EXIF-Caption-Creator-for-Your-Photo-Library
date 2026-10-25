@@ -177,14 +177,28 @@ def test_captions_become_one_safe_line() -> None:
     assert "\n" not in result.caption and "\r" not in result.caption
 
 
-def test_overlong_text_never_exceeds_the_limits() -> None:
-    try:
-        result = parse(caption="word " * 100, keywords=["k" * 100, "b", "c"])
-    except SchemaError:
-        return  # rejecting is fine too; what matters is that nothing too long gets through
+def test_text_that_only_cleaning_makes_too_long_is_cut_to_the_limit() -> None:
+    # 240 raw characters pass the wire check; NFC and whitespace cleaning can
+    # only shorten them, so the result is within the limits and trimmed.
+    result = parse(caption=" " + "word " * 47 + "end", keywords=["k" * 40, "b", "c"])
     assert len(result.caption) <= CAPTION_MAX
     assert all(len(k) <= KEYWORD_MAX for k in result.keywords)
     assert result.caption == result.caption.strip()
+    assert result.caption.endswith("end")
+
+
+def test_constructing_directly_cuts_overlong_text() -> None:
+    # Callers that build a CaptionResult themselves (not from the model) get
+    # cleaned, cut text rather than an error.
+    result = CaptionResult(
+        caption="word " * 100,
+        keywords=("k" * 100, "b", "c"),
+        has_text=False,
+        people_count=0,
+        setting="unclear",
+    )
+    assert len(result.caption) <= CAPTION_MAX
+    assert all(len(k) <= KEYWORD_MAX for k in result.keywords)
 
 
 def test_keywords_are_cleaned_and_deduplicated_keeping_the_first_spelling() -> None:

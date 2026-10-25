@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import selectors
 import subprocess
 import time
@@ -20,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 from typing import Any
+
+from asif.proc import die_with_parent
 
 NS_CONFIG = Path(__file__).with_name("asif_ns.config")
 
@@ -46,7 +49,17 @@ def check_arg(arg: str) -> str:
     """Refuse arguments that could break exiftool's one-per-line protocol."""
     if any(ch in arg for ch in _FORBIDDEN_IN_ARGS):
         raise ValueError("exiftool argument contains a line break or NUL; refusing to send it")
+    try:
+        _encode(arg)
+    except UnicodeEncodeError as exc:
+        raise ValueError("exiftool argument isn't valid text; refusing to send it") from exc
     return arg
+
+
+def _encode(text: str) -> bytes:
+    # surrogateescape turns a non-UTF-8 file name (which Python decodes into
+    # U+DC80..U+DCFF) back into its original bytes, which is what exiftool needs.
+    return text.encode("utf-8", "surrogateescape")
 
 
 class ExifTool:
@@ -61,7 +74,6 @@ class ExifTool:
         self.config = config
         self.timeout_s = timeout_s
         self._proc: subprocess.Popen[bytes] | None = None
-        self._counter = 0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -78,10 +90,18 @@ class ExifTool:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                # exiftool -stay_open never exits on its own, even when its
+                # stdin closes: make sure it dies with us, even on SIGKILL.
+                preexec_fn=die_with_parent(),
             )
         except FileNotFoundError as exc:
             raise ExifToolError(
                 f"exiftool not found ({self.executable!r}); run `asif doctor`"
+            ) from exc
+        except OSError as exc:
+            raise ExifToolError(
+                f"exiftool can't be started ({self.executable!r}: {exc.strerror}); "
+                "run `asif doctor`"
             ) from exc
 
     @property
@@ -128,10 +148,12 @@ class ExifTool:
         proc = self._proc
         assert proc is not None and proc.stdin and proc.stdout and proc.stderr
 
-        self._counter += 1
-        marker = f"{{ready{self._counter}}}"
-        lines = [*args, *COMMON_ARGS, "-echo4", marker, f"-execute{self._counter}"]
-        payload = ("\n".join(lines) + "\n").encode("utf-8")
+        # An unguessable id: a tag value that happens to contain "{ready7}"
+        # could otherwise end the read early and desync every later reply.
+        cmd_id = secrets.randbelow(10**15) + 1
+        marker = f"{{ready{cmd_id}}}"
+        lines = [*args, *COMMON_ARGS, "-echo4", marker, f"-execute{cmd_id}"]
+        payload = _encode("\n".join(lines) + "\n")
         try:
             proc.stdin.write(payload)
             proc.stdin.flush()
@@ -196,8 +218,15 @@ class ExifTool:
         text = result.stdout.strip()
         if not text:
             return []
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            # The reply is out of step with what we asked; nothing after it can
+            # be trusted, so start a fresh process for the next command.
+            self._kill()
+            raise ExifToolError("exiftool's JSON output couldn't be parsed") from exc
         if not isinstance(data, list):
+            self._kill()
             raise ExifToolError("unexpected JSON from exiftool")
         return data
 

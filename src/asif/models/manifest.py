@@ -52,6 +52,7 @@ class ModelEntry:
     min_vram_gb: float | None
     """VRAM from which this model is the GPU pick; None = not a GPU-tier model."""
     min_ram_gb: float
+    """RAM from which this is the CPU pick, as the OS reports it (below the nominal size)."""
     languages: tuple[str, ...]
     """Primary language subtags ("en", "zh"), or ``("*",)`` for multilingual."""
     licence: str

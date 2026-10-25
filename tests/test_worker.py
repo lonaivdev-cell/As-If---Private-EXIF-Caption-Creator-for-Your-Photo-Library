@@ -11,6 +11,8 @@ import http.client
 import json
 import os
 import queue
+import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -36,6 +38,8 @@ from tests.fake_llama_server import FakeLlama, process_gone
 
 DECODABLE = sorted(n for n, e in FIXTURE_EXPECT.items() if e == "ok" and n != "panorama.jpg")
 WORKER = [sys.executable, "-I", "-m", "asif.infer.worker"]
+FAKE_SCRIPT = Path(__file__).resolve().with_name("fake_llama_server.py")
+OUR_LLAMA_ENV = ["LLAMA_API_KEY", "LLAMA_ARG_API_KEY", "LLAMA_ARG_OFFLINE"]
 linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
 
 
@@ -362,7 +366,7 @@ def test_llama_happy_path(spawn: Callable[..., Proc], fake: FakeLlama, fixtures_
     assert flag_value(argv, "-np") == "1"
     assert "-t" not in argv and "-ngl" not in argv  # threads 0 / gpu_layers None: llama decides
     assert not any("api-key" in arg for arg in argv)  # the key travels in the environment
-    assert start["llama_env"] == ["LLAMA_API_KEY", "LLAMA_ARG_API_KEY"]
+    assert start["llama_env"] == OUR_LLAMA_ENV  # the fake also insists on offline mode
 
     [request] = fake.records("request")
     assert request["problems"] == []
@@ -508,7 +512,13 @@ def test_missing_model_files_are_fatal(
         ("-hf", "someone/some-model"),
         ("-m", "/somewhere/else.gguf"),
         ("--mmproj=/somewhere/else.gguf",),
+        ("-mm", "/somewhere/else.gguf"),
         ("--model-url", "https://example.com/m.gguf"),
+        ("--hf_repo", "someone/some-model"),
+        ("-dr", "gemma3"),
+        ("--rpc", "10.0.0.2:50052"),
+        ("--connect",),
+        ("--tools", "all"),
     ],
 )
 def test_server_args_cant_undo_the_isolation(
@@ -522,6 +532,101 @@ def test_server_args_cant_undo_the_isolation(
     assert fake.records() == []  # llama-server never ran
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        # another model, projector or adapter than the ones As If chose and hashed
+        ("--model=/x.gguf",),
+        ("--mmproj_url", "https://example.com/p.gguf"),
+        ("-mmu", "https://example.com/p.gguf"),
+        ("--no-mmproj",),
+        ("-md", "/x.gguf"),
+        ("--spec-draft-model", "/x.gguf"),
+        ("--lora", "/x.gguf"),
+        ("--control-vector", "/x.gguf"),
+        ("--override-kv", "general.name=str:x"),
+        ("--models-dir", "/models"),
+        # downloads
+        ("-hf", "o/m"),
+        ("-hfr", "o/m"),
+        ("-hff", "m.gguf"),
+        ("-hft", "hf_token"),
+        ("-hfd", "o/d"),
+        ("-hfrd", "o/d"),
+        ("--hf-repo-draft", "o/d"),
+        ("--spec-draft-hf", "o/d"),
+        ("-mu", "https://example.com/m.gguf"),
+        ("--docker-repo", "gemma3"),
+        ("--vision-gemma-4b-default",),
+        ("--gpt-oss-20b-default",),
+        # other machines, tools, files
+        ("--rpc", "10.0.0.2:50052"),
+        ("--connect-code", "x" * 40),
+        ("-ag",),
+        ("--agent",),
+        ("--tools-runtime", "ssh:me@elsewhere"),
+        ("--mcp-servers-json", "{}"),
+        ("--webui-mcp-proxy",),
+        ("--path", "/"),
+        ("--media-path", "/"),
+        ("--video-ffmpeg-dir", "/tmp"),
+        # where it listens, and with which key
+        ("--host", "0.0.0.0"),
+        ("--reuse-port",),
+        ("--api_key", "k"),
+        ("--api-key-file", "/k"),
+        ("--ssl-key-file", "/k"),
+        ("--api-prefix", "/x"),
+        # prompts (photos included) written to disk
+        ("--log-file", "/tmp/llama.log"),
+        ("--log-prompts-dir", "/tmp"),
+        ("--slot-save-path", "/tmp"),
+        ("-lcd", "/tmp/cache"),
+        # an option As If doesn't know yet, or one hidden among allowed ones
+        ("--some-future-option",),
+        ("--flash-attn", "on", "--rpc", "10.0.0.2:50052"),
+    ],
+)
+def test_server_args_allow_only_known_safe_options(args: tuple[str, ...]) -> None:
+    with pytest.raises(worker._Fatal) as info:
+        worker._check_server_args(args)
+    assert info.value.kind == "bad_config"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--flash-attn", "on"),
+        ("-fa",),
+        ("--no-mmap", "--mlock"),
+        ("-lm", "mmap+mlock"),
+        ("-ctk", "q8_0", "-ctv", "q8_0"),
+        ("--n_gpu_layers", "99"),  # llama.cpp reads _ as - in -- options
+        ("-ot", r"\.ffn_.*_exps\.=CPU"),
+        ("--cpu-moe", "--n-cpu-moe", "10"),
+        ("--prio", "-1", "--reasoning-budget", "-1"),  # negative numbers are values
+        ("-v",),
+        ("-lv", "5"),
+        ("--jinja", "--chat-template", "chatml"),
+        ("--temp", "1.0", "--top-k", "64", "--top-p", "0.95", "--min-p", "0.0"),
+        ("--image-max-tokens", "1024", "--no-mmproj-offload"),
+        ("--offline", "--no-webui"),
+    ],
+)
+def test_server_args_take_speed_memory_and_logging_options(args: tuple[str, ...]) -> None:
+    worker._check_server_args(args)
+
+
+@pytest.mark.parametrize(
+    "args", [("--api-key=hunter2",), ("--api-key hunter2",), ("--hf-token", "hunter2")]
+)
+def test_a_refused_option_is_named_but_its_value_never_shown(args: tuple[str, ...]) -> None:
+    with pytest.raises(worker._Fatal) as info:
+        worker._check_server_args(args)
+    assert "hunter2" not in info.value.detail
+    assert args[0][:8] in info.value.detail
+
+
 def test_llama_arg_environment_variables_are_not_passed_on(
     spawn: Callable[..., Proc], fake: FakeLlama, fixtures_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -529,9 +634,10 @@ def test_llama_arg_environment_variables_are_not_passed_on(
     monkeypatch.setenv("LLAMA_ARG_HF_REPO", "someone/some-model")
     monkeypatch.setenv("LLAMA_API_KEY", "a-key-someone-else-knows")
     monkeypatch.setenv("LLAMA_ARG_API_KEY", "a-key-someone-else-knows")
-    proc = started(spawn, llama_config(fake))
+    monkeypatch.setenv("LLAMA_ARG_OFFLINE", "0")
+    proc = started(spawn, llama_config(fake))  # the fake refuses to start if not offline
     assert proc.ask(fixtures_dir / "plain.jpg")["ok"] is True  # authorised with *our* key
-    assert fake.records("start")[0]["llama_env"] == ["LLAMA_API_KEY", "LLAMA_ARG_API_KEY"]
+    assert fake.records("start")[0]["llama_env"] == OUR_LLAMA_ENV
 
 
 def test_llama_server_dying_mid_run_is_fatal(
@@ -562,7 +668,7 @@ def test_a_chatty_llama_server_cant_block_the_worker(
 
 
 @linux_only
-@pytest.mark.parametrize("how", ["shutdown", "eof", "sigterm", "sigkill"])
+@pytest.mark.parametrize("how", ["shutdown", "eof", "sigterm", "sighup", "sigquit", "sigkill"])
 def test_llama_server_never_outlives_the_worker(
     spawn: Callable[..., Proc], fake: FakeLlama, fixtures_dir: Path, how: str
 ) -> None:
@@ -575,13 +681,66 @@ def test_llama_server_never_outlives_the_worker(
     elif how == "eof":
         assert proc.p.stdin is not None
         proc.p.stdin.close()
-    elif how == "sigterm":
-        proc.p.send_signal(signal.SIGTERM)
-    else:  # no cleanup code runs at all: PR_SET_PDEATHSIG does the work
+    elif how == "sigkill":  # no cleanup code runs at all: PR_SET_PDEATHSIG does the work
         proc.p.kill()
+    else:  # llama-server has its own session: a closed terminal or Ctrl+\ can't reach it
+        proc.p.send_signal(getattr(signal, how.upper()))
     code = proc.wait()
-    assert code == {"shutdown": 0, "eof": 0, "sigterm": 128 + 15, "sigkill": -9}[how]
+    # 130: the signal unwound into the cleanup code, rather than ending the worker on the spot.
+    assert code == {"shutdown": 0, "eof": 0, "sigkill": -9}.get(how, 130)
     assert wait_until(lambda: process_gone(pid)), f"llama-server ({pid}) outlived the worker"
+
+
+@linux_only
+def test_a_wrapper_script_without_exec_is_refused_and_stopped(
+    spawn: Callable[..., Proc], fake: FakeLlama, tmp_path: Path
+) -> None:
+    # A common way to set GPU variables. Without exec, the death signal and
+    # the port check reach only the shell, never llama-server itself.
+    wrapper = tmp_path / "llama-server-wrapper"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "export CUDA_VISIBLE_DEVICES=0\n"
+        f'{shlex.quote(sys.executable)} {shlex.quote(str(FAKE_SCRIPT))} "$@"\n'
+        "exit $?\n"
+    )
+    wrapper.chmod(0o755)
+    proc = spawn()
+    proc.send(llama_config(fake, llama_server=str(wrapper)))
+    msg = proc.recv()
+    assert (msg["type"], msg["error"]) == ("fatal", "bad_config")
+    assert "without exec" in msg["detail"]
+    assert proc.wait() == 1
+    [pid] = fake.pids()
+    assert wait_until(lambda: process_gone(pid)), f"llama-server ({pid}) outlived the worker"
+
+
+def _core_limit(pid: int) -> tuple[str, str]:
+    for line in Path(f"/proc/{pid}/limits").read_text().splitlines():
+        if line.startswith("Max core file size"):
+            soft, hard = line.split()[4:6]
+            return soft, hard
+    raise AssertionError(f"no core file limit for {pid}")
+
+
+@linux_only
+def test_neither_the_worker_nor_llama_server_can_dump_core(
+    spawn: Callable[..., Proc], fake: FakeLlama
+) -> None:
+    # Started the way a shell that allows core dumps would start it.
+    code = (
+        "import resource\n"
+        "_, hard = resource.getrlimit(resource.RLIMIT_CORE)\n"
+        "resource.setrlimit(resource.RLIMIT_CORE, (hard, hard))\n"
+        "from asif.infer import worker\n"
+        "raise SystemExit(worker.main())\n"
+    )
+    proc = spawn([sys.executable, "-c", code])
+    proc.send(llama_config(fake))
+    assert proc.recv()["type"] == "ready"
+    [pid] = fake.pids()
+    assert _core_limit(proc.p.pid) == ("0", "0")
+    assert _core_limit(pid) == ("0", "0")  # inherited, and it can't raise it again
 
 
 # -- nobody else gets the photos ------------------------------------------------------
@@ -720,6 +879,39 @@ def test_log_tail_is_bounded_and_hides_image_data() -> None:
     assert all(len(line) <= 500 for line in lines)
 
 
+def _log_tail_of(data: bytes) -> str:
+    tail = worker._LogTail()
+    read, write = os.pipe()
+    tail.follow(os.fdopen(read, "rb"))  # reading first: data larger than a pipe would block
+    with os.fdopen(write, "wb") as w:
+        w.write(data)
+    tail.join(5)
+    return tail.tail()
+
+
+_BASE64_RUN = re.compile(r"[A-Za-z0-9+/]{50,}")
+_AFTER = b"".join(b"line %d\n" % i for i in range(16))
+
+
+def test_log_tail_hides_all_of_a_long_line_with_image_data() -> None:
+    # A verbose llama-server logs each request body, photo and all, on one line:
+    # far longer than one read, so it arrives in many chunks.
+    photo = base64.b64encode(os.urandom(240_000))
+    body = b'{"messages": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'
+    shown = _log_tail_of(b"srv  log_server_r: request:  " + body + photo + b'"}}]}\n' + _AFTER)
+    assert _BASE64_RUN.search(shown) is None
+    lines = shown.splitlines()
+    assert lines == ["[line hidden: it contained image data]"] + [f"line {i}" for i in range(16)]
+
+
+def test_log_tail_hides_image_data_whose_marker_straddles_two_reads() -> None:
+    head = (b"srv  log_server_r: request:  " + b'{"a": 1, ' * 500)[: 4096 - len(b"data:ima")]
+    photo = base64.b64encode(os.urandom(30_000))
+    shown = _log_tail_of(head + b"data:image/jpeg;base64," + photo + b'"}\n' + _AFTER)
+    assert _BASE64_RUN.search(shown) is None
+    assert shown.splitlines()[-16:] == [f"line {i}" for i in range(16)]
+
+
 # -- the fake itself must be strict, or the tests above prove little ------------------
 
 
@@ -735,7 +927,7 @@ def fake_server(fake: FakeLlama, monkeypatch: pytest.MonkeyPatch) -> Iterator[tu
     key = "test-key-123"
     port = _free_port()
     model, mmproj = fake.model_files()
-    env = {**os.environ, "LLAMA_API_KEY": key, "LLAMA_ARG_API_KEY": key}
+    env = {**os.environ, "LLAMA_API_KEY": key, "LLAMA_ARG_API_KEY": key, "LLAMA_ARG_OFFLINE": "1"}
     argv = [str(fake.binary), "-m", str(model), "--mmproj", str(mmproj), "--port", str(port)]
     server = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -817,11 +1009,20 @@ def test_fake_checks_key_image_and_schema(
 
 
 @pytest.mark.parametrize(
-    "extra", [["--host", "0.0.0.0"], ["--host", "192.168.1.10"], ["--api-key", "k"]]
+    ("extra", "offline"),
+    [
+        (["--host", "0.0.0.0"], "1"),
+        (["--host", "192.168.1.10"], "1"),
+        (["--api-key", "k"], "1"),
+        ([], "0"),
+    ],
 )
-def test_fake_refuses_exposed_hosts_and_argv_keys(fake: FakeLlama, extra: list[str]) -> None:
+def test_fake_refuses_exposed_hosts_argv_keys_and_online_mode(
+    fake: FakeLlama, extra: list[str], offline: str
+) -> None:
     model, mmproj = fake.model_files()
     env = {**os.environ, "LLAMA_API_KEY": "k", "LLAMA_ARG_API_KEY": "k"}
+    env["LLAMA_ARG_OFFLINE"] = offline
     argv = [str(fake.binary), "-m", str(model), "--mmproj", str(mmproj), *extra]
     proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
     assert proc.returncode == 2
