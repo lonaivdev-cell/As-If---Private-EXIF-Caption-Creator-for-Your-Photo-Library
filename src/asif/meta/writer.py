@@ -101,13 +101,19 @@ _ASIF_LISTS = frozenset({"AddedKeywords", "AddedIPTCKeywords", "CopiedKeywords"}
 # What cameras put in EXIF ImageDescription when nobody wrote a caption,
 # matched against the whole text (whitespace collapsed, any letter case).
 # Filler missing from here costs a photo its AI caption (reported as
-# kept-user); it never hides a real caption.
+# kept-user); a pattern that is too loose would hide a real caption, so
+# each one spells out the firmware's own wording.
 _CAMERA_FILLER = re.compile(
     r"""
     # OLYMPUS DIGITAL CAMERA, LEICA DIGITAL CAMERA, KODAK Digital Still Camera
     (?:\w+\s+)?digital\s+(?:still\s+)?camera
-    # KODAK CX7530 ZOOM DIGITAL CAMERA, SAMSUNG CAMERA PICTURES
-    | (?:agfa|kodak|konica|minolta|pentax|samsung)\b.*\bcamera(?:\s+pictures?)?
+    # KODAK CX7530 ZOOM DIGITAL CAMERA, KODAK EASYSHARE C813 ZOOM DIGITAL
+    # CAMERA, KONICA MINOLTA DIGITAL CAMERA: at most one model name, and it
+    # has a digit ("Kodak Brownie, my grandfather's first camera" is a caption)
+    | (?:agfa|kodak|konica|minolta|pentax|samsung)(?:\s+(?:minolta|easyshare))?
+      (?:\s+[a-z-]*\d[\w-]*)?(?:\s+zoom)?\s+digital\s+(?:still\s+)?camera
+    # SAMSUNG CAMERA PICTURES
+    | samsung\s+camera\s+pictures?
     # SONY DSC
     | (?:sony\s+)?dsc
     # Exif_JPEG_PICTURE, EXIF_JPEG_422
@@ -327,6 +333,9 @@ def _subject_langs(packet: str) -> bool:
     element makes exiftool refuse the write with a warning, so only the
     list itself matters.)
     """
+    # Some writers pad the packet with NULs, which XML doesn't allow and
+    # exiftool passes on; structure.read_xmp accepts them the same way.
+    packet = packet.rstrip("\0")
     if not packet.strip():
         return False
     if _DTD.search(packet):
@@ -685,6 +694,9 @@ def _wiping_replaced_inode(path: Path) -> Iterator[None]:
     an open descriptor) keeps it reachable so it can be zeroed. Nothing is
     zeroed while anything else still names it: a write that didn't replace
     it leaves the caller's file as it was.
+
+    exiftool's half-written new file (``<name>_exiftool_tmp``) is wiped too:
+    exiftool removes it itself, unless it was killed mid-write (a timeout).
     """
     name = path.with_name(f"{secrets.token_hex(8)}.pre-write")
     link: Path | None = name
@@ -700,6 +712,11 @@ def _wiping_replaced_inode(path: Path) -> Iterator[None]:
     try:
         yield
     finally:
+        # Nothing writes it any more: exiftool finished, failed (and removed
+        # it) or was killed and waited for. After a write it was renamed
+        # over ``path``, so nothing is there.
+        with contextlib.suppress(OSError):  # the inode below still gets its turn
+            wipe_file(path.with_name(path.name + "_exiftool_tmp"))
         if link is not None:
             try:
                 only_ours = link.stat().st_nlink == 1

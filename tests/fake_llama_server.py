@@ -3,10 +3,22 @@
 It takes llama-server's command line (``-m``, ``--mmproj``, ``--host``,
 ``--port``, ``-c``, ``-np``, ``-t``, ``-ngl``; unknown extras are accepted),
 refuses a non-loopback ``--host``, any ``--api-key`` on the command line and
-a start without offline mode (``LLAMA_ARG_OFFLINE=1``), and serves
-``GET /health`` (503 "Loading model" for the first
-``FAKE_LLAMA_LOADING_POLLS`` polls, default 2, then 200) and
-``POST /v1/chat/completions`` in OpenAI format.
+a start without offline mode, and serves ``GET /health`` (503 "Loading
+model" for the first ``FAKE_LLAMA_LOADING_POLLS`` polls, default 2, then
+200) and ``POST /v1/chat/completions`` in OpenAI format.
+
+It plays llama.cpp build ``FAKE_LLAMA_BUILD`` (default 11000), because what
+real builds read changed over time:
+
+* offline mode is ``LLAMA_OFFLINE=1`` before build 9330 and
+  ``LLAMA_ARG_OFFLINE=1`` from then on (each build reads only one name);
+* from build 10400 the settings files ``/etc/llama.cpp/config.ini``
+  (``FAKE_LLAMA_SYSTEM_CONFIG`` overrides the path, for tests) and then
+  ``${XDG_CONFIG_HOME:-$HOME/.config}/llama.cpp/config.ini`` are applied
+  first, the environment and command line on top, as llama.cpp does. A
+  file's ``host``, ``port`` and ``api-key`` (an extra accepted key) take
+  effect; any other setting makes it refuse to start, since a real one
+  would apply it whatever it is (``rpc``, ``log-file``...).
 
 Every completion request is checked the way a strict server would:
 
@@ -36,8 +48,10 @@ found in the model's file name (``model-slow.gguf``)::
     spew              floods its log (FAKE_LLAMA_SPEW_KB, default 4096 KiB)
 
 ``FAKE_LLAMA_RECORD`` names a JSON Lines file the server appends to: one
-``start`` record (pid, argv, names of LLAMA_* variables) and one ``request``
-record per completion (seed, temperature, image size...). Never image data.
+``start`` record (pid, parent pid, argv, the names of the llama.cpp
+settings it found in its environment and in config.ini files, and where it
+looked for the user's file) and one ``request`` record per completion
+(seed, temperature, image size...). Never image data.
 """
 
 from __future__ import annotations
@@ -68,6 +82,13 @@ MODES = (
     "good",
 )
 LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+DEFAULT_BUILD = 11000
+OFFLINE_RENAMED_AT = 9330
+"""The first build whose --offline reads LLAMA_ARG_OFFLINE rather than LLAMA_OFFLINE."""
+CONFIG_INI_SINCE = 10400
+"""The first build that applies config.ini files."""
+CONFIG_KEYS_MODELLED = frozenset({"host", "port", "api-key"})
+SETTINGS_ENV_PREFIXES = ("LLAMA", "MTMD_", "HF_", "HUGGING")
 SCHEMA_FILE = Path(__file__).resolve().parents[1] / "src" / "asif" / "infer" / "schema.json"
 DATA_URL_PREFIX = "data:image/jpeg;base64,"
 
@@ -177,6 +198,45 @@ def jpeg_info(data: bytes) -> tuple[int, int, list[int]]:
     return size[0], size[1], markers
 
 
+def config_home() -> Path:
+    """Where llama.cpp looks for the user's settings: XDG_CONFIG_HOME, else ~/.config."""
+    return Path(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.environ.get("HOME", ""), ".config")
+    )
+
+
+def config_files() -> list[Path]:
+    """The config.ini files llama.cpp applies, in its order: system-wide, then the user's."""
+    system = os.environ.get("FAKE_LLAMA_SYSTEM_CONFIG", "/etc/llama.cpp/config.ini")
+    return [Path(system), config_home() / "llama.cpp" / "config.ini"]
+
+
+def read_config(path: Path) -> dict[str, str]:
+    """The settings in a llama.cpp config.ini, keyed by option name ("rpc", "api-key").
+
+    A key may be an option's name or its environment name (LLAMA_ARG_RPC).
+    Every section counts: stricter than llama.cpp, which applies its global
+    and default ones.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    settings = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith((";", "#", "[")) or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        key = key.lower().lstrip("-")
+        for prefix in ("llama_arg_", "llama_"):
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+                break
+        settings[key.replace("_", "-")] = value
+    return settings
+
+
 def check_request(body: Any, max_edge: int) -> tuple[list[str], dict[str, Any]]:
     """Problems with a chat-completion request, and facts about it for the record."""
     problems: list[str] = []
@@ -273,11 +333,13 @@ SCHEMA_VIOLATION = json.dumps(
 class FakeServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], mode: str, model: str) -> None:
+    def __init__(
+        self, address: tuple[str, int], mode: str, model: str, api_keys: frozenset[str]
+    ) -> None:
         super().__init__(address, Handler)
         self.mode = mode
         self.model = model
-        self.api_key = os.environ.get("LLAMA_API_KEY", "")
+        self.api_keys = api_keys
         self.max_edge = int(os.environ.get("FAKE_LLAMA_MAX_EDGE", "4096"))
         self.loading_polls = int(os.environ.get("FAKE_LLAMA_LOADING_POLLS", "2"))
         self.delay_s = float(os.environ.get("FAKE_LLAMA_DELAY_S", "3"))
@@ -320,8 +382,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/chat/completions":
             self._error(404, "File Not Found", "not_found_error")
             return
-        expected = f"Bearer {self.server.api_key}"
-        if not self.server.api_key or self.headers.get("Authorization") != expected:
+        accepted = {f"Bearer {key}" for key in self.server.api_keys}
+        if self.headers.get("Authorization") not in accepted:
             self._error(401, "Invalid API Key", "authentication_error")
             return
         length = int(self.headers.get("Content-Length") or 0)
@@ -393,11 +455,18 @@ def pick_mode(model: str) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    build = int(os.environ.get("FAKE_LLAMA_BUILD", str(DEFAULT_BUILD)))
+    # Applied first, so the environment and the command line override it.
+    config: dict[str, str] = {}
+    if build >= CONFIG_INI_SINCE:
+        for path in config_files():
+            config.update(read_config(path))
+
     parser = argparse.ArgumentParser(prog="llama-server", allow_abbrev=False)
     parser.add_argument("-m", "--model", required=True)
     parser.add_argument("--mmproj", required=True)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--host", default=config.get("host", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(config.get("port", "8080")))
     parser.add_argument("-c", "--ctx-size", type=int, default=4096)
     parser.add_argument("-np", "--parallel", type=int, default=1)
     parser.add_argument("-t", "--threads", type=int, default=-1)
@@ -417,22 +486,44 @@ def main(argv: list[str] | None = None) -> int:
     if os.environ["LLAMA_API_KEY"] != os.environ["LLAMA_ARG_API_KEY"]:
         print("error: fake llama-server: LLAMA_API_KEY != LLAMA_ARG_API_KEY", flush=True)
         return 2
-    if os.environ.get("LLAMA_ARG_OFFLINE") != "1":  # what --offline reads
-        print("error: fake llama-server: not in offline mode", flush=True)
+    # What --offline reads in this build; it ignores the other name.
+    offline = "LLAMA_OFFLINE" if build < OFFLINE_RENAMED_AT else "LLAMA_ARG_OFFLINE"
+    if os.environ.get(offline) != "1":
+        print(f"error: fake llama-server: not in offline mode ({offline} isn't 1)", flush=True)
         return 2
+    unvetted = sorted(set(config) - CONFIG_KEYS_MODELLED)
+    if unvetted:
+        print(
+            f"error: fake llama-server: config.ini sets {', '.join(unvetted)}, and a real "
+            "llama-server would apply it",
+            flush=True,
+        )
+        return 2
+    # Every source adds a key, as in llama.cpp: config.ini's is accepted too.
+    api_keys = frozenset(
+        key
+        for value in (config.get("api-key", ""), os.environ["LLAMA_API_KEY"])
+        for key in value.split(",")
+        if key
+    )
 
     mode = pick_mode(args.model)
     record(
         {
             "event": "start",
             "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "build": build,
             "argv": sys.argv[1:] if argv is None else argv,
             "extras": extras,
             "mode": mode,
-            "llama_env": sorted(k for k in os.environ if k.startswith("LLAMA")),
+            "llama_env": sorted(k for k in os.environ if k.startswith(SETTINGS_ENV_PREFIXES)),
+            "config_keys": sorted(config),
+            "config_home": str(config_home()),
+            "home": os.environ.get("HOME"),
         }
     )
-    print("build: fake llama-server for As If tests", flush=True)
+    print(f"build: {build} (fake llama-server for As If tests)", flush=True)
     print(f"llama_model_load: loading model from {args.model}", flush=True)
     if mode == "crash-on-load":
         print("llama_model_load: error loading model: fake crash for tests", flush=True)
@@ -445,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     if mode == "spew":
         spew(int(os.environ.get("FAKE_LLAMA_SPEW_KB", "4096")))
 
-    server = FakeServer((args.host, args.port), mode, Path(args.model).name)
+    server = FakeServer((args.host, args.port), mode, Path(args.model).name, api_keys)
     print(f"main: server is listening on http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever(poll_interval=0.05)

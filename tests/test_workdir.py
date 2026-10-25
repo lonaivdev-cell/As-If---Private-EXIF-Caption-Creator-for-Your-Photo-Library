@@ -142,3 +142,31 @@ def test_unlocked_dirs_are_only_swept_once_clearly_abandoned(tmp_path: Path) -> 
     os.utime(fresh, (old, old))
     assert sweep_stale(tmp_path) == 1
     assert not fresh.exists()
+
+
+def test_dead_runs_are_swept_wherever_they_were(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    elsewhere = tmp_path / "runtime"
+    elsewhere.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(elsewhere))
+    dead = _dead_run(elsewhere, "asif-bbbbbbbbbbbb")
+    here = tmp_path / "configured"
+    with RamWorkDir(str(here), allow_disk=True) as work:
+        assert work.swept >= 1
+        assert not dead.exists()
+
+
+def test_the_lock_is_held_and_never_left_under_a_temporary_name(tmp_path: Path) -> None:
+    import fcntl
+
+    with RamWorkDir(str(tmp_path), allow_disk=True) as work:
+        assert work.path is not None
+        names = sorted(p.name for p in work.path.iterdir())
+        assert names == [".lock"]
+        fd = os.open(work.path / ".lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)

@@ -19,6 +19,7 @@ import pytest
 from PIL import Image, ImageCms
 
 from asif.meta.structure import (
+    C2PA_PROBLEM,
     StructureError,
     compare,
     compare_jpeg,
@@ -29,6 +30,7 @@ from asif.meta.structure import (
     jpeg_trailer,
     read_xmp,
     tiff_layout,
+    write_hazard,
 )
 
 SECRET = b"GPS -22.951916 my secret caption"
@@ -74,6 +76,10 @@ PNG_XMP = chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x00\x00\x00\x00" + SECRET)
 
 def png(*chunks: bytes, tail: bytes = b"") -> bytes:
     return PNG_SIG + IHDR + b"".join(chunks) + IDAT + IEND + tail
+
+
+# Apple's iDOT: where the image data continues, counted from iDOT's own start.
+IDOT = chunk(b"iDOT", struct.pack(">7I", 2, 0, 8, 40, 8, 8, 40 + len(IDAT)))
 
 
 def rchunk(fourcc: bytes, data: bytes) -> bytes:
@@ -547,6 +553,17 @@ def test_png_bytes_after_iend() -> None:
         ]
 
 
+def test_png_idot_must_keep_pointing_at_the_image_data() -> None:
+    # Two IDATs after iDOT: nothing may appear or change size between them.
+    bigger = chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x00\x00\x00\x00" + SECRET * 3)
+    moved = ["PNG iDOT chunk no longer points at the same image data"]
+    assert compare_png(png(IDOT, IDAT), png(IDOT, PNG_XMP, IDAT)) == moved
+    assert compare_png(png(IDOT, PNG_XMP, IDAT), png(IDOT, bigger, IDAT)) == moved
+    # XMP ahead of iDOT, or after the image data, may change: iDOT still points right.
+    assert compare_png(png(PNG_XMP, IDOT, IDAT), png(bigger, IDOT, IDAT)) == []
+    assert compare_png(png(IDOT, IDAT), PNG_SIG + IHDR + IDOT + IDAT + IDAT + PNG_XMP + IEND) == []
+
+
 def test_png_image_data_changed() -> None:
     other_idat = chunk(b"IDAT", zlib.compress(b"\x00" + b"\x11" * 48))
     after = PNG_SIG + IHDR + other_idat + IEND
@@ -715,6 +732,86 @@ def test_webp_fixtures_parse(fixtures_dir: Path) -> None:
     for name in ("lossy.webp", "lossless.webp"):
         data = (fixtures_dir / name).read_bytes()
         assert compare_webp(data, data) == []
+
+
+# -- write_hazard -------------------------------------------------------------------
+
+C2PA_UUID = b"c2pa" + bytes.fromhex("00110010800000AA00389B71")
+
+
+def jumbf(label: bytes = b"c2pa", uuid: bytes = C2PA_UUID) -> bytes:
+    """A JUMBF superbox with only its description box, as a C2PA manifest store begins."""
+    jumd = b"jumd" + uuid + b"\x03" + label + b"\x00"
+    jumb = b"jumb" + struct.pack(">I", 4 + len(jumd)) + jumd
+    return struct.pack(">I", 4 + len(jumb)) + jumb
+
+
+def app11(box: bytes) -> bytes:
+    """A JPEG APP11 segment holding JUMBF: "JP", box instance 1, sequence number 1."""
+    return seg(0xEB, b"JP\x00\x01\x00\x00\x00\x01" + box)
+
+
+def jpeg_with(*segments: bytes) -> bytes:
+    return jpeg(JFIF, *segments, DQT0, SOF0, DHT)
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(jpeg_with(app11(jumbf())), id="jpeg"),
+        pytest.param(jpeg_with(app11(jumbf(uuid=b"\x00" * 16))), id="jpeg-label-only"),
+        pytest.param(jpeg_with(app11(jumbf(label=b"manifests"))), id="jpeg-type-only"),
+        pytest.param(png(chunk(b"caBX", jumbf())), id="png"),
+        pytest.param(riff(VP8, rchunk(b"C2PA", jumbf())), id="webp"),
+    ],
+)
+def test_content_credentials_are_a_hazard(data: bytes) -> None:
+    # Their signature covers every byte outside the manifest: any write breaks it.
+    assert write_hazard(data) == C2PA_PROBLEM
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(jpeg(), id="jpeg"),
+        pytest.param(jpeg_with(app11(jumbf(b"jpxt", b"\x01" * 16))), id="other-jumbf"),
+        pytest.param(jpeg_with(seg(0xEB, b"JP\x00\x01")), id="cut-short-app11"),
+        pytest.param(jpeg_with(seg(0xEB, b"HDR_" + SECRET)), id="other-app11"),
+        pytest.param(png(GAMA, PNG_XMP), id="png"),
+        pytest.param(png(PNG_XMP, IDOT), id="png-xmp-ahead-of-idot"),
+        pytest.param(riff(vp8x(0x04), VP8, WEBP_XMP), id="webp"),
+    ],
+)
+def test_no_hazard(data: bytes) -> None:
+    assert write_hazard(data) is None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(png(IDOT), id="no-xmp"),
+        pytest.param(png(IDOT, PNG_XMP), id="xmp-after-idot"),
+        pytest.param(PNG_SIG + IHDR + IDOT + IDAT + PNG_XMP + IEND, id="xmp-after-the-data"),
+    ],
+)
+def test_apple_idot_without_xmp_ahead_of_it_is_a_hazard(data: bytes) -> None:
+    # exiftool puts new XMP right before the image data, after iDOT.
+    assert write_hazard(data) == "it has Apple's iDOT chunk, whose offsets new XMP would break"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"II*\x00\x08\x00\x00\x00", id="tiff"),
+        pytest.param(b"GIF89a" + SECRET, id="unknown"),
+        pytest.param(jpeg()[:-2], id="jpeg-cut"),
+        pytest.param(png()[:-4], id="png-cut"),
+    ],
+)
+def test_write_hazard_raises_for_what_it_cant_parse(data: bytes) -> None:
+    with pytest.raises(StructureError) as exc:
+        write_hazard(data)
+    assert_private([str(exc.value)])
 
 
 # -- compare -----------------------------------------------------------------------
@@ -1004,15 +1101,13 @@ OWNER_XMP = xmp_packet(
     '<dc:title><rdf:Alt><rdf:li xml:lang="x-default">Garden</rdf:li></rdf:Alt></dc:title>'
     "<dc:subject><rdf:Bag><rdf:li>family</rdf:li><rdf:li> family </rdf:li></rdf:Bag></dc:subject>"
     '<photoshop:Source rdf:resource="http://example.com/x"/>'
-    "<photoshop:Instructions><![CDATA[a <b> & c]]></photoshop:Instructions>"
+    "<photoshop:Instructions><![CDATA[a & c]]></photoshop:Instructions>"
     "<asif:RunId>run-1</asif:RunId>"
     "<asif:AddedKeywords><rdf:Bag><rdf:li>dog</rdf:li></rdf:Bag></asif:AddedKeywords>"
     "<xmpNote:HasExtendedXMP>0123456789ABCDEF0123456789ABCDEF</xmpNote:HasExtendedXMP>",
     attrs='photoshop:City="  Rio  " asif:ModelId="stub" rdf:nodeID="n1"',
 )
-OWNER_VALUES = Counter(
-    {"Garden": 1, "family": 2, "http://example.com/x": 1, "a <b> & c": 1, "Rio": 1}
-)
+OWNER_VALUES = Counter({"Garden": 1, "family": 2, "http://example.com/x": 1, "a & c": 1, "Rio": 1})
 
 
 def test_xmp_values_skip_syntax_and_as_ifs_own_record() -> None:
@@ -1087,15 +1182,42 @@ def test_markup_inside_a_value_is_a_problem(body: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "cdata",
+    [
+        pytest.param("Lisbon <b>old town</b>", id="element"),  # exiftool: "City B: old town"
+        pytest.param("a <br/> b", id="empty-element"),
+        pytest.param("a <b> & c", id="unclosed"),  # exiftool refuses the write
+        pytest.param("x < y", id="lone-angle-bracket"),  # fine for exiftool; refused anyway
+    ],
+)
+def test_markup_inside_a_cdata_value_is_a_problem(cdata: str) -> None:
+    # exiftool's parser doesn't know CDATA: it reads the markup as elements.
+    body = f"<photoshop:City><![CDATA[{cdata}]]></photoshop:City>"
+    text = read_xmp(jpeg_xmp(std_xmp(xmp_packet(body))))
+    assert text.problem == "its XMP has markup inside a value, which exiftool can't carry over"
+    assert text.values[cdata] == 1
+
+
+@pytest.mark.parametrize(
     "body",
     [
         LITERAL.format("Use only with credit"),
         '<dc:rights rdf:parseType="Resource"><photoshop:Inner>x</photoshop:Inner></dc:rights>',
         "<asif:Note>As If <b>own</b></asif:Note>",
+        "<photoshop:City><![CDATA[Lisbon & old town]]></photoshop:City>",
+        "<asif:Note><![CDATA[As If <b>own</b>]]></asif:Note>",
     ],
 )
 def test_plain_values_and_structures_are_no_problem(body: str) -> None:
     assert read_xmp(jpeg_xmp(std_xmp(xmp_packet(body)))).problem is None
+
+
+def test_old_adobe_toolkit_attribute_is_not_a_value() -> None:
+    # Photoshop 7-era XMP: exiftool reads x:xaptk as the toolkit name and
+    # writes it back as x:xmptk, so it is bookkeeping, like x:xmptk.
+    packet = OWNER_XMP.replace(b'x:xmptk="Some Toolkit 1.0"', b'x:xaptk="XMP toolkit 2.8.2-33"')
+    assert b"x:xaptk" in packet
+    assert read_xmp(jpeg_xmp(std_xmp(packet))).values == OWNER_VALUES
 
 
 def test_extended_xmp_linked_from_the_main_packet() -> None:

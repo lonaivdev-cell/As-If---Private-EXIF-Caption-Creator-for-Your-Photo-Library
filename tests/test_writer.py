@@ -246,6 +246,15 @@ def test_caption_deleted_by_owner_is_written_again() -> None:
         ("OLYMPUS DIGITAL CAMERA", "Our wedding day"),  # filler next to a real one
         ("Digital camera fun at the beach",),
         ("Sony DSC-RX100 on a tripod",),
+        # A brand first and "camera" last is still a caption, not firmware filler.
+        ("Kodak Brownie, my grandfather's first camera",),
+        ("Samsung Galaxy S23 rear camera",),
+        ("Pentax K1000 film camera",),
+        ("Minolta X-700, Dad's camera",),
+        ("Konica C35 rangefinder camera",),
+        ("Agfa Isolette folding camera",),
+        ("Kodak moment with the new camera",),
+        ("Kodak and my old digital camera",),
     ],
 )
 def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
@@ -271,6 +280,9 @@ def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
         "LEICA DIGITAL CAMERA",
         "KODAK Digital Still Camera",
         "KODAK CX7530 ZOOM DIGITAL CAMERA",
+        "KODAK EASYSHARE C813 ZOOM DIGITAL CAMERA",
+        "KODAK Z710 ZOOM DIGITAL CAMERA",
+        "KONICA MINOLTA DIGITAL CAMERA",
         "SAMSUNG CAMERA PICTURES",
         "MINOLTA DIGITAL CAMERA",
         "Exif_JPEG_PICTURE",
@@ -1276,6 +1288,24 @@ def test_plain_keywords_are_not_language_tagged(
     assert not read_existing(et, path).subject_langs
 
 
+def test_nul_padded_xmp_still_gets_keywords(et: ExifTool, fixture_copy: Copy) -> None:
+    # Padding isn't a language tag: As If's keywords go in, next to the owner's.
+    path = fixture_copy("plain.jpg")
+    exiftool_set(et, path, "-XMP-dc:Subject=owner kw")
+    data = path.read_bytes()
+    start = data.index(b"http://ns.adobe.com/xap/1.0/\x00") - 4  # the APP1 marker
+    length = int.from_bytes(data[start + 2 : start + 4], "big")
+    end = start + 2 + length
+    padded = data[start + 4 : end] + b"\0" * 200
+    segment = b"\xff\xe1" + (len(padded) + 2).to_bytes(2, "big") + padded
+    path.write_bytes(data[:start] + segment + data[end:])
+    assert et.execute("-b", "-XMP", str(path)).stdout.endswith("\0")
+    assert not read_existing(et, path).subject_langs
+    _, record = run_writer(et, path, result(keywords=("dog", "beach")))
+    assert record.subjects_added == ("dog", "beach") and record.subject_note is None
+    assert read_existing(et, path).subjects == ("owner kw", "dog", "beach")
+
+
 def test_owner_xmp_toolkit_is_kept(et: ExifTool, fixture_copy: Copy, tmp_path: Path) -> None:
     path = fixture_copy("plain.jpg")
     owner_xmp(et, path, tmp_path, "<rdf:li>Garden</rdf:li>")
@@ -1601,6 +1631,14 @@ DTD_BOMB = (
             ),
             False,
         ),
+        # Some writers pad the packet with NULs, and exiftool passes them on.
+        pytest.param(xmp_packet("<rdf:li>Hund</rdf:li>") + "\0", False, id="one-nul"),
+        pytest.param(xmp_packet("<rdf:li>Hund</rdf:li>") + "\0" * 200, False, id="nul-padded"),
+        pytest.param(
+            xmp_packet("<rdf:li xml:lang='de'>Hund</rdf:li>") + "\0" * 200,
+            True,
+            id="nul-padded-tagged",
+        ),
         # Anything that can't be read with certainty counts as tagged.
         ("not xml at all", True),
         (xmp_packet("<rdf:li>Hund</rdf:li>") + "<junk/>", True),
@@ -1668,6 +1706,46 @@ def test_apply_write_leaves_a_file_it_did_not_replace_alone(
     with contextlib.suppress(ExifToolError):
         scripted_write(tool, ram_file)
     assert ram_file.read_bytes() == before
+    assert [p.name for p in ram_file.parent.iterdir()] == [ram_file.name]
+
+
+class KilledExifTool(ScriptedExifTool):
+    """Killed mid-write (a timeout): its half-written new file stays behind."""
+
+    tmp_fd: int | None = None
+
+    def execute(self, *args: str) -> ExecResult:
+        if "-overwrite_original" in args:
+            path = Path(args[-1])
+            tmp = path.with_name(path.name + "_exiftool_tmp")
+            tmp.write_bytes(b"the start of the new file, photo and all")
+            # Kept open, so the test can see whether it was zeroed before removal.
+            self.tmp_fd = os.open(tmp, os.O_RDONLY)
+            raise ExifToolError("exiftool timed out after 120 s")
+        return super().execute(*args)
+
+
+@pytest.mark.parametrize("hard_links", [True, False], ids=["link", "no-hard-links"])
+def test_a_killed_write_leaves_no_half_written_copy(
+    ram_file: Path, monkeypatch: pytest.MonkeyPatch, hard_links: bool
+) -> None:
+    if not hard_links:
+
+        def no_link(*args: Any, **kwargs: Any) -> None:
+            raise OSError(95, "Operation not supported")
+
+        monkeypatch.setattr(os, "link", no_link)
+    before = ram_file.read_bytes()
+    tool = KilledExifTool(stdout="", rows=GOOD_ROWS)
+    with pytest.raises(ExifToolError, match="timed out"):
+        scripted_write(tool, ram_file)
+    assert tool.tmp_fd is not None
+    try:
+        size = len(b"the start of the new file, photo and all")
+        assert read_all(tool.tmp_fd) == bytes(size)  # zeroed, not just unlinked
+    finally:
+        os.close(tool.tmp_fd)
+    assert ram_file.read_bytes() == before  # never replaced, so never zeroed here
     assert [p.name for p in ram_file.parent.iterdir()] == [ram_file.name]
 
 

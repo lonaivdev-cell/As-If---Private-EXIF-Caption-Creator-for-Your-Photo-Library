@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from asif import __version__
+from asif import __version__, proc
 from asif.config import Config
 from asif.infer.client import InferenceClient, InferenceError, WorkerConfig
 from asif.infer.schema import PROMPT_VERSION, CaptionResult, SchemaError, parse_caption_json
@@ -349,19 +349,38 @@ def _copy_and_fingerprint(src: Path, dest: Path) -> Fingerprint:
     return Fingerprint(size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=digest.hexdigest())
 
 
+def _has_acl(path: Path) -> bool:
+    """Does ``path`` carry a POSIX access ACL? (Linux; False where there are none.)"""
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:  # macOS: no POSIX ACLs, group bits mean what they say
+        return False
+    try:
+        getxattr(path, "system.posix_acl_access")
+    except OSError as exc:
+        # No ACL, or a filesystem without them. Anything else: assume one.
+        return exc.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP)
+    return True
+
+
 def _reach_mask(path: Path) -> int:
-    """Permission bits ``path``'s folders actually let group/others use.
+    """Permission bits ``path`` and its folders actually let group/others use.
 
     A 0644 photo inside a 0700 folder is private; its copy must not become
-    readable just because the destination folder is open. ACLs are ignored,
-    so this can only narrow access.
+    readable just because the destination folder is open. With a POSIX ACL
+    the group bits are the ACL's mask, not the owning group's access, and
+    the copy gets no ACL; so wherever an ACL is involved, group access is
+    dropped. This can only narrow access, never widen it.
     """
     mask = 0o777
+    if _has_acl(path):
+        mask &= ~0o070
     for parent in path.parents:
         try:
             mode = parent.stat().st_mode
         except OSError:
             return 0o700
+        if _has_acl(parent):
+            mask &= ~0o070
         if not mode & stat.S_IXOTH:
             mask &= ~0o007
         if not mode & stat.S_IXGRP:
@@ -393,14 +412,24 @@ def _make_private_dirs(path: Path) -> None:
             os.mkdir(folder, 0o700)
 
 
-def _commit(ram_copy: Path, dest: Path, mode: int) -> bool:
+class _ReadBackMismatch(Exception):
+    """The copy on the destination isn't byte-identical to what was checked."""
+
+
+def _commit(ram_copy: Path, dest: Path, mode: int, expect_sha: str | None = None) -> bool:
     """Write ``ram_copy`` to ``dest`` without ever replacing an existing file.
 
     Returns False if ``dest`` appeared in the meantime. The bytes go to a
     temp file next to ``dest`` first and are hard-linked into place (atomic
-    and no-clobber); on filesystems without hard links (FAT, exFAT) it falls
-    back to an exclusive create. The temp name is short and fixed-length, so
-    a long photo name can't push it past the filesystem's name limit.
+    and no-clobber); on filesystems without hard links (FAT, exFAT, FUSE
+    mounts such as rclone or sshfs) it falls back to an exclusive create.
+    The temp name is short and fixed-length, so a long photo name can't push
+    it past the filesystem's name limit.
+
+    With ``expect_sha``, the placed copy is read back and must hash to it,
+    or ``_ReadBackMismatch`` is raised. A copy that was placed but not
+    confirmed (mismatch, error, Ctrl+C) is removed again, so nothing
+    unverified is ever left for a later run to take as done.
     """
     _make_private_dirs(dest.parent)
     tmp = dest.parent / f".asif-{secrets.token_hex(8)}.tmp"
@@ -419,14 +448,21 @@ def _commit(ram_copy: Path, dest: Path, mode: int) -> bool:
         except FileExistsError:
             return False
         except OSError as exc:
-            if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV):
+            no_links = (errno.EPERM, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV)
+            if exc.errno not in no_links:
                 raise
             # No hard links here. An exclusive rename isn't portable, so do
             # the next best thing: refuse if anything is there, then move.
             if dest.exists():
                 return False
             os.replace(tmp, dest)
-        _fsync_dir(dest.parent)
+        try:
+            _fsync_dir(dest.parent)
+            if expect_sha is not None and sha256_file(dest) != expect_sha:
+                raise _ReadBackMismatch
+        except BaseException:
+            dest.unlink(missing_ok=True)
+            raise
         return True
     finally:
         tmp.unlink(missing_ok=True)
@@ -442,10 +478,16 @@ def _already_done(et: ExifTool, src: Path, dest: Path) -> Done:
         if "XMP-asif:RunId" not in tags:
             return "no"
         recorded = tags.get("XMP-asif:SourceSHA256")
+        if recorded and str(recorded) == fingerprint(src).sha256:
+            return "done"
+        # Not this exact original. The gates proved a copy's image data equals
+        # its original's, so the same pixels mean "same photo, since edited";
+        # different pixels mean another photo is in the way (e.g. two names
+        # that collide on a case-insensitive destination).
+        same_photo = et.image_data_hash(dest) == et.image_data_hash(src)
         if recorded:
-            return "done" if str(recorded) == fingerprint(src).sha256 else "stale"
-        # Copies made before the source hash was recorded.
-        return "done" if et.image_data_hash(dest) == et.image_data_hash(src) else "stale"
+            return "stale" if same_photo else "no"
+        return "done" if same_photo else "no"  # copies from before the hash was recorded
     except (ExifToolError, ValueError, OSError):
         # ValueError: a name exiftool can't be given (line break). Don't guess.
         return "unknown"
@@ -496,10 +538,23 @@ def _describe(ctx: _Ctx, ram: Path, img: str) -> CaptionResult:
     raise last
 
 
-def _only_repair_warnings(stderr: str) -> bool:
-    """True if exiftool only complained about the file's own metadata layout."""
+def _only_minor_warnings(stderr: str) -> bool:
+    """True if exiftool only objected to this file's own metadata.
+
+    exiftool marks these "[minor]" (it would repair something on the way)
+    or "[Minor]" (it would drop part of the XMP it can't carry over).
+    """
     lines = [line for line in stderr.splitlines() if line.strip()]
-    return bool(lines) and all(line.startswith("Warning: [minor]") for line in lines)
+    return bool(lines) and all(
+        line.startswith(("Warning: [minor]", "Warning: [Minor]")) for line in lines
+    )
+
+
+def _destination_problem(rel: str, exc: OSError) -> ItemOutcome:
+    """One photo's destination path is unusable; or raise if the destination is."""
+    if exc.errno in _PER_PATH_ERRNOS:
+        return ItemOutcome(rel, State.FAILED_UPLOAD, f"couldn't write the copy ({exc.strerror})")
+    raise _DestinationError(f"can't write to the destination ({exc.strerror or exc})") from exc
 
 
 def _source_problem(rel: str, exc: OSError, when: str) -> ItemOutcome:
@@ -516,7 +571,13 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
     if suffix in NOT_YET:
         return ItemOutcome(rel, State.SKIPPED_FORMAT, NOT_YET[suffix])
 
-    if not ctx.dry_run and (dest.exists() or dest.is_symlink()):
+    occupied = False
+    if not ctx.dry_run:
+        try:
+            occupied = dest.exists() or dest.is_symlink()
+        except OSError as exc:
+            return _destination_problem(rel, exc)
+    if occupied:
         done = _already_done(ctx.et, src, dest)
         if done == "done":
             return ItemOutcome(rel, State.SKIPPED_DONE, "already captioned")
@@ -608,13 +669,13 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             with ctx.log.timed("write", img):
                 record = apply_write(ctx.et, ram, plan, prov, lang=lang)
         except ExifToolError as exc:
-            if _only_repair_warnings(exc.stderr):
-                # The file's own metadata needs fixing first ("... (fixed)");
-                # a property of this photo, not a bug.
+            if _only_minor_warnings(exc.stderr):
+                # A property of this photo's metadata, not a bug.
                 return ItemOutcome(
                     rel,
-                    State.QUARANTINE,
-                    "exiftool would have to repair this file's metadata first",
+                    State.SKIPPED_FORMAT,
+                    "exiftool can't rewrite this file's metadata without repairing or "
+                    "dropping part of it",
                 )
             return ItemOutcome(
                 rel, State.FAILED_GATE, "exiftool refused the write", systematic=True
@@ -646,28 +707,18 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             )
 
         processed_sha = sha256_file(ram)
-        committed = False
         try:
             with ctx.log.timed("commit", img):
-                committed = _commit(ram, dest, mode)
-            if committed and sha256_file(dest) != processed_sha:
-                dest.unlink(missing_ok=True)
-                return ItemOutcome(
-                    rel,
-                    State.FAILED_UPLOAD,
-                    "the written copy didn't read back identically; removed it",
-                    systematic=True,
-                )
+                committed = _commit(ram, dest, mode, expect_sha=processed_sha)
+        except _ReadBackMismatch:
+            return ItemOutcome(
+                rel,
+                State.FAILED_UPLOAD,
+                "the written copy didn't read back identically; removed it",
+                systematic=True,
+            )
         except OSError as exc:
-            if committed:
-                dest.unlink(missing_ok=True)  # never leave an unverified copy behind
-            if exc.errno in _PER_PATH_ERRNOS:
-                return ItemOutcome(
-                    rel, State.FAILED_UPLOAD, f"couldn't write the copy ({exc.strerror})"
-                )
-            raise _DestinationError(
-                f"can't write to the destination ({exc.strerror or exc})"
-            ) from exc
+            return _destination_problem(rel, exc)
         if not committed:
             return ItemOutcome(
                 rel, State.SKIPPED_CONFLICT, "a file appeared at the destination meanwhile"
@@ -715,47 +766,56 @@ def caption_folder(
 
     if not dry_run:
         try:
-            dest.mkdir(parents=True, exist_ok=True)
+            _make_private_dirs(dest)
         except OSError as exc:
             raise CaptionError(
                 f"can't create the destination folder {dest}: {exc.strerror}"
             ) from exc
 
-    with contextlib.ExitStack() as stack:
-        # Unwinds in reverse: the model worker stops, the RAM copies are
-        # wiped, then exiftool closes. Also on Ctrl+C and stop signals.
-        et = ExifTool(exiftool)
-        try:
-            et.start()
-        except ExifToolError as exc:
-            raise CaptionError(str(exc)) from exc
-        stack.callback(et.close)
-        work = RamWorkDir(cfg.resources.work_dir, allow_disk=cfg.resources.allow_disk_workdir)
-        try:
-            stack.enter_context(work)
-        except NotInRamError as exc:
-            raise CaptionError(str(exc)) from exc
-        except OSError as exc:
-            raise CaptionError(f"can't create the work dir: {exc.strerror}") from exc
-        if notice and not work.choice.in_ram:
-            notice(f"The work dir is on disk ({work.choice.reason}); you allowed that.")
-        if notice and work.swept:
-            notice(f"Wiped photo copies left in RAM by {work.swept} run(s) that were cut short.")
+    completed = False
+    try:
+        with proc.ShieldedExitStack() as stack:
+            # Unwinds in reverse: the model worker stops, the RAM copies are
+            # wiped, then exiftool closes. Also on Ctrl+C and stop signals.
+            et = ExifTool(exiftool)
+            try:
+                et.start()
+            except ExifToolError as exc:
+                raise CaptionError(str(exc)) from exc
+            stack.callback(et.close)
+            work = RamWorkDir(cfg.resources.work_dir, allow_disk=cfg.resources.allow_disk_workdir)
+            try:
+                stack.enter_context(work)
+            except NotInRamError as exc:
+                raise CaptionError(str(exc)) from exc
+            except OSError as exc:
+                raise CaptionError(f"can't create the work dir: {exc.strerror}") from exc
+            if notice and not work.choice.in_ram:
+                notice(f"The work dir is on disk ({work.choice.reason}); you allowed that.")
+            if notice and work.swept:
+                notice(
+                    f"Wiped photo copies left in RAM by {work.swept} run(s) that were cut short."
+                )
 
-        ctx = _Ctx(cfg, model, et, InferenceClient(model.worker), work, log, run_id, dry_run)
-        stack.callback(lambda: ctx.client.close())
-        log.event("run_start", n=len(files))
-        completed = False
-        try:
-            with log.timed("model_load"):
-                ctx.client.start()
-            _run(ctx, src, dest, files, summary, on_progress)
-            completed = True
-        except KeyboardInterrupt:
+            ctx = _Ctx(cfg, model, et, InferenceClient(model.worker), work, log, run_id, dry_run)
+            stack.callback(lambda: ctx.client.close())
+            log.event("run_start", n=len(files))
+            try:
+                with log.timed("model_load"):
+                    ctx.client.start()
+                _run(ctx, src, dest, files, summary, on_progress)
+                completed = True
+            finally:
+                log.event(
+                    "run_end", n=len(summary.outcomes), ok=completed and summary.aborted is None
+                )
+    except KeyboardInterrupt:
+        # Ctrl+C or a stop signal, before or during the run (the cleanup above
+        # can't be cut short; one arriving during it is acted on after it).
+        # After every photo is done, a late signal changes nothing.
+        if not completed:
             summary.interrupted = True
-            summary.aborted = _STOPPED
-        finally:
-            log.event("run_end", n=len(summary.outcomes), ok=completed and summary.aborted is None)
+            summary.aborted = summary.aborted or _STOPPED
     return summary
 
 

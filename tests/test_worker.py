@@ -39,7 +39,20 @@ from tests.fake_llama_server import FakeLlama, process_gone
 DECODABLE = sorted(n for n, e in FIXTURE_EXPECT.items() if e == "ok" and n != "panorama.jpg")
 WORKER = [sys.executable, "-I", "-m", "asif.infer.worker"]
 FAKE_SCRIPT = Path(__file__).resolve().with_name("fake_llama_server.py")
-OUR_LLAMA_ENV = ["LLAMA_API_KEY", "LLAMA_ARG_API_KEY", "LLAMA_ARG_OFFLINE"]
+OUR_LLAMA_ENV = ["LLAMA_API_KEY", "LLAMA_ARG_API_KEY", "LLAMA_ARG_OFFLINE", "LLAMA_OFFLINE"]
+# llama.cpp builds that read offline mode under different names (and only
+# the newer applies config.ini files): the worker must cover both.
+BUILDS = ["9200", "11000"]
+# Settings someone may have in ~/.config/llama.cpp/config.ini for their own
+# llama-server. Applied to As If's, they'd send work to another machine,
+# accept another key and log to a file.
+USER_LLAMA_CONFIG = (
+    "[*]\n"
+    "rpc = 10.0.0.2:50052\n"
+    "api-key = a-key-someone-else-knows\n"
+    "log-file = /tmp/llama.log\n"
+    "verbose = true\n"
+)
 linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
 
 
@@ -123,7 +136,12 @@ def spawn() -> Iterator[Callable[..., Proc]]:
 
 @pytest.fixture
 def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeLlama:
+    if os.path.lexists(worker.SYSTEM_LLAMA_CONFIG):
+        pytest.skip(f"{worker.SYSTEM_LLAMA_CONFIG} exists, so the worker refuses llama-server")
     fake = FakeLlama(tmp_path / "llama")
+    # The worker's private config dir for llama-server goes here: a worker
+    # killed outright (as many tests do) can't remove it.
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("FAKE_LLAMA_RECORD", str(fake.record_path))
     monkeypatch.setenv("FAKE_LLAMA_MAX_EDGE", "512")
     monkeypatch.delenv("FAKE_LLAMA_MODE", raising=False)
@@ -303,6 +321,8 @@ def test_eof_before_any_config_is_a_clean_exit(spawn: Callable[..., Proc]) -> No
             "server_args": "-v",
         },
         {"type": "config", "backend": "stub", "lang": "en", "max_edge_px": 512, "gpu_layers": -1},
+        {"type": "config", "backend": "stub", "lang": "en", "max_edge_px": 512, "parent_pid": "1"},
+        {"type": "config", "backend": "stub", "lang": "en", "max_edge_px": 512, "parent_pid": 0},
     ],
 )
 def test_a_bad_config_is_fatal(spawn: Callable[..., Proc], config: dict[str, Any] | str) -> None:
@@ -348,7 +368,15 @@ def test_stdout_carries_only_protocol_lines(spawn: Callable[..., Proc], fixtures
 # -- llama backend, against the fake llama-server ------------------------------------
 
 
-def test_llama_happy_path(spawn: Callable[..., Proc], fake: FakeLlama, fixtures_dir: Path) -> None:
+@pytest.mark.parametrize("build", BUILDS)
+def test_llama_happy_path(
+    spawn: Callable[..., Proc],
+    fake: FakeLlama,
+    fixtures_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    build: str,
+) -> None:
+    monkeypatch.setenv("FAKE_LLAMA_BUILD", build)  # the fake insists on that build's offline mode
     proc = spawn()
     proc.send(llama_config(fake))
     assert proc.recv() == {"type": "ready", "backend": "llama", "prompt_version": PROMPT_VERSION}
@@ -366,7 +394,7 @@ def test_llama_happy_path(spawn: Callable[..., Proc], fake: FakeLlama, fixtures_
     assert flag_value(argv, "-np") == "1"
     assert "-t" not in argv and "-ngl" not in argv  # threads 0 / gpu_layers None: llama decides
     assert not any("api-key" in arg for arg in argv)  # the key travels in the environment
-    assert start["llama_env"] == OUR_LLAMA_ENV  # the fake also insists on offline mode
+    assert start["llama_env"] == OUR_LLAMA_ENV
 
     [request] = fake.records("request")
     assert request["problems"] == []
@@ -627,17 +655,102 @@ def test_a_refused_option_is_named_but_its_value_never_shown(args: tuple[str, ..
     assert args[0][:8] in info.value.detail
 
 
-def test_llama_arg_environment_variables_are_not_passed_on(
-    spawn: Callable[..., Proc], fake: FakeLlama, fixtures_dir: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("build", BUILDS)
+def test_llama_settings_in_the_environment_are_not_passed_on(
+    spawn: Callable[..., Proc],
+    fake: FakeLlama,
+    fixtures_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    build: str,
 ) -> None:
+    monkeypatch.setenv("FAKE_LLAMA_BUILD", build)
     monkeypatch.setenv("LLAMA_ARG_HOST", "0.0.0.0")
     monkeypatch.setenv("LLAMA_ARG_HF_REPO", "someone/some-model")
     monkeypatch.setenv("LLAMA_API_KEY", "a-key-someone-else-knows")
     monkeypatch.setenv("LLAMA_ARG_API_KEY", "a-key-someone-else-knows")
     monkeypatch.setenv("LLAMA_ARG_OFFLINE", "0")
+    monkeypatch.setenv("LLAMA_OFFLINE", "0")
+    # Older builds' names for --log-file and -lv: a log file of every request, photo and all.
+    monkeypatch.setenv("LLAMA_LOG_FILE", str(fake.directory / "llama.log"))
+    monkeypatch.setenv("LLAMA_LOG_VERBOSITY", "5")
+    monkeypatch.setenv("LLAMA_CHAT_TEMPLATE_KWARGS", '{"enable_thinking": true}')
+    monkeypatch.setenv("MTMD_BACKEND_DEVICE", "RPC0")
+    monkeypatch.setenv("HF_TOKEN", "hf_someone")
+    monkeypatch.setenv("HF_ENDPOINT", "https://example.com")
+    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "hf_someone")
     proc = started(spawn, llama_config(fake))  # the fake refuses to start if not offline
     assert proc.ask(fixtures_dir / "plain.jpg")["ok"] is True  # authorised with *our* key
     assert fake.records("start")[0]["llama_env"] == OUR_LLAMA_ENV
+
+
+@pytest.mark.parametrize("where", ["XDG_CONFIG_HOME", "HOME"])
+def test_the_users_llama_cpp_config_file_never_reaches_llama_server(
+    spawn: Callable[..., Proc],
+    fake: FakeLlama,
+    fixtures_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    where: str,
+) -> None:
+    # Current llama-server builds apply this file before their environment
+    # and command line; the fake refuses to start if it sees rpc= and the like.
+    home = tmp_path / "home"
+    if where == "HOME":
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+        user_config = home / ".config"
+    else:
+        user_config = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(user_config))
+    monkeypatch.setenv("HOME", str(home))
+    (user_config / "llama.cpp").mkdir(parents=True)
+    (user_config / "llama.cpp" / "config.ini").write_text(USER_LLAMA_CONFIG)
+
+    proc = started(spawn, llama_config(fake))
+    assert proc.ask(fixtures_dir / "plain.jpg")["ok"] is True
+    [start] = fake.records("start")
+    assert start["config_keys"] == []
+    assert start["home"] == str(home)  # GPU drivers keep their caches there
+    # llama-server looked in an empty folder only the worker can use...
+    private = Path(start["config_home"])
+    assert private != user_config
+    assert os.listdir(private) == []
+    assert private.stat().st_mode & 0o777 == 0o700
+    proc.send({"type": "shutdown"})
+    assert proc.wait() == 0
+    assert not private.exists()  # ...and that is gone with it
+
+
+def test_a_system_wide_llama_cpp_config_file_is_refused(
+    spawn: Callable[..., Proc], fake: FakeLlama, tmp_path: Path
+) -> None:
+    # No environment hides /etc/llama.cpp/config.ini from llama-server.
+    system = tmp_path / "etc" / "llama.cpp" / "config.ini"
+    system.parent.mkdir(parents=True)
+    system.write_text("rpc = 10.0.0.2:50052\n")
+    code = (
+        "from asif.infer import worker\n"
+        f"worker.SYSTEM_LLAMA_CONFIG = {str(system)!r}\n"
+        "raise SystemExit(worker.main())\n"
+    )
+    proc = spawn([sys.executable, "-c", code])
+    proc.send(llama_config(fake))
+    msg = proc.recv()
+    assert (msg["type"], msg["error"]) == ("fatal", "bad_config")
+    assert str(system) in msg["detail"] and "10.0.0.2" not in msg["detail"]
+    assert proc.wait() == 1
+    assert fake.records() == []  # llama-server never ran
+
+
+def test_a_worker_whose_orchestrator_is_already_gone_starts_nothing(
+    spawn: Callable[..., Proc], fake: FakeLlama
+) -> None:
+    # The orchestrator died before the worker could arm its death signal:
+    # the worker now has another parent than the one named in the config.
+    proc = spawn()
+    proc.send({**llama_config(fake), "parent_pid": os.getppid()})
+    assert proc.wait(timeout=10) == 1
+    assert proc.raw == []
+    assert fake.records() == []
 
 
 def test_llama_server_dying_mid_run_is_fatal(
@@ -739,8 +852,9 @@ def test_neither_the_worker_nor_llama_server_can_dump_core(
     proc.send(llama_config(fake))
     assert proc.recv()["type"] == "ready"
     [pid] = fake.pids()
-    assert _core_limit(proc.p.pid) == ("0", "0")
-    assert _core_limit(pid) == ("0", "0")  # inherited, and it can't raise it again
+    # 0, or 1 byte: too small for a core file, and no crash reporter either.
+    assert _core_limit(proc.p.pid) in {("0", "0"), ("1", "1")}
+    assert _core_limit(pid) == _core_limit(proc.p.pid)  # inherited, and it can't raise it again
 
 
 # -- nobody else gets the photos ------------------------------------------------------
@@ -922,16 +1036,38 @@ def _free_port() -> int:
         return port
 
 
-@pytest.fixture
-def fake_server(fake: FakeLlama, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[int, str]]:
-    key = "test-key-123"
+def _fake_env(tmp_path: Path, **extra: str) -> dict[str, str]:
+    """The fake's environment as the worker gives it, plus ``extra``."""
+    xdg = tmp_path / "fake-xdg"  # never the developer's own llama.cpp settings
+    xdg.mkdir(exist_ok=True)
+    env = {
+        **os.environ,
+        "LLAMA_API_KEY": "k",
+        "LLAMA_ARG_API_KEY": "k",
+        "XDG_CONFIG_HOME": str(xdg),
+    }
+    env.update(LLAMA_OFFLINE="1", LLAMA_ARG_OFFLINE="1")
+    env.update(extra)
+    return env
+
+
+def _start_fake(fake: FakeLlama, env: dict[str, str]) -> tuple[subprocess.Popen[bytes], int]:
     port = _free_port()
     model, mmproj = fake.model_files()
-    env = {**os.environ, "LLAMA_API_KEY": key, "LLAMA_ARG_API_KEY": key, "LLAMA_ARG_OFFLINE": "1"}
     argv = [str(fake.binary), "-m", str(model), "--mmproj", str(mmproj), "--port", str(port)]
     server = subprocess.Popen(argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not wait_until(lambda: _get(port, "/health") is not None):
+        server.kill()
+        server.wait()
+        raise AssertionError("the fake llama-server didn't start")
+    return server, port
+
+
+@pytest.fixture
+def fake_server(fake: FakeLlama, tmp_path: Path) -> Iterator[tuple[int, str]]:
+    key = "test-key-123"
+    server, port = _start_fake(fake, _fake_env(tmp_path, LLAMA_API_KEY=key, LLAMA_ARG_API_KEY=key))
     try:
-        assert wait_until(lambda: _get(port, "/health") is not None)
         yield port, key
     finally:
         server.kill()
@@ -1009,21 +1145,68 @@ def test_fake_checks_key_image_and_schema(
 
 
 @pytest.mark.parametrize(
-    ("extra", "offline"),
+    ("extra", "env"),
     [
-        (["--host", "0.0.0.0"], "1"),
-        (["--host", "192.168.1.10"], "1"),
-        (["--api-key", "k"], "1"),
-        ([], "0"),
+        (["--host", "0.0.0.0"], {}),
+        (["--host", "192.168.1.10"], {}),
+        (["--api-key", "k"], {}),
+        ([], {"LLAMA_ARG_OFFLINE": "0"}),
+        ([], {"FAKE_LLAMA_BUILD": "11000", "LLAMA_ARG_OFFLINE": ""}),  # LLAMA_OFFLINE is ignored
+        ([], {"FAKE_LLAMA_BUILD": "9200", "LLAMA_OFFLINE": ""}),  # LLAMA_ARG_OFFLINE is ignored
     ],
 )
 def test_fake_refuses_exposed_hosts_argv_keys_and_online_mode(
-    fake: FakeLlama, extra: list[str], offline: str
+    fake: FakeLlama, tmp_path: Path, extra: list[str], env: dict[str, str]
 ) -> None:
     model, mmproj = fake.model_files()
-    env = {**os.environ, "LLAMA_API_KEY": "k", "LLAMA_ARG_API_KEY": "k"}
-    env["LLAMA_ARG_OFFLINE"] = offline
     argv = [str(fake.binary), "-m", str(model), "--mmproj", str(mmproj), *extra]
-    proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(
+        argv, env=_fake_env(tmp_path, **env), capture_output=True, text=True, timeout=30
+    )
     assert proc.returncode == 2
     assert "error" in proc.stdout
+
+
+@pytest.mark.parametrize("where", ["system", "XDG_CONFIG_HOME", "HOME"])
+def test_fake_applies_llama_cpp_config_files_like_current_builds(
+    fake: FakeLlama, tmp_path: Path, where: str
+) -> None:
+    files = {
+        "system": tmp_path / "etc" / "config.ini",
+        "XDG_CONFIG_HOME": tmp_path / "fake-xdg" / "llama.cpp" / "config.ini",
+        "HOME": tmp_path / "home" / ".config" / "llama.cpp" / "config.ini",
+    }
+    env = _fake_env(tmp_path, FAKE_LLAMA_SYSTEM_CONFIG=str(files["system"]))
+    env["HOME"] = str(tmp_path / "home")
+    if where == "HOME":
+        del env["XDG_CONFIG_HOME"]
+    files[where].parent.mkdir(parents=True, exist_ok=True)
+    files[where].write_text(USER_LLAMA_CONFIG)
+    model, mmproj = fake.model_files()
+    argv = [str(fake.binary), "-m", str(model), "--mmproj", str(mmproj)]
+    proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 2
+    assert "config.ini sets log-file, rpc, verbose" in proc.stdout
+    # A build from before config.ini files ignores them.
+    env["FAKE_LLAMA_BUILD"] = "9200"
+    server, _port = _start_fake(fake, env)
+    server.kill()
+    server.wait()
+
+
+def test_fake_takes_a_config_files_api_key_as_well(
+    fake: FakeLlama, fixtures_dir: Path, tmp_path: Path
+) -> None:
+    # As llama.cpp does: each source adds a key, so another program could use it.
+    env = _fake_env(tmp_path)
+    (tmp_path / "fake-xdg" / "llama.cpp").mkdir(parents=True)
+    (tmp_path / "fake-xdg" / "llama.cpp" / "config.ini").write_text("api-key = theirs\n")
+    server, port = _start_fake(fake, env)
+    try:
+        body = _body_for(prepare_image(fixtures_dir / "plain.jpg", 512))
+        assert _post(port, "k", body)[0] == 200
+        assert _post(port, "theirs", body)[0] == 200
+        assert _post(port, "nobody's", body)[0] == 401
+    finally:
+        server.kill()
+        server.wait()

@@ -8,8 +8,10 @@ the wrong photo, and never let a worker's chatter fill a pipe.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -109,6 +111,23 @@ for line in sys.stdin:
 """
 
 
+# An orchestrator as the CLI runs one: by the time it starts the worker,
+# another thread is running (rich's progress display), so a preexec_fn
+# would be unsafe there and can't be what stops the worker.
+ORCHESTRATOR = r"""
+import json, sys, threading, time
+from pathlib import Path
+from asif.infer.client import InferenceClient, WorkerConfig
+
+threading.Thread(target=time.sleep, args=(600,), daemon=True).start()
+client = InferenceClient(WorkerConfig(**json.loads(sys.argv[1])))
+client.start()
+client.describe(Path(sys.argv[2]), "i_000001")
+"""
+
+linux_only = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux only")
+
+
 @pytest.fixture
 def fast(monkeypatch: pytest.MonkeyPatch) -> None:
     """Shrink the client's safety margins so failure tests finish quickly."""
@@ -151,7 +170,12 @@ def scripted(tmp_path: Path) -> Callable[..., WorkerConfig]:
 
 @pytest.fixture
 def fake(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeLlama:
+    if os.path.lexists(worker.SYSTEM_LLAMA_CONFIG):
+        pytest.skip(f"{worker.SYSTEM_LLAMA_CONFIG} exists, so the worker refuses llama-server")
     fake = FakeLlama(tmp_path / "llama")
+    # The worker's private config dir for llama-server goes here: a worker
+    # killed outright (as many tests do) can't remove it.
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
     monkeypatch.setenv("FAKE_LLAMA_RECORD", str(fake.record_path))
     monkeypatch.setenv("FAKE_LLAMA_MAX_EDGE", "512")
     monkeypatch.delenv("FAKE_LLAMA_MODE", raising=False)
@@ -293,10 +317,64 @@ def test_the_config_message_is_what_the_worker_parses(fake: FakeLlama) -> None:
     assert (parsed.threads, parsed.gpu_layers) == (2, 10)
     assert parsed.server_args == ("--flash-attn", "on")
     assert parsed.model == config.model and parsed.mmproj == config.mmproj
+    assert parsed.parent_pid == os.getpid()  # the worker checks it's still our child
     assert worker._parse_config(stub().to_message()).backend == "stub"
 
 
 # -- the real worker with llama, against the fake llama-server ------------------------
+
+
+@linux_only
+@pytest.mark.parametrize("when", ["loading the model", "describing a photo"])
+def test_a_sigkilled_orchestrator_leaves_no_worker_or_llama_server_behind(
+    fake: FakeLlama, fixtures_dir: Path, monkeypatch: pytest.MonkeyPatch, when: str
+) -> None:
+    if when == "loading the model":
+        monkeypatch.setenv("FAKE_LLAMA_LOADING_POLLS", "1000000")
+    monkeypatch.setenv("FAKE_LLAMA_DELAY_S", "120")
+    model, mmproj = fake.model_files("slow")
+    settings = {
+        "backend": "llama",
+        "lang": "en",
+        "max_edge_px": 512,
+        "llama_server": str(fake.binary),
+        "model": str(model),
+        "mmproj": str(mmproj),
+        "load_timeout_s": 120,
+        "request_timeout_s": 120,
+    }
+    image = str(fixtures_dir / "plain.jpg")
+    orchestrator = subprocess.Popen(
+        [sys.executable, "-c", ORCHESTRATOR, json.dumps(settings), image]
+    )
+    pids: list[int] = []
+    try:
+        event = "start" if when == "loading the model" else "request"
+        assert _wait_until(lambda: bool(fake.records(event)), 30), f"never got to {when}"
+        [start] = fake.records("start")
+        pids = [start["ppid"], start["pid"]]  # the worker, and llama-server
+        orchestrator.kill()  # nothing in it can clean up
+        orchestrator.wait()
+        assert _wait_until(lambda: all(process_gone(pid) for pid in pids), 10), (
+            f"still running {when}: " + ", ".join(str(pid) for pid in pids if not process_gone(pid))
+        )
+    finally:
+        if orchestrator.poll() is None:
+            orchestrator.kill()
+            orchestrator.wait()
+        for pid in pids:
+            if not process_gone(pid):
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+
+
+def _wait_until(check: Callable[[], bool], timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.05)
+    return check()
 
 
 def test_llama_start_describe_close(

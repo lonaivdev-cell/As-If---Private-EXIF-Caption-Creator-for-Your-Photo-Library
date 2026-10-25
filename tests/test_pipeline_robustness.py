@@ -213,11 +213,11 @@ def test_a_full_destination_stops_the_run_and_keeps_the_summary(
     real_commit = local._commit
     calls = {"n": 0}
 
-    def fill_up(ram: Path, dest: Path, mode: int) -> bool:
+    def fill_up(ram: Path, dest: Path, mode: int, **kw: Any) -> bool:
         calls["n"] += 1
         if calls["n"] >= 3:
             raise OSError(errno.ENOSPC, "No space left on device")
-        return real_commit(ram, dest, mode)
+        return real_commit(ram, dest, mode, **kw)
 
     monkeypatch.setattr(local, "_commit", fill_up)
     summary = _run(photos, tmp_path / "out", cfg, tmp_path)
@@ -267,6 +267,7 @@ def test_copies_of_private_photos_stay_private(
     copy = dest / "medical" / "scan.jpg"
     assert stat.S_IMODE(copy.stat().st_mode) & 0o077 == 0
     assert stat.S_IMODE((dest / "medical").stat().st_mode) == 0o700
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o700  # the new destination root too
 
 
 # -- the model ---------------------------------------------------------------
@@ -514,3 +515,201 @@ def test_tiffs_with_maker_notes_are_skipped_as_a_format_limit(cfg: Config, tmp_p
     assert set(_states(summary).values()) == {State.SKIPPED_FORMAT}
     assert all("maker notes" in o.reason and not o.systematic for o in summary.outcomes)
     assert not (tmp_path / "out").exists() or not any((tmp_path / "out").rglob("*.tif"))
+
+
+# -- round 2 -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("no_link_errno", [errno.EPERM, errno.ENOSYS, errno.EOPNOTSUPP])
+def test_commit_falls_back_wherever_hard_links_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_link_errno: int
+) -> None:
+    ram = tmp_path / "ram.jpg"
+    ram.write_bytes(b"processed")
+
+    def no_links(src: Any, dst: Any) -> None:
+        raise OSError(no_link_errno, os.strerror(no_link_errno))  # e.g. FUSE: rclone, sshfs
+
+    monkeypatch.setattr(local.os, "link", no_links)
+    dest = tmp_path / "out" / "a.jpg"
+    assert local._commit(ram, dest, 0o644)
+    assert dest.read_bytes() == b"processed"
+
+
+def test_ctrl_c_during_the_read_back_leaves_no_unconfirmed_copy(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = tmp_path / "out"
+    real_sha = local.sha256_file
+
+    def interrupted_read(path: Path) -> str:
+        if dest in path.parents:
+            raise KeyboardInterrupt
+        return real_sha(path)
+
+    monkeypatch.setattr(local, "sha256_file", interrupted_read)
+    summary = _run(photos, dest, cfg, tmp_path)
+    assert summary.interrupted
+    assert not any(p.is_file() for p in dest.rglob("*"))  # placed, never confirmed: removed
+
+
+class _KeepOrder:
+    """Stands in for the shuffle so a test can know the processing order."""
+
+    def shuffle(self, items: list[Path]) -> None:
+        items.sort()
+
+
+def test_an_unsearchable_destination_subfolder_is_handled(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = tmp_path / "out"
+    real_exists = Path.exists
+
+    def exists(self: Path, *a: Any, **kw: Any) -> bool:
+        if self.name == "p2.jpg" and dest in self.parents:
+            raise OSError(errno.ENAMETOOLONG, "File name too long")
+        if self.name == "p3.jpg" and dest in self.parents:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_exists(self, *a, **kw)
+
+    monkeypatch.setattr(local.secrets, "SystemRandom", _KeepOrder)
+    monkeypatch.setattr(Path, "exists", exists)
+    summary = _run(photos, dest, cfg, tmp_path)
+    states = _states(summary)
+    assert states["p2.jpg"] == State.FAILED_UPLOAD  # only this photo's path
+    # EACCES means the destination itself: stop, and keep the summary so far.
+    assert summary.aborted is not None and "Permission denied" in summary.aborted
+    assert states["p3.jpg"] == State.FAILED_UPLOAD
+    assert "p4.jpg" not in states
+    assert states["p0.jpg"] == states["p1.jpg"] == State.CLEAN
+
+
+def test_a_different_photo_in_the_way_is_not_called_stale(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "a.jpg")
+    dest = tmp_path / "out"
+    _run(src, dest, cfg, tmp_path)
+    # Now a different photo wants the same name (think case-insensitive disks).
+    (src / "a.jpg").unlink()
+    shutil.copy2(fixtures_dir / "gps.jpg", src / "a.jpg")
+    (outcome,) = _run(src, dest, cfg, tmp_path).outcomes
+    assert outcome.state == State.SKIPPED_CONFLICT
+    assert "different file" in outcome.reason
+
+
+def test_files_exiftool_cant_rewrite_are_skipped_not_counted_as_bugs(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from asif.meta.exiftool import ExifToolError
+
+    def refuse(*_a: Any, **_kw: Any) -> Any:
+        raise ExifToolError(
+            "exiftool warned about the write (1 warning(s))",
+            "Warning: [Minor] Duplicate XMP property: photoshop:City\n",
+        )
+
+    monkeypatch.setattr(local, "apply_write", refuse)
+    for i in range(5, 8):  # more than the failure budget would allow if systematic
+        shutil.copy2(photos / "p0.jpg", photos / f"p{i}.jpg")
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is None
+    assert set(_states(summary).values()) == {State.SKIPPED_FORMAT}
+    assert not any(o.systematic for o in summary.outcomes)
+
+
+def test_processing_order_comes_from_the_shuffle(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[Path]] = []
+
+    class Reverse:
+        def shuffle(self, items: list[Path]) -> None:
+            seen.append(list(items))
+            items.reverse()
+
+    monkeypatch.setattr(local.secrets, "SystemRandom", Reverse)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert len(seen) == 1 and len(seen[0]) == 5
+    assert [o.rel for o in summary.outcomes] == [p.name for p in reversed(seen[0])]
+
+
+@pytest.mark.skipif(not os.path.isdir("/dev/shm"), reason="needs a world-searchable dir")
+def test_acl_group_bits_are_never_passed_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+
+    # Under /dev/shm every parent is searchable, so only the ACL can narrow it.
+    folder = Path(tempfile.mkdtemp(dir="/dev/shm"))
+    try:
+        photo = folder / "a.jpg"
+        photo.write_bytes(b"x")
+        photo.chmod(0o664)
+        folder.chmod(0o775)
+        monkeypatch.setattr(local, "_has_acl", lambda p: False)
+        assert local._reach_mask(photo) & 0o070 == 0o070  # no ACL: group bits stand
+        # With an ACL the group bits are only its mask, and the copy gets no ACL.
+        monkeypatch.setattr(local, "_has_acl", lambda p: p == folder)
+        assert local._reach_mask(photo) & 0o070 == 0
+    finally:
+        shutil.rmtree(folder)
+
+
+def test_has_acl_is_false_for_a_plain_file(tmp_path: Path) -> None:
+    plain = tmp_path / "a.jpg"
+    plain.write_bytes(b"x")
+    assert not local._has_acl(plain)
+
+
+def test_a_late_signal_during_cleanup_keeps_the_summary(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_close = local.InferenceClient.close
+    fired = {"done": False}
+
+    def close_then_signal(self: Any) -> None:
+        real_close(self)
+        if not fired["done"]:
+            fired["done"] = True
+            raise KeyboardInterrupt  # as if Ctrl+C landed while the model unloads
+
+    monkeypatch.setattr(local.InferenceClient, "close", close_then_signal)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert summary.count(State.CLEAN) == 5  # every photo was done...
+    assert not summary.interrupted  # ...so a late signal changes nothing
+    assert _ram_is_empty(tmp_path)
+
+
+def test_files_the_gates_cant_vouch_for_are_skipped_before_the_model(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import Image
+
+    from tests.test_gates import _document_ancestors, _with_c2pa
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(6):  # more than the failure budget would allow if these counted as bugs
+        shutil.copy2(fixtures_dir / "plain.jpg", src / f"bloat{i}.jpg")
+        _document_ancestors(src / f"bloat{i}.jpg", 1001)
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "signed.jpg")
+    _with_c2pa("jpeg", src / "signed.jpg")
+    Image.new("RGB", (64, 48), (10, 120, 200)).save(src / "scan.tif", compression="jpeg")
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "ordinary.jpg")
+
+    described: list[str] = []
+    real = local._describe
+    monkeypatch.setattr(
+        local, "_describe", lambda ctx, ram, img: described.append(img) or real(ctx, ram, img)
+    )
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    states = _states(summary)
+    assert summary.aborted is None
+    assert states.pop("ordinary.jpg") == State.CLEAN
+    assert set(states.values()) == {State.SKIPPED_FORMAT}
+    reasons = {o.rel: o.reason for o in summary.outcomes}
+    assert "Content Credentials" in reasons["signed.jpg"]
+    assert "JPEG-compressed TIFF" in reasons["scan.tif"]
+    assert len(described) == 1  # the model only ever saw the ordinary photo

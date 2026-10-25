@@ -170,3 +170,4 @@ def test_ctrl_c_exits_130_after_cleaning_up(
     result = runner.invoke(app, ["caption", str(src), str(tmp_path / "out"), "-m", "stub"])
     assert result.exit_code == EXIT_INTERRUPTED, result.output
     assert "stopped" in result.output.lower()
+    assert "No photos found" not in result.output

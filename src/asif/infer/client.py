@@ -83,7 +83,7 @@ class WorkerConfig:
     """Override the worker command (default: this Python, ``-I -m asif.infer.worker``)."""
 
     def to_message(self) -> dict[str, object]:
-        """The ``config`` line sent to the worker."""
+        """The ``config`` line sent to the worker, by this process (its parent)."""
         return {
             "type": "config",
             "backend": self.backend,
@@ -98,6 +98,9 @@ class WorkerConfig:
             "server_args": list(self.server_args),
             "load_timeout_s": self.load_timeout_s,
             "request_timeout_s": self.request_timeout_s,
+            # The worker arms its own parent-death signal, then checks we're
+            # still its parent, in case we died before that took effect.
+            "parent_pid": os.getpid(),
         }
 
 
@@ -162,6 +165,11 @@ class InferenceClient:
         with kind ``start`` if it reports a fatal error, exits, says
         something unexpected, or isn't ready within ``load_timeout_s`` plus
         ``SLACK_S`` seconds.
+
+        Call it from the main thread: on Linux the worker (and llama-server
+        with it) gets SIGTERM when the thread that started it ends, which is
+        what stops it if this process is SIGKILLed. Nothing runs in the child
+        before exec (no ``preexec_fn``), so other threads may be running.
         """
         if self._proc is not None or self._closed:
             raise RuntimeError("an InferenceClient can only be started once")

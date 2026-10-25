@@ -18,7 +18,9 @@ a child's output can never corrupt the stream. Diagnostics go to stderr.
       "llama_server": "/usr/bin/llama-server", "model": "/m/x.gguf",
       "mmproj": "/m/mmproj.gguf", "ctx": 4096, "threads": 0,
       "gpu_layers": null, "server_args": [], "load_timeout_s": 300,
-      "request_timeout_s": 600}
+      "request_timeout_s": 600,
+      # optional: the orchestrator's pid (see "Parent death" below)
+      "parent_pid": 4242}
 
 2. Worker -> orchestrator, once ready::
 
@@ -33,7 +35,9 @@ a child's output can never corrupt the stream. Diagnostics go to stderr.
    memory, GPU, sampling and logging options, and a ``llama_server`` script
    that doesn't ``exec`` llama-server), ``missing_binary``,
    ``missing_model``, ``server_start``, ``server_exited`` (the model failed
-   to load), ``load_timeout``, ``port_taken`` and ``internal``.
+   to load), ``load_timeout``, ``port_taken`` and ``internal``. A
+   system-wide llama.cpp settings file (``/etc/llama.cpp/config.ini``) is a
+   ``bad_config`` too: see ``SYSTEM_LLAMA_CONFIG``.
 
 3. Requests, one at a time::
 
@@ -58,6 +62,14 @@ a child's output can never corrupt the stream. Diagnostics go to stderr.
 4. ``{"type": "shutdown"}``, EOF on stdin, or SIGTERM, SIGHUP, SIGQUIT or
    SIGINT: stop llama-server, exit (0 for the first two, 130 for a signal).
 
+Parent death: on Linux the worker asks the kernel for SIGTERM when the
+thread that started it ends, so a SIGKILLed orchestrator can't leave it and
+llama-server running with a photo in memory. It arms this itself, at
+startup: the orchestrator can't (a ``preexec_fn`` isn't safe once it runs
+other threads, and the CLI always does). If the config's ``parent_pid``
+isn't its parent any more, the orchestrator died before that took effect,
+and the worker exits 1 without starting anything.
+
 Backends:
 
 * ``stub``: no model. Deterministic, schema-valid English output derived
@@ -66,7 +78,12 @@ Backends:
   trying the pipeline and for tests.
 * ``llama``: ``llama-server`` from llama.cpp, bound to 127.0.0.1 on a free
   port, with a random API key passed through the environment (never argv),
-  so other local processes can't use it, and in offline mode. On Linux the
+  so other local processes can't use it, and in offline mode. It sees none
+  of the llama.cpp settings the user may have elsewhere: no ``LLAMA_*``,
+  ``MTMD_*``, ``HF_*`` or ``HUGGING*`` variables but the worker's own, and
+  an empty private ``XDG_CONFIG_HOME``, so the user's
+  ``~/.config/llama.cpp/config.ini`` (which current builds apply before
+  their environment and command line) is never read. On Linux the
   worker also checks that the process answering on that port really is its
   llama-server before sending it anything, and llama-server gets SIGTERM if
   the worker dies, however it dies. It runs in a process group of its own,
@@ -84,6 +101,7 @@ import base64
 import collections
 import colorsys
 import contextlib
+import ctypes
 import http.client
 import io
 import json
@@ -94,6 +112,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -124,6 +143,22 @@ _HIDDEN_LINE = "[line hidden: it contained image data]"
 _MAX_RESPONSE = 4 << 20
 _HEALTH_TIMEOUT_S = 2.0
 _STOP_GRACE_S = 3.0
+_PR_SET_PDEATHSIG = 1
+
+SYSTEM_LLAMA_CONFIG = "/etc/llama.cpp/config.ini"
+"""llama.cpp's system-wide settings. From about b10400 every llama.cpp program
+applies this file, then ``${XDG_CONFIG_HOME:-~/.config}/llama.cpp/config.ini``,
+before its environment and command line, so either can set any option at
+all (``rpc``, ``api-key``, ``log-file``...). The user's file is hidden by
+pointing XDG_CONFIG_HOME elsewhere; no environment hides this one, so the
+worker refuses to start llama-server while it exists (until the M3
+sandbox can mask it)."""
+
+# Environment variables llama.cpp reads as settings. LLAMA_* covers every
+# option under each name it has had (LLAMA_ARG_*, and the LLAMA_LOG_FILE,
+# LLAMA_OFFLINE... of older builds), MTMD_* the vision side, HF_* and
+# HUGGING* where models come from. Only the worker's own get through.
+_LLAMA_ENV_PREFIXES = ("LLAMA_", "MTMD_", "HF_", "HUGGING")
 
 # The only llama-server options server_args may carry: ones that change speed,
 # memory, GPU placement, sampling defaults or logging, and nothing else. An
@@ -204,6 +239,7 @@ class _Config:
     server_args: tuple[str, ...] = ()
     load_timeout_s: int = 300
     request_timeout_s: int = 600
+    parent_pid: int | None = None
 
 
 def _parse_config(msg: dict[str, Any]) -> _Config:
@@ -228,6 +264,9 @@ def _parse_config(msg: dict[str, Any]) -> _Config:
     gpu_layers = msg.get("gpu_layers")
     if gpu_layers is not None:
         gpu_layers = integer("gpu_layers", 0, 0)
+    parent_pid = msg.get("parent_pid")
+    if parent_pid is not None:
+        parent_pid = integer("parent_pid", 0, 1)
     server_args = msg.get("server_args", [])
     if not isinstance(server_args, list) or not all(isinstance(a, str) for a in server_args):
         raise _Fatal("bad_config", "server_args must be a list of strings")
@@ -247,6 +286,7 @@ def _parse_config(msg: dict[str, Any]) -> _Config:
         server_args=tuple(server_args),
         load_timeout_s=integer("load_timeout_s", 300, 1),
         request_timeout_s=integer("request_timeout_s", 600, 1),
+        parent_pid=parent_pid,
     )
 
 
@@ -498,6 +538,7 @@ class _LlamaBackend:
         self.key = secrets.token_urlsafe(32)
         self.port = 0
         self.proc: subprocess.Popen[bytes] | None = None
+        self.config_dir: str | None = None
         self.log = _LogTail()
 
     # -- lifecycle --
@@ -516,6 +557,15 @@ class _LlamaBackend:
         for label, path in (("model", cfg.model), ("vision projector (mmproj)", cfg.mmproj)):
             if not path or not os.path.isfile(path):
                 raise _Fatal("missing_model", f"the {label} file was not found: {path!r}")
+        if os.path.lexists(SYSTEM_LLAMA_CONFIG):
+            raise _Fatal(
+                "bad_config",
+                f"llama.cpp's system-wide settings file {SYSTEM_LLAMA_CONFIG} exists. Current "
+                "llama-server builds apply it before anything As If sets, so it could make "
+                "llama-server send work to another machine or accept other keys. As If won't "
+                "start llama-server while it's there. If nothing else needs it, rename or "
+                "remove it (that takes an administrator, e.g. with sudo mv).",
+            )
 
         self.port = _free_port()
         argv = [binary, "-m", cfg.model, "--mmproj", cfg.mmproj]
@@ -526,16 +576,25 @@ class _LlamaBackend:
             argv += ["-ngl", str(cfg.gpu_layers)]
         argv += cfg.server_args
 
-        # LLAMA_ARG_* variables configure llama-server too; only ours get through.
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if not k.startswith("LLAMA_ARG_") and k != "LLAMA_API_KEY"
-        }
+        env = {k: v for k, v in os.environ.items() if not k.startswith(_LLAMA_ENV_PREFIXES)}
         env["LLAMA_API_KEY"] = env["LLAMA_ARG_API_KEY"] = self.key
-        # --offline as a variable: a build that predates it ignores the
-        # variable, where it would refuse the flag. No option turns it off.
-        env["LLAMA_ARG_OFFLINE"] = "1"
+        # Offline mode as a variable, under both of its names: builds from
+        # about b5500 to b9320 read LLAMA_OFFLINE, later ones LLAMA_ARG_OFFLINE,
+        # and each ignores the other (as older builds, which have no offline
+        # mode and no download on start, ignore both). No option turns it off.
+        env["LLAMA_OFFLINE"] = env["LLAMA_ARG_OFFLINE"] = "1"
+        # An empty config dir of our own (0700, so nobody can plant a
+        # config.ini in it), in place of the user's ~/.config. HOME stays: GPU
+        # drivers keep their shader caches under it.
+        try:
+            self.config_dir = tempfile.mkdtemp(prefix="asif-llama-config-")
+        except OSError as exc:
+            raise _Fatal(
+                "server_start",
+                "no private temporary folder could be made for llama-server: "
+                f"{exc.strerror or exc}",
+            ) from exc
+        env["XDG_CONFIG_HOME"] = self.config_dir
         try:
             self.proc = subprocess.Popen(
                 argv,
@@ -582,16 +641,18 @@ class _LlamaBackend:
 
     def close(self) -> None:
         proc, self.proc = self.proc, None
-        if proc is None:
-            return
-        # The whole group, even if llama-server itself is gone: a wrapper
-        # script may have left a child behind.
-        _signal_group(proc.pid, signal.SIGTERM)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=_STOP_GRACE_S)
-        _signal_group(proc.pid, signal.SIGKILL)
-        proc.wait()
-        self.log.join(timeout=1)
+        if proc is not None:
+            # The whole group, even if llama-server itself is gone: a wrapper
+            # script may have left a child behind.
+            _signal_group(proc.pid, signal.SIGTERM)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=_STOP_GRACE_S)
+            _signal_group(proc.pid, signal.SIGKILL)
+            proc.wait()
+            self.log.join(timeout=1)
+        config_dir, self.config_dir = self.config_dir, None
+        if config_dir is not None:
+            shutil.rmtree(config_dir, ignore_errors=True)
 
     # -- requests --
 
@@ -808,6 +869,18 @@ def _serve(backend: _Backend, stdin: IO[bytes], out: _Out) -> int:
     return 0
 
 
+def _stop_with_parent() -> None:
+    """Have the kernel send us SIGTERM when our parent dies (Linux only).
+
+    Set here, not by the orchestrator: a ``preexec_fn`` isn't safe once a
+    process runs other threads, and the CLI always does by then.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    with contextlib.suppress(OSError, AttributeError):
+        ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
+
+
 def main() -> int:
     # Before any photo is read: a core dump would write its pixels to disk.
     # llama-server inherits the limit, and can't raise it again.
@@ -816,6 +889,9 @@ def main() -> int:
     # llama-server has a session of its own, so a closed terminal or Ctrl+\
     # no longer reaches it: these signals must unwind into close() instead.
     install_stop_signals()
+    # After the handlers, so a dead orchestrator's SIGTERM unwinds into
+    # close() like any other, and before anything is started.
+    _stop_with_parent()
     stdin = sys.stdin.buffer
     backend: _Backend | None = None
     try:
@@ -827,6 +903,10 @@ def main() -> int:
             if msg is None:
                 raise _Fatal("bad_config", "the first line must be a JSON config message")
             cfg = _parse_config(msg)
+            if cfg.parent_pid is not None and os.getppid() != cfg.parent_pid:
+                # It died before the death signal was armed: nobody is listening.
+                print("asif worker: the orchestrator has exited; stopping", file=sys.stderr)
+                return 1
             backend = _LlamaBackend(cfg) if cfg.backend == "llama" else _StubBackend(cfg)
             backend.start()
         except _Fatal as exc:

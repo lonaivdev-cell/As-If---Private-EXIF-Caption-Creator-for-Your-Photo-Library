@@ -955,15 +955,10 @@ def test_dependencies_with_versions_trimmed_to_one_line() -> None:
             "proton-drive": "/usr/local/bin/proton-drive",
         }
     )
-    probe.commands["llama-server --version"] = (
-        0,
-        "\nversion: 4567 (1a2b3c4d)\nbuilt with cc (GCC) 13.2.0 for x86_64-linux-gnu\n",
-    )
-    probe.commands["bwrap --version"] = (0, "bubblewrap 0.9.0\n")
+    probe.commands["bwrap --version"] = (0, "\nbubblewrap 0.9.0\nmore text\n")
     deps = {d.name: d for d in find_dependencies(Config(), probe)}
     assert list(deps) == ["exiftool", "llama-server", "bwrap", "age", "rclone", "proton-drive"]
     assert deps["exiftool"].version == "12.76" and deps["exiftool"].required
-    assert deps["llama-server"].version == "version: 4567 (1a2b3c4d)"
     assert deps["bwrap"].version == "bubblewrap 0.9.0" and not deps["bwrap"].required
     assert not deps["age"].found and deps["age"].path is None
     assert all(d.purpose for d in deps.values())
@@ -972,23 +967,19 @@ def test_dependencies_with_versions_trimmed_to_one_line() -> None:
     assert not any("proton-drive" in argv[0] for argv in probe.ran)
 
 
-def test_llama_server_version_skips_backend_loading_lines() -> None:
-    # Release builds load their backends before handling --version, and log it.
+def test_llama_server_is_found_but_never_run() -> None:
+    # Even --version applies the user's LLAMA_* variables and config.ini files
+    # first, and an rpc= among them connects to another machine.
     probe = linux()
     probe.programs["llama-server"] = "/usr/local/bin/llama-server"
-    probe.commands["llama-server --version"] = (
-        0,
-        "load_backend: loaded RPC backend from /opt/llama/libggml-rpc.so\n"
-        "ggml_cuda_init: found 1 CUDA devices:\n"
-        "  Device 0: NVIDIA GeForce RTX 3060, compute capability 8.6, VMM: yes\n"
-        "load_backend: loaded CUDA backend from /opt/llama/libggml-cuda.so\n"
-        "version: 6123 (abc1234)\n"
-        "built with cc (Ubuntu 13.3.0) 13.3.0 for x86_64-linux-gnu\n",
-    )
+    probe.commands["llama-server --version"] = (0, "version: 6123 (abc1234)\n")
     report = run_doctor(Config(), probe)
     deps = {d.name: d for d in report.deps}
-    assert deps["llama-server"].version == "version: 6123 (abc1234)"
-    assert check(report, "llama-server").summary == "llama-server found (version: 6123 (abc1234))."
+    assert deps["llama-server"].found and deps["llama-server"].version is None
+    assert (
+        check(report, "llama-server").summary == "llama-server found (/usr/local/bin/llama-server)."
+    )
+    assert not any("llama-server" in argv[0] for argv in probe.ran)
 
 
 def test_llama_server_from_the_config_path() -> None:
@@ -996,9 +987,32 @@ def test_llama_server_from_the_config_path() -> None:
     cfg.model.llama_server = "/opt/llama/bin/llama-server"
     probe = linux()
     probe.programs["/opt/llama/bin/llama-server"] = "/opt/llama/bin/llama-server"
-    probe.commands["llama-server --version"] = (0, "version: 1 (abc)\n")
     report = run_doctor(cfg, probe)
     assert check(report, "llama-server").status == "ok"
+    assert "/opt/llama/bin/llama-server" in check(report, "llama-server").summary
+
+
+@pytest.mark.parametrize("how", ["readable", "listed only"])
+def test_a_system_wide_llama_cpp_settings_file_fails(how: str) -> None:
+    # llama-server applies it before anything As If sets; the worker refuses to start then.
+    probe = linux()
+    probe.programs["llama-server"] = "/usr/bin/llama-server"
+    if how == "readable":
+        probe.files["/etc/llama.cpp/config.ini"] = "rpc = 10.0.0.2:50052\n"
+    else:  # unreadable, or a dangling link: llama-server may still find it
+        probe.dirs["/etc/llama.cpp"] = ["config.ini"]
+    report = run_doctor(Config(), probe)
+    settings = check(report, "llama.cpp settings")
+    assert settings.status == "fail"
+    assert "/etc/llama.cpp/config.ini" in settings.summary and "sudo mv" in settings.hint
+    assert "10.0.0.2" not in settings.summary + settings.hint
+    assert "1 problem above" in render(report)
+
+
+def test_no_llama_cpp_settings_check_without_the_file() -> None:
+    probe = linux()
+    probe.dirs["/etc/llama.cpp"] = ["config.ini.off"]
+    assert all(c.name != "llama.cpp settings" for c in run_doctor(Config(), probe).checks)
 
 
 def test_missing_llama_server_warns_and_mentions_the_stub_model() -> None:

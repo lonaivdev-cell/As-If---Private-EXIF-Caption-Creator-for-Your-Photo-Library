@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import selectors
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
-from asif.proc import die_with_parent
+from asif.proc import with_parent_death
 
 NS_CONFIG = Path(__file__).with_name("asif_ns.config")
 
@@ -80,19 +81,21 @@ class ExifTool:
     def start(self) -> None:
         if self.alive:
             return
-        argv = [self.executable]
+        resolved = shutil.which(self.executable)
+        if resolved is None:
+            raise ExifToolError(f"exiftool not found ({self.executable!r}); run `asif doctor`")
+        argv = [resolved]
         if self.config is not None:
             argv += ["-config", str(self.config)]
         argv += ["-stay_open", "True", "-@", "-"]
         try:
             self._proc = subprocess.Popen(
-                argv,
+                # exiftool -stay_open never exits on its own, even when its
+                # stdin closes: make sure it dies with us, even on SIGKILL.
+                with_parent_death(argv),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                # exiftool -stay_open never exits on its own, even when its
-                # stdin closes: make sure it dies with us, even on SIGKILL.
-                preexec_fn=die_with_parent(),
             )
         except FileNotFoundError as exc:
             raise ExifToolError(

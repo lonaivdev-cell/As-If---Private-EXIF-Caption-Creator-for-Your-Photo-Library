@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -29,23 +30,37 @@ def _python(code: str) -> subprocess.CompletedProcess[str]:
 def test_cli_disables_core_dumps_for_itself_and_its_children() -> None:
     result = _python(
         """
-        import resource, subprocess, sys
+        import ctypes, json, resource, subprocess, sys
         from asif import cli
         sys.argv = ["asif", "version"]
         try:
             cli.main()
         except SystemExit:
             pass
-        print(resource.getrlimit(resource.RLIMIT_CORE))
-        child = subprocess.run(["sh", "-c", "ulimit -c; ulimit -H -c"],
-                               capture_output=True, text=True)
-        print(child.stdout.split())
+        report = {
+            "limit": resource.getrlimit(resource.RLIMIT_CORE),
+            "dumpable": ctypes.CDLL(None).prctl(3, 0, 0, 0, 0),  # PR_GET_DUMPABLE
+            "filter": open("/proc/self/coredump_filter").read().strip(),
+        }
+        child = subprocess.run(
+            [sys.executable, "-c",
+             "import json, resource; print(json.dumps(resource.getrlimit(resource.RLIMIT_CORE)));"
+             "print(open('/proc/self/coredump_filter').read().strip())"],
+            capture_output=True, text=True)
+        report["child"] = child.stdout.splitlines()
+        print(json.dumps(report))
         """
     )
     assert result.returncode == 0, result.stderr
-    lines = result.stdout.strip().splitlines()
-    assert lines[-2] == "(0, 0)"
-    assert lines[-1] == "['0', '0']"  # inherited, and the hard limit can't be raised again
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    # 1 byte: no core file, and the kernel won't pipe a dump to a crash
+    # reporter either (0 if the hard limit was already 0).
+    assert report["limit"] in ([1, 1], [0, 0])
+    assert report["dumpable"] == 0
+    assert int(report["filter"], 16) == 0
+    # Inherited by children, and they can't raise it again.
+    assert json.loads(report["child"][0]) == report["limit"]
+    assert int(report["child"][1], 16) == 0
 
 
 @pytest.mark.parametrize("sig", ["SIGTERM", "SIGHUP", "SIGQUIT"])
@@ -220,3 +235,119 @@ def _alive(pid: int) -> bool:
     except OSError:
         return False
     return state != "Z"
+
+
+def test_shielded_cleanup_finishes_before_a_signal_is_acted_on() -> None:
+    result = _python(
+        """
+        import os, signal
+        from asif import proc
+        steps = []
+        try:
+            with proc.shielded():
+                os.kill(os.getpid(), signal.SIGTERM)
+                steps.append("cleanup finished")
+        except KeyboardInterrupt:
+            steps.append("then stopped")
+        print(steps)
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "['cleanup finished', 'then stopped']"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+def test_exiftool_dies_with_its_parent_even_with_threads_running(tmp_path: Path) -> None:
+    # The real CLI always has a thread running (rich's progress refresh) when
+    # exiftool starts; a preexec_fn would be skipped then. The trampoline isn't.
+    import shutil
+
+    if not shutil.which("exiftool"):
+        pytest.skip("exiftool not installed")
+    pidfile = tmp_path / "pid"
+    orchestrator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""
+                import threading, time
+                from asif.meta.exiftool import ExifTool
+                threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
+                et = ExifTool()
+                et.start()
+                et.version()  # by now the trampoline has become exiftool
+                open({str(pidfile)!r}, "w").write(str(et._proc.pid))
+                time.sleep(60)
+                """
+            ),
+        ]
+    )
+    try:
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text():
+                break
+            time.sleep(0.1)
+        exiftool_pid = int(pidfile.read_text())
+        orchestrator.kill()
+        orchestrator.wait()
+        for _ in range(50):
+            if not _alive(exiftool_pid):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("exiftool outlived its SIGKILLed parent")
+    finally:
+        orchestrator.kill()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+def test_sigkill_of_the_real_cli_leaves_no_helper_running(tmp_path: Path) -> None:
+    """`asif caption` (with rich's progress thread running), killed with SIGKILL."""
+    import shutil
+
+    if not shutil.which("exiftool"):
+        pytest.skip("exiftool not installed")
+    from tests.fixtures.make_fixtures import MAKERS
+
+    src = tmp_path / "src"
+    src.mkdir()
+    MAKERS["plain.jpg"](src / "a.jpg")
+    ready = tmp_path / "ready"
+    driver = textwrap.dedent(
+        f"""
+        import sys, time
+        from pathlib import Path
+        from asif import cli
+        from asif.pipeline import local
+
+        def slow_describe(ctx, ram, img):
+            Path({str(ready)!r}).write_text("x")
+            time.sleep(60)
+
+        local._describe = slow_describe
+        sys.argv = ["asif", "caption", {str(src)!r}, {str(tmp_path / "out")!r}, "-m", "stub"]
+        cli.main()
+        """
+    )
+    env = {**os.environ, "ASIF_HOME": str(tmp_path / "home")}
+    run = subprocess.Popen([sys.executable, "-c", driver], env=env, stderr=subprocess.DEVNULL)
+    try:
+        for _ in range(300):
+            if ready.exists():
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("the run never reached the model")
+        children = _children(run.pid)
+        assert len(children) >= 2  # exiftool and the model worker
+        run.kill()
+        run.wait()
+        for _ in range(100):
+            if not [pid for pid in children if _alive(pid)]:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"helpers outlived the SIGKILLed orchestrator: {children}")
+    finally:
+        run.kill()

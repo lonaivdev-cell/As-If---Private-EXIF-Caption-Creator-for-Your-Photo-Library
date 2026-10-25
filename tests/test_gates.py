@@ -25,6 +25,7 @@ from typing import Any, Literal
 import pytest
 from PIL import Image, ImageCms, PngImagePlugin
 
+from asif.meta import structure
 from asif.meta.exiftool import ExecResult, ExifTool, ExifToolError
 from asif.meta.gates import (
     MAX_GROWTH,
@@ -39,15 +40,19 @@ from asif.meta.gates import (
     fingerprint,
     snapshot,
 )
-from asif.meta.structure import jpeg_eoi_offset
+from asif.meta.structure import C2PA_PROBLEM, jpeg_eoi_offset
 from tests.conftest import HAVE_EXIFTOOL
 from tests.test_structure import (
     LITERAL,
     Tiff,
+    app11,
     ascii_entry,
     canon_maker_note,
+    chunk,
     ext_xmp,
+    jumbf,
     pillow_tiff,
+    rchunk,
     std_xmp,
     undefined,
     xmp_packet,
@@ -496,6 +501,13 @@ def test_tiff_data_of_every_page_may_move() -> None:
         "IFD1:ThumbnailOffset",
         "SubIFD:StripOffsets",
         "SubIFD2:TileOffsets",
+        # exiftool names a second page's SubIFD, or one inside another, plain "SubIFD" again.
+        "SubIFD:StripOffsets#2",
+        # JPEG images behind tag 0x201 outside IFD1, covered by the image-data hash.
+        "IFD0:OtherImageStart",
+        "SubIFD1:OtherImageStart",
+        "SubIFD:JpgFromRawStart",
+        "IFD2:JpgFromRawStart",
     ]
     for key in moved:
         assert _allowed(key, "tiff", "xmp")
@@ -1035,6 +1047,78 @@ def test_tiff_preview_and_thumbnail_move_but_stay_checked(
     assert "IFD1:ThumbnailImage" in protected.detail
 
 
+def _subifd(t: Tiff, at: int) -> tuple[int, int, int, bytes]:
+    return (0x014A, 13, 1, struct.pack("<I", at))
+
+
+def _subifd_on_each_page(t: Tiff) -> int:
+    page2 = t.page(16, 12, _subifd(t, t.page(8, 8, t.long(254, 1), seed=50)), seed=60)
+    return t.page(32, 24, _subifd(t, t.page(8, 8, t.long(254, 1), seed=40)), next_ifd=page2)
+
+
+def _nested_subifds(t: Tiff) -> int:
+    inner = t.page(4, 4, t.long(254, 1), seed=50)
+    return t.page(32, 24, _subifd(t, t.page(8, 8, t.long(254, 1), _subifd(t, inner), seed=40)))
+
+
+def _jpeg_in(t: Tiff, where: str) -> int:
+    """Tag 0x201's JPEG in IFD0, a SubIFD or IFD2 (exiftool's OtherImage, JpgFromRaw)."""
+    thumb = _thumbnail()
+    entries = (t.long(0x0201, t.blob(thumb)), t.long(0x0202, len(thumb)))
+    if where == "IFD0":
+        return t.page(32, 24, *entries)
+    if where == "SubIFD":
+        return t.page(32, 24, _subifd(t, t.ifd(t.long(254, 1), *entries)))
+    return t.page(32, 24, next_ifd=t.page(16, 12, seed=60, next_ifd=t.ifd(*entries)))
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+@pytest.mark.parametrize(
+    ("build", "moved"),
+    [
+        pytest.param(_subifd_on_each_page, "SubIFD:StripOffsets#2", id="subifd-on-each-page"),
+        pytest.param(_nested_subifds, "SubIFD:StripOffsets#2", id="nested-subifds"),
+        pytest.param(lambda t: _jpeg_in(t, "IFD0"), "IFD0:OtherImageStart", id="ifd0-jpeg"),
+        pytest.param(lambda t: _jpeg_in(t, "SubIFD"), "SubIFD:JpgFromRawStart", id="subifd-jpeg"),
+        pytest.param(lambda t: _jpeg_in(t, "IFD2"), "IFD2:JpgFromRawStart", id="ifd2-jpeg"),
+    ],
+)
+def test_every_moved_tiff_image_passes_and_stays_checked(
+    et: ExifTool, tmp_path: Path, compat: Compat, build: Callable[[Tiff], int], moved: str
+) -> None:
+    path = tmp_path / "pyramid.tif"
+    t = Tiff()
+    path.write_bytes(t.done(build(t)))
+    before = snapshot(et, path)
+    assert moved in before.tags
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
+
+    # The image moved, but what it holds is still checked.
+    at = int(str(snapshot(et, path).tags[moved]).split()[0])
+    _flip(path, at + 5)
+    assert "equality" in failing(check_written(et, before, path, compat=compat))
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_tiled_jpeg_tiff_is_still_hashed_and_passes(
+    et: ExifTool, tmp_path: Path, compat: Compat
+) -> None:
+    # Only JPEG *strips* hide the image from exiftool's hash; tiles don't.
+    path = tmp_path / "tiled.tif"
+    _tiled_tiff(path)
+    data = bytearray(path.read_bytes())
+    entry = data.index(struct.pack("<HHI", 259, 3, 1))
+    data[entry + 8 : entry + 10] = struct.pack("<H", 7)  # Compression: JPEG
+    path.write_bytes(bytes(data))
+    before = snapshot(et, path)
+    assert before.tags["IFD0:Compression"] == 7 and before.image_hash
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
+
+
 def test_unknown_tiff_tags_are_compared(et: ExifTool, tmp_path: Path) -> None:
     path = tmp_path / "scanner.tif"
     settings = b"PRIVATE-SCANNER-SETTINGS" * 4
@@ -1210,6 +1294,259 @@ def test_unknown_format_cant_be_proven(tmp_path: Path) -> None:
     assert structure == GateResult(
         "structure", False, f"can't prove a write is safe: {before.unprovable}"
     )
+
+
+def test_tiff_preview_exiftool_would_move_is_refused(et: ExifTool, tmp_path: Path) -> None:
+    # Page 2 in JPEG strips without a SubfileType: exiftool takes it for a
+    # preview, which its hash doesn't cover, and moves it on every write.
+    path = tmp_path / "scan.tif"
+    t = Tiff()
+    thumb = _thumbnail()
+    at = t.blob(thumb)
+    page2 = t.ifd(
+        t.long(256, 16),
+        t.long(257, 12),
+        t.short(258, 8, 8, 8),
+        t.short(259, 7),  # JPEG
+        t.short(262, 6),  # YCbCr
+        t.long(273, at),
+        t.short(277, 3),
+        t.long(278, 12),
+        t.long(279, len(thumb)),
+    )
+    path.write_bytes(t.done(t.page(32, 24, next_ifd=page2)))
+    before = snapshot(et, path)
+    assert "IFD1:PreviewImageStart" in before.tags
+    assert before.unprovable == (
+        "it's a TIFF with an embedded preview that exiftool would move, which As If can't check"
+    )
+    legit_write(et, path, "xmp", before.image_hash)
+    # Why: the protected gate would fail after the model's work.
+    unflagged = dataclasses.replace(before, unprovable=None)
+    protected = by_name(check_written(et, unflagged, path, compat="xmp"))["protected"]
+    assert protected.detail == "changed: IFD1:PreviewImageStart"
+
+
+def test_jpeg_compressed_tiff_is_a_format_limit_not_corrupt(et: ExifTool, tmp_path: Path) -> None:
+    # exiftool takes the JPEG strips of Pillow's (and ImageMagick's, libtiff's)
+    # JPEG TIFFs for a preview and computes no image-data hash at all.
+    path = tmp_path / "scan.tif"
+    path.write_bytes(pillow_tiff(compression="jpeg"))
+    with pytest.raises(ExifToolError):
+        et.image_data_hash(path)
+    before = snapshot(et, path)
+    assert before.image_hash == ""
+    assert before.unprovable == "it's a JPEG-compressed TIFF, whose image data exiftool can't hash"
+    assert not before.unprovable.startswith("its structure can't be checked")  # not quarantined
+    assert "structure" in failing(check_written(et, before, path, compat="xmp"))
+
+
+class UnhashableExifTool(FakeExifTool):
+    def image_data_hash(self, path: Path) -> str:
+        raise ExifToolError("exiftool couldn't compute the image-data hash")
+
+
+@pytest.mark.parametrize(
+    "dump",
+    [
+        pytest.param({}, id="nothing-known"),
+        pytest.param({"IFD0:Compression": 1, "IFD0:StripOffsets": 8}, id="uncompressed"),
+        pytest.param(
+            {"IFD0:Compression": 7, "IFD0:PreviewImageStart": 8, "IFD0:StripOffsets": 8},
+            id="strips-too",
+        ),
+    ],
+)
+def test_other_files_exiftool_cant_hash_still_raise(tmp_path: Path, dump: dict[str, Any]) -> None:
+    # Only the one known format limit is let through; anything else may be corrupt.
+    path = tmp_path / "scan.tif"
+    path.write_bytes(pillow_tiff())
+    fake = UnhashableExifTool(json.dumps([{"SourceFile": "scan.tif", **dump}]))
+    with pytest.raises(ExifToolError):
+        snapshot(fake, path)  # type: ignore[arg-type]
+    jpeg_like = tmp_path / "photo.jpg"
+    jpeg_like.write_bytes(b"\xff\xd8\xff\xd9")
+    fake = UnhashableExifTool(
+        json.dumps(
+            [{"SourceFile": "photo.jpg", "IFD0:Compression": 7, "IFD0:PreviewImageStart": 8}]
+        )
+    )
+    with pytest.raises(ExifToolError):
+        snapshot(fake, jpeg_like)  # type: ignore[arg-type]
+
+
+def _document_ancestors(path: Path, count: int) -> None:
+    """Photoshop's well-known bloat: an XMP list of every document ever pasted in."""
+    items = "".join(f"<rdf:li>xmp.did:{i:032x}</rdf:li>" for i in range(count))
+    body = f"<photoshop:DocumentAncestors><rdf:Bag>{items}</rdf:Bag></photoshop:DocumentAncestors>"
+    data = path.read_bytes()
+    path.write_bytes(data[:2] + std_xmp(xmp_packet(body)) + data[2:])
+
+
+def test_metadata_exiftool_reads_only_in_part_is_refused(
+    et: ExifTool, fixture_copy: FixtureCopy
+) -> None:
+    path = fixture_copy("plain.jpg")
+    _document_ancestors(path, 1001)
+    before = snapshot(et, path)
+    assert before.unprovable == (
+        "exiftool reads only part of its metadata, so As If can't prove a write keeps the rest"
+    )
+    # Why: exiftool read 1000 of the 1001 items, so no gate could compare the last one.
+    assert len(before.tags["XMP-photoshop:DocumentAncestors"]) == 1000
+
+    path = fixture_copy("exif.jpg")
+    _document_ancestors(path, 1000)  # within exiftool's limit: nothing to refuse
+    assert snapshot(et, path).unprovable is None
+
+
+@pytest.mark.parametrize(
+    ("warning", "unprovable"),
+    [
+        pytest.param("[Minor] Extracted only 1000 ns:Tag items", True, id="Minor"),
+        pytest.param("[Minor] Not decoding some large array(s)", True, id="large-array"),
+        pytest.param("[minor] Possibly incorrect maker notes offsets", False, id="minor"),
+        pytest.param("Unrecognized MakerNotes", False, id="plain"),
+    ],
+)
+def test_exiftool_read_warnings_that_mean_lost_data(
+    tmp_path: Path, warning: str, unprovable: bool
+) -> None:
+    # "[Minor]" (capital M) is exiftool's mark for a part it skipped while reading.
+    path = tmp_path / "photo.jpg"
+    path.write_bytes(b"\xff\xd8\xff\xd9")
+    dump = [{"SourceFile": "photo.jpg", "ExifTool:Warning": warning, "File:Comment": "x"}]
+    before = snapshot(FakeExifTool(json.dumps(dump)), path)  # type: ignore[arg-type]
+    expected = (
+        "exiftool reads only part of its metadata, so As If can't prove a write keeps the rest"
+    )
+    assert before.unprovable == (expected if unprovable else None)
+    assert "ExifTool:Warning" not in before.tags
+    copies = [
+        {
+            "SourceFile": "photo.jpg",
+            "ExifTool:Warning": "[minor] other",
+            "ExifTool:Copy1:Warning": warning,
+        }
+    ]
+    again = snapshot(FakeExifTool(json.dumps(copies)), path)  # type: ignore[arg-type]
+    assert again.unprovable == before.unprovable  # every warning counts, not just the first
+
+
+def test_cdata_markup_exiftool_cant_carry_over_is_refused(
+    et: ExifTool, fixture_copy: FixtureCopy
+) -> None:
+    body = "<photoshop:City><![CDATA[Lisbon <b>old town</b>]]></photoshop:City>"
+    path = _with_xmp("jpeg", fixture_copy("plain.jpg"), xmp_packet(body))
+    before = snapshot(et, path)
+    assert before.unprovable == "its XMP has markup inside a value, which exiftool can't carry over"
+    legit_write(et, path, "xmp", before.image_hash)
+    # Why: exiftool read the markup as a structure and dropped the value.
+    unflagged = dataclasses.replace(before, unprovable=None)
+    results = check_written(et, unflagged, path, compat="xmp")
+    assert by_name(results)["structure"].detail == "1 of the original XMP's values went missing"
+    assert_private(results, "Lisbon", "old town")
+
+
+def _with_c2pa(fmt: str, path: Path) -> Path:
+    """``path`` (a JPEG, PNG or WebP) with a C2PA manifest store where that format keeps it."""
+    data = path.read_bytes()
+    if fmt == "jpeg":
+        path.write_bytes(data[:2] + app11(jumbf()) + data[2:])
+    elif fmt == "png":
+        at = data.index(b"IDAT") - 4
+        path.write_bytes(data[:at] + chunk(b"caBX", jumbf()) + data[at:])
+    else:
+        body = data[12:] + rchunk(b"C2PA", jumbf())
+        path.write_bytes(b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WEBP" + body)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("fmt", "name"), [("jpeg", "exif.jpg"), ("png", "plain.png"), ("webp", "lossless.webp")]
+)
+def test_content_credentials_are_refused(
+    et: ExifTool, fixture_copy: FixtureCopy, monkeypatch: pytest.MonkeyPatch, fmt: str, name: str
+) -> None:
+    # A write leaves the manifest's bytes alone but breaks its signature.
+    path = _with_c2pa(fmt, fixture_copy(name))
+    before = snapshot(et, path)
+    assert before.tags["JUMBF:JUMDLabel"] == "c2pa"
+    assert before.unprovable == C2PA_PROBLEM
+    assert not before.unprovable.startswith("its structure can't be checked")
+    # exiftool's reading alone is enough, should the byte check ever miss one.
+    monkeypatch.setattr(structure, "write_hazard", lambda data: None)
+    assert snapshot(et, path).unprovable == C2PA_PROBLEM
+
+
+def _apple_png(path: Path, *, xmp_first: bool) -> None:
+    """``path`` as Apple's ImageIO writes it: iDOT, then the image data in two
+    IDAT chunks (and, with ``xmp_first``, XMP ahead of iDOT, as in a screenshot)."""
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 24), (90, 140, 200)).save(buf, "PNG")
+    data = buf.getvalue()
+    idat_at = data.index(b"IDAT") - 4
+    size = int.from_bytes(data[idat_at : idat_at + 4], "big")
+    pixels = data[idat_at + 8 : idat_at + 8 + size]
+    idats = chunk(b"IDAT", pixels[: size // 2]) + chunk(b"IDAT", pixels[size // 2 :])
+    second = 40 + 12 + size // 2  # from iDOT's start: iDOT itself, then the first IDAT
+    idot = chunk(b"iDOT", struct.pack(">7I", 2, 0, 12, 40, 12, 12, second))
+    xmp = (
+        chunk(b"iTXt", b"XML:com.adobe.xmp\x00\x00\x00\x00\x00" + xmp_packet(""))
+        if xmp_first
+        else b""
+    )
+    path.write_bytes(data[:idat_at] + xmp + idot + idats + data[idat_at + 12 + size :])
+
+
+def test_apple_idot_png_is_refused_and_caught(et: ExifTool, tmp_path: Path) -> None:
+    path = tmp_path / "IMG_0001.png"
+    _apple_png(path, xmp_first=False)
+    before = snapshot(et, path)
+    assert before.unprovable == "it has Apple's iDOT chunk, whose offsets new XMP would break"
+    legit_write(et, path, "xmp", before.image_hash)
+    # Why: exiftool put the XMP between iDOT and the image data. Every byte
+    # it points to is unchanged, yet it points at the wrong place now.
+    unflagged = dataclasses.replace(before, unprovable=None)
+    results = check_written(et, unflagged, path, compat="xmp")
+    assert failing(results) == {"structure"}
+    assert by_name(results)["structure"].detail == (
+        "PNG iDOT chunk no longer points at the same image data"
+    )
+
+
+def test_apple_png_with_xmp_ahead_of_idot_passes(et: ExifTool, tmp_path: Path) -> None:
+    # A macOS screenshot: exiftool rewrites that XMP where it is. (As If
+    # writes no IPTC into a PNG, so "wide" is the same here.)
+    path = tmp_path / "Screenshot.png"
+    _apple_png(path, xmp_first=True)
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    legit_write(et, path, "xmp", before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat="xmp")), results
+
+
+@pytest.mark.parametrize("compat", ["xmp", "wide"])
+def test_photoshop_7_era_xmp_passes(
+    et: ExifTool, fixture_copy: FixtureCopy, compat: Compat
+) -> None:
+    # x:xapmeta/x:xaptk: exiftool reads x:xaptk as the toolkit name and
+    # writes it back as x:xmptk. Nothing of the owner's is lost.
+    packet = (
+        "<?xpacket begin='\ufeff' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+        "<x:xapmeta xmlns:x='adobe:ns:meta/' x:xaptk='XMP toolkit 2.8.2-33, framework 1.5'>"
+        "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+        "<rdf:Description about='uuid:5d0f8a64-4a2f-11d9-8d8a-000a95c8b4b2'"
+        " xmlns:xapMM='http://ns.adobe.com/xap/1.0/mm/'>"
+        "<xapMM:DocumentID>adobe:docid:photoshop:5d0f8a63-4a2f-11d9</xapMM:DocumentID>"
+        "</rdf:Description></rdf:RDF></x:xapmeta><?xpacket end='w'?>"
+    ).encode()
+    path = _with_xmp("jpeg", fixture_copy("plain.jpg"), packet)
+    before = snapshot(et, path)
+    assert before.tags["XMP-x:XMPToolkit"] == "XMP toolkit 2.8.2-33, framework 1.5"
+    assert before.unprovable is None
+    legit_write(et, path, compat, before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat=compat)), results
 
 
 # -- additive-only, enforced by the gate --------------------------------------------------------

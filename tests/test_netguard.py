@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from collections.abc import Iterable
 from pathlib import Path
 
 import asif
@@ -180,24 +181,72 @@ def test_the_probe_catches_an_offender_hiding_behind_a_benign_import(tmp_path: P
     assert ("socket", str(tmp_path / "offender.py")) in bad
 
 
+_DYNAMIC_IMPORTERS = {"import_module", "__import__"}
+
+
+def _imports_in(tree: ast.AST) -> tuple[set[str], list[str]]:
+    """Every module a source file can import, and its unresolvable dynamic imports."""
+    names: set[str] = set()
+    dynamic: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            # "from asif.infer import worker" imports the module asif.infer.worker.
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if called in _DYNAMIC_IMPORTERS:
+                arg = node.args[0] if node.args else None
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    names.add(arg.value)
+                else:
+                    dynamic.append(f"line {node.lineno}")
+    return names, dynamic
+
+
+def _is_under(name: str, roots: Iterable[str]) -> bool:
+    return any(name == r or name.startswith(r + ".") for r in roots)
+
+
 def test_no_orchestrator_source_imports_networking_modules() -> None:
-    # Catches what an import can't: imports inside functions that haven't run.
+    # Catches what importing can't: imports inside functions that haven't
+    # run, dynamic imports, and lazy imports of a network-capable module.
     root = Path(asif.__file__).parent
     offenders = []
+    third_party: set[str] = set()
     for path in sorted(root.rglob("*.py")):
         module = ".".join(("asif", *path.relative_to(root).with_suffix("").parts))
         if module.removesuffix(".__init__") in NETWORK_CAPABLE:
             continue
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            names = []
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                names = [node.module]
-            for name in names:
-                if any(name == f or name.startswith(f + ".") for f in FORBIDDEN):
-                    offenders.append(f"{path.relative_to(root)}:{node.lineno} imports {name}")
+        names, dynamic = _imports_in(ast.parse(path.read_text(encoding="utf-8")))
+        where = path.relative_to(root)
+        offenders += [f"{where}: import by a computed name ({d})" for d in dynamic]
+        for name in sorted(names):
+            if _is_under(name, FORBIDDEN) or _is_under(name, NETWORK_CAPABLE):
+                offenders.append(f"{where} imports {name}")
+            elif not _is_under(name, ("asif",)):
+                third_party.add(name.split(".")[0])
     assert offenders == []
+    # And everything those files could ever import from outside As If, even
+    # lazily, mustn't pull in networking either.
+    _, bad = forbidden_imports(*sorted(third_party))
+    assert bad == []
+
+
+def test_the_source_check_sees_lazy_and_dynamic_imports() -> None:
+    sample = ast.parse(
+        "def later():\n"
+        "    import socket\n"
+        "    from asif.infer import worker\n"
+        "    importlib.import_module('http.client')\n"
+        "    __import__(name)\n"
+    )
+    names, dynamic = _imports_in(sample)
+    assert {"socket", "asif.infer.worker", "http.client"} <= names
+    assert dynamic == ["line 5"]
 
 
 def test_pydantic_plugins_are_disabled_in_the_orchestrator() -> None:

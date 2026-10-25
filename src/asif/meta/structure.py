@@ -11,7 +11,8 @@ exiftool rebuilds a TIFF on every write, so its bytes can't match. Instead,
 ``tiff_layout`` proves exiftool *can* carry everything over: every byte is
 reachable from an IFD it rewrites. ``read_xmp`` reads the XMP packet's own
 text with an XML parser, so a value exiftool's parser misses can't vanish
-unnoticed.
+unnoticed. ``write_hazard`` finds what a write would break even though
+those bytes stay the same: Content Credentials, Apple's iDOT chunk.
 
 Every function takes whole files as bytes and is pure. Messages name
 segments, chunks and byte counts, never file contents: these files are
@@ -256,6 +257,8 @@ _PNG_XMP_KEYWORD = b"XML:com.adobe.xmp"
 _PNG_XMP_RAW_PROFILE = b"Raw profile type xmp"
 # exiftool's (non-standard) home for IPTC in PNG, used for compat = "wide".
 _PNG_IPTC_KEYWORD = b"Raw profile type iptc"
+# Apple's offsets into the image data, for decoding it in parallel.
+_PNG_IDOT = b"iDOT"
 
 
 def _chunk_name(fourcc: bytes) -> str:
@@ -285,13 +288,35 @@ def _png_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, bytes]], bytes]:
             return chunks, data[pos:]
 
 
+def _idot_distances(chunks: list[tuple[bytes, bytes, bytes]]) -> list[list[int]]:
+    """For each ``iDOT`` chunk, how far each ``IDAT`` chunk starts from it.
+
+    Apple's iDOT chunk records where the image data continues, counted
+    from the iDOT chunk's own start, so these must never change.
+    """
+    starts: list[int] = []
+    pos = 8
+    for _ctype, _cdata, raw in chunks:
+        starts.append(pos)
+        pos += len(raw)
+    idats = [at for at, (ctype, _d, _r) in zip(starts, chunks, strict=True) if ctype == b"IDAT"]
+    return [
+        [idat - at for idat in idats]
+        for at, (ctype, _d, _r) in zip(starts, chunks, strict=True)
+        if ctype == _PNG_IDOT
+    ]
+
+
 def compare_png(before: bytes, after: bytes, *, allow_iptc: bool = False) -> list[str]:
     """Chunk-for-chunk (type, data and CRC) in order; ``[]`` means no differences.
 
     Ignores ``iTXt``/``tEXt``/``zTXt`` chunks whose keyword is
     ``XML:com.adobe.xmp`` and, when ``allow_iptc``, ``Raw profile type
-    iptc`` (where exiftool puts IPTC in a PNG). Bytes after ``IEND`` must
-    match too. Raises ``StructureError`` if either side can't be parsed.
+    iptc`` (where exiftool puts IPTC in a PNG). Apple's ``iDOT`` chunk
+    must still point at the same image data: no chunk may appear, vanish
+    or change size between it and the image data. Bytes after ``IEND``
+    must match too. Raises ``StructureError`` if either side can't be
+    parsed.
     """
     ignored = {_PNG_XMP_KEYWORD, _PNG_IPTC_KEYWORD} if allow_iptc else {_PNG_XMP_KEYWORD}
 
@@ -305,6 +330,8 @@ def compare_png(before: bytes, after: bytes, *, allow_iptc: bool = False) -> lis
     chunks_b, tail_b = _png_chunks(before)
     chunks_a, tail_a = _png_chunks(after)
     diffs = _diff_sequences("PNG chunk", kept(chunks_b), kept(chunks_a))
+    if _idot_distances(chunks_b) != _idot_distances(chunks_a):
+        diffs.append("PNG iDOT chunk no longer points at the same image data")
     if tail_b != tail_a:
         diffs.append(_count_diff("PNG data after IEND", len(tail_b), len(tail_a)))
     return diffs
@@ -562,8 +589,10 @@ _XMP_NOTE = "http://ns.adobe.com/xmp/note/"
 _ASIF_NS = "http://ns.as-if.invalid/1.0/"
 _HAS_EXTENDED = f"{_XMP_NOTE} HasExtendedXMP"
 # RDF syntax and bookkeeping exiftool rewrites on every write, so not values:
-# rdf:about/parseType/nodeID, xml:lang (it fixes the case), its own toolkit
-# name (x:xmptk) and the GUID linking the extended XMP (an MD5 of that part).
+# rdf:about/parseType/nodeID, xml:lang (it fixes the case), the toolkit name
+# (x:xmptk, and the x:xaptk of Photoshop 7-era XMP, which exiftool reads as
+# the same tag and writes back as x:xmptk; the writer checks it was kept)
+# and the GUID linking the extended XMP (an MD5 of that part).
 _XMP_NOT_VALUES = frozenset(
     {
         f"{_RDF} about",
@@ -572,6 +601,7 @@ _XMP_NOT_VALUES = frozenset(
         f"{_RDF} nodeID",
         "http://www.w3.org/XML/1998/namespace lang",
         "adobe:ns:meta/ xmptk",
+        "adobe:ns:meta/ xaptk",
         _HAS_EXTENDED,
     }
 )
@@ -599,6 +629,8 @@ class _XmpReader:
         self.markup = False
         # Per open element: ([skipped, has children, has text, parseType Literal], text so far).
         self.stack: list[tuple[list[bool], list[str]]] = []
+        self.cdata: list[str] | None = None
+        """The text of the CDATA section being read, if any."""
 
     def parse(self, packet: bytes) -> None:
         parser = expat.ParserCreate(namespace_separator=" ")
@@ -607,6 +639,8 @@ class _XmpReader:
         parser.StartElementHandler = self._start
         parser.EndElementHandler = self._end
         parser.CharacterDataHandler = self._text
+        parser.StartCdataSectionHandler = self._start_cdata
+        parser.EndCdataSectionHandler = self._end_cdata
         try:
             # Some writers pad the packet with NULs, which XML doesn't allow.
             parser.Parse(packet.rstrip(b"\0"), True)
@@ -644,6 +678,19 @@ class _XmpReader:
     def _text(self, data: str) -> None:
         if self.stack:
             self.stack[-1][1].append(data)
+        if self.cdata is not None:
+            self.cdata.append(data)
+
+    def _start_cdata(self) -> None:
+        self.cdata = []
+
+    def _end_cdata(self) -> None:
+        text, self.cdata = "".join(self.cdata or ()), None
+        # exiftool's parser doesn't know CDATA: "<b>bold</b>" inside one
+        # becomes a structure, losing the text around it, and a lone "<b>"
+        # makes it refuse the write. Any "<" counts, to be safe.
+        if "<" in text and not (self.stack and self.stack[-1][0][0]):
+            self.markup = True
 
     def _end(self, name: str) -> None:
         flags, text = self.stack[-1]
@@ -770,6 +817,63 @@ def _inflate(data: bytes) -> bytes:
     if len(out) > _XMP_MAX:
         raise StructureError("PNG compressed XMP is implausibly large")
     return out
+
+
+# -- what a write would break unseen -----------------------------------------
+
+_APP11 = 0xEB
+# C2PA's manifest store: a JUMBF superbox ("jumb") whose description box
+# ("jumd") has a type UUID starting with "c2pa" and the label "c2pa". In a
+# JPEG it fills APP11 segments ("JP", box instance and sequence number
+# first); PNG and WebP have a chunk of their own for it.
+_C2PA_PNG_CHUNK = b"caBX"
+_C2PA_WEBP_CHUNK = b"C2PA"
+
+
+def _c2pa_box(box: bytes) -> bool:
+    """Is this JUMBF superbox a C2PA manifest store?"""
+    if box[4:8] != b"jumb" or box[12:16] != b"jumd":
+        return False
+    return box[16:20] == b"c2pa" or box[33:38] == b"c2pa\0"  # type UUID, or label
+
+
+C2PA_PROBLEM = "it carries Content Credentials (C2PA), which any change to the file breaks"
+"""Why a file with a C2PA manifest is never written, in plain words."""
+
+
+def write_hazard(data: bytes) -> str | None:
+    """What adding XMP to this JPEG, PNG or WebP would break although every
+    byte the structure check compares stays the same; None if nothing.
+
+    - Content Credentials (C2PA): their signature covers every byte of the
+      file outside the manifest, so any write invalidates them.
+    - Apple's ``iDOT`` PNG chunk, with no XMP before it: exiftool puts new
+      XMP right before the image data, after iDOT, which shifts the data
+      iDOT points to. (``compare_png`` checks that too.)
+
+    In plain words, never values. Raises ``StructureError`` when the file
+    can't be parsed or isn't one of those formats.
+    """
+    fmt = detect_format(data)
+    if fmt == "jpeg":
+        for seg in _jpeg_layout(data).header:
+            if seg.marker == _APP11 and seg.payload[:2] == b"JP" and _c2pa_box(seg.payload[8:]):
+                return C2PA_PROBLEM
+        return None
+    if fmt == "webp":
+        chunks = _webp_chunks(data)[0]
+        return C2PA_PROBLEM if any(f == _C2PA_WEBP_CHUNK for f, _d, _r in chunks) else None
+    if fmt != "png":
+        raise StructureError("not a JPEG, PNG or WebP file")
+    chunks = _png_chunks(data)[0]
+    if any(ctype == _C2PA_PNG_CHUNK for ctype, _d, _r in chunks):
+        return C2PA_PROBLEM
+    for ctype, cdata, _raw in chunks:
+        if ctype in _PNG_TEXT_CHUNKS and cdata.split(b"\0", 1)[0] == _PNG_XMP_KEYWORD:
+            return None  # exiftool rewrites XMP where it is: here, ahead of any iDOT
+        if ctype == _PNG_IDOT:
+            return "it has Apple's iDOT chunk, whose offsets new XMP would break"
+    return None
 
 
 # -- dispatch ------------------------------------------------------------------

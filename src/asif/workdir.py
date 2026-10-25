@@ -8,7 +8,8 @@ to work unless you explicitly allow an on-disk work dir.
 
 Each run holds a lock on its own work dir. A run that was killed outright
 (SIGKILL, power loss on an on-disk dir) can't wipe its leftovers itself, so
-the next run wipes every work dir whose lock nobody holds any more.
+the next run wipes every work dir whose lock nobody holds any more, in every
+place a run of this user could have put one.
 """
 
 from __future__ import annotations
@@ -170,6 +171,29 @@ def sweep_stale(parent: Path) -> int:
     return removed
 
 
+def _sweep_parents(override: str) -> list[Path]:
+    """Every folder a run of this user could have put its work dir in."""
+    candidates = []
+    if override:
+        candidates.append(Path(override).expanduser())
+    if runtime := os.environ.get("XDG_RUNTIME_DIR"):
+        candidates.append(Path(runtime))
+    candidates += [
+        Path(f"/run/user/{os.getuid()}"),
+        Path("/dev/shm"),  # noqa: S108  # only our own asif-<hex> dirs are touched
+        Path(tempfile.gettempdir()),
+    ]
+    seen: list[Path] = []
+    for cand in candidates:
+        try:
+            real = cand.resolve()
+        except OSError:
+            continue
+        if real.is_dir() and real not in seen:
+            seen.append(real)
+    return seen
+
+
 class RamWorkDir:
     """A private (0700) directory in RAM, locked while in use and wiped on exit."""
 
@@ -189,11 +213,21 @@ class RamWorkDir:
             )
         parent = self.choice.path
         parent.mkdir(parents=True, exist_ok=True)
-        self.swept = sweep_stale(parent)
+        self.swept = sum(sweep_stale(p) for p in _sweep_parents(str(parent)))
         path = parent / f"asif-{secrets.token_hex(6)}"
         path.mkdir(mode=0o700)
-        fd = os.open(path / _LOCK, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        # A ".lock" file must never exist unlocked, or a sweep by another run
+        # could take it in between and wipe this live dir. So lock it under a
+        # temporary name and only then give it its real name.
+        tmp = path / f".lock-{secrets.token_hex(4)}"
+        fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.rename(tmp, path / _LOCK)
+        except BaseException:
+            os.close(fd)
+            _wipe_tree(path)
+            raise
         self._lock_fd = fd
         self.path = path
         return self

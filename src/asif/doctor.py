@@ -46,6 +46,12 @@ INTERESTING_FLAGS = ("avx", "avx2", "avx512f", "f16c", "fma", "neon", "asimd")
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
+LLAMA_SYSTEM_CONFIG = "/etc/llama.cpp/config.ini"
+"""llama.cpp's system-wide settings, which current llama-server builds apply
+before anything As If sets. The inference worker refuses to start llama-server
+while it exists (``asif.infer.worker.SYSTEM_LLAMA_CONFIG``, not imported here:
+the worker module loads networking code)."""
+
 
 # -- probing -------------------------------------------------------------------
 
@@ -669,10 +675,13 @@ def find_dependencies(cfg: Config, probe: Probe | None = None) -> list[Dependenc
             True,
             "writes captions into your photos and proves the image data is untouched",
         ),
+        # Not run: llama.cpp applies LLAMA_* variables and its config.ini
+        # files (an rpc= line connects to another machine) before it even
+        # handles --version, and no environment hides /etc/llama.cpp.
         (
             "llama-server",
             cfg.model.llama_server,
-            ["--version"],
+            None,
             True,
             "runs the AI model locally (part of llama.cpp); needed for real captions",
         ),
@@ -696,14 +705,7 @@ def find_dependencies(cfg: Config, probe: Probe | None = None) -> list[Dependenc
 
 
 def _version_line(text: str) -> str | None:
-    """The "version: ..." line if there is one, else the first line.
-
-    llama.cpp release builds log "load_backend: ..." and GPU init lines before
-    their version; the other tools print the version first.
-    """
-    for line in text.splitlines():
-        if line.strip().lower().startswith("version:"):
-            return line.strip()[:80]
+    """The first non-empty line: every tool run here prints its version first."""
     for line in text.splitlines():
         if line.strip():
             return line.strip()[:80]
@@ -788,7 +790,7 @@ def _missing_exiftool_features(probe: Probe, exe: str) -> list[str]:
 
 def _llama_check(cfg: Config, dep: Dependency) -> Check:
     if dep.found:
-        return Check("llama-server", "ok", f"llama-server found ({dep.version or dep.path}).", "")
+        return Check("llama-server", "ok", f"llama-server found ({dep.path}).", "")
     configured = cfg.model.llama_server
     where = "" if configured == "llama-server" else f" (looked for {configured!r})"
     return Check(
@@ -800,6 +802,26 @@ def _llama_check(cfg: Config, dep: Dependency) -> Check:
         "If it's somewhere else, set llama_server under [model] to its full path. "
         "Meanwhile, `asif caption --model stub` tries the whole pipeline with fake captions.",
     )
+
+
+def _llama_settings_checks(probe: Probe) -> list[Check]:
+    """A failing check if llama.cpp's system-wide settings file exists; else none."""
+    folder, name = os.path.split(LLAMA_SYSTEM_CONFIG)
+    if probe.read_text(LLAMA_SYSTEM_CONFIG) is None and name not in probe.listdir(folder):
+        return []
+    check = Check(
+        "llama.cpp settings",
+        "fail",
+        f"llama.cpp's system-wide settings file ({LLAMA_SYSTEM_CONFIG}) exists. Current "
+        "llama-server builds apply it before anything As If sets, so it could make "
+        "llama-server send work to another machine or accept other keys. As If won't start "
+        "llama-server while it's there.",
+        "If nothing else on this machine needs it, rename it, for example "
+        f"`sudo mv {LLAMA_SYSTEM_CONFIG} {LLAMA_SYSTEM_CONFIG}.off`, then run `asif doctor` "
+        "again. Meanwhile, `asif caption --model stub` tries the whole pipeline with fake "
+        "captions.",
+    )
+    return [check]
 
 
 def _encryption_check(specs: Specs) -> Check:
@@ -960,6 +982,7 @@ def _checks(cfg: Config, specs: Specs, deps: list[Dependency], probe: Probe) -> 
     checks = [
         _exiftool_check(probe, by_name["exiftool"]),
         _llama_check(cfg, by_name["llama-server"]),
+        *_llama_settings_checks(probe),
         _encryption_check(specs),
         _swap_check(specs.swap, specs.is_wsl),
         _ram_dir_check(specs),

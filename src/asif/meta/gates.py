@@ -123,11 +123,22 @@ _FORMAT_BOOKKEEPING: dict[str, frozenset[str]] = {
 # (every page, reduced-size preview and thumbnail). Where it sits may
 # change, never what: exiftool's ImageDataHash covers the strips and tiles
 # of every TIFF IFD outside maker notes (a byte flipped in page 2 changes
-# it), the byte counts are still compared, and so is the thumbnail itself
+# it) and the JPEG images it calls OtherImage and JpgFromRaw, the byte
+# counts are still compared, and so is the thumbnail itself
 # (IFDn:ThumbnailImage, as binary). Not for JPEG: there the hash doesn't
 # cover EXIF's IFD1, and nothing in a JPEG's EXIF may move anyway.
 _TIFF_MOVED = re.compile(
-    r"IFD\d+:(?:StripOffsets|TileOffsets|ThumbnailOffset)|SubIFD\d*:(?:StripOffsets|TileOffsets)"
+    r"IFD\d+:(?:StripOffsets|TileOffsets|ThumbnailOffset|OtherImageStart|JpgFromRawStart)"
+    r"|SubIFD\d*:(?:StripOffsets|TileOffsets|OtherImageStart|JpgFromRawStart)"
+)
+# Every name exiftool gives where a TIFF's strips, tiles or JPEG images
+# start (tags 0x111, 0x144 and 0x201, named by IFD, compression and file
+# type). It moves all of them; one ``_TIFF_MOVED`` doesn't cover (an IFD0
+# "PreviewImageStart", say, whose image the hash doesn't cover) would fail
+# the protected gate after the model's work, so ``snapshot`` refuses it.
+_TIFF_OFFSET = re.compile(
+    r"[\w-]+:(?:StripOffsets|TileOffsets|ThumbnailOffset|PreviewImageStart"
+    r"|OtherImageStart|JpgFromRawStart)"
 )
 # MPF (JPEG): exiftool reports where each extra image starts as an absolute
 # file offset, so it moves when the XMP in front of it grows. The stored,
@@ -169,7 +180,7 @@ def _allowed(key: str, fmt: str, compat: Literal["xmp", "wide"]) -> bool:
         return True
     if key in _FORMAT_BOOKKEEPING.get(fmt, ()):
         return True
-    if fmt == "tiff" and _TIFF_MOVED.fullmatch(key):
+    if fmt == "tiff" and _TIFF_MOVED.fullmatch(base):
         return True
     return fmt == "jpeg" and _MPF_IMAGE_START.fullmatch(key) is not None
 
@@ -233,7 +244,8 @@ class Snapshot:
     fmt: str
     """``detect_format`` of the bytes, or ``"other"``."""
     image_hash: str
-    """SHA-256 ``ImageDataHash``."""
+    """SHA-256 ``ImageDataHash``; "" for a file exiftool can't hash, which is
+    then ``unprovable``."""
     size: int
     sha256: str
     # Kept out of repr: tag values can be GPS coordinates, and data is the photo.
@@ -247,11 +259,15 @@ class Snapshot:
     """Why no write to this file can be proven safe, in plain words, or None.
 
     Set for a file the gates can't check (an unknown format, a structure
-    that can't be parsed) and for one exiftool can't write without losing
-    or rewriting something: a TIFF with a maker note or with bytes nothing
-    points to, XMP with markup inside a value. It is a limit of the format
-    or of exiftool, not a sign of a bug, so the caller should skip the file
-    before writing. The structure gate fails for it regardless."""
+    that can't be parsed, a TIFF exiftool can't hash or whose preview it
+    would move) and for one exiftool can't write without losing or
+    rewriting something: a TIFF with a maker note or with bytes nothing
+    points to, XMP with markup inside a value, metadata exiftool warns it
+    can't read in full, Content Credentials, Apple's iDOT PNG chunk. It is
+    a limit of the format or of exiftool, not a sign of a bug, so the
+    caller should skip the file before writing. Only a file whose structure
+    can't be parsed gets a reason starting "its structure can't be
+    checked". The structure gate fails for it regardless."""
 
 
 @dataclass(frozen=True)
@@ -275,8 +291,9 @@ def fingerprint(path: Path) -> Fingerprint:
     return Fingerprint(size=st.st_size, mtime_ns=st.st_mtime_ns, sha256=digest.hexdigest())
 
 
-def _dump_tags(et: ExifTool, path: Path) -> dict[str, Any]:
-    """Every tag exiftool can read, minus file-system and derived ones.
+def _dump_tags(et: ExifTool, path: Path) -> tuple[dict[str, Any], list[str]]:
+    """Every tag exiftool can read, minus file-system and derived ones, and
+    exiftool's warnings about reading the file.
 
     Keys are ``Group:Tag``. A second copy of a tag in the same group becomes
     ``Group:Tag#2`` (and so on, in file order). exiftool's own copy numbers
@@ -293,11 +310,14 @@ def _dump_tags(et: ExifTool, path: Path) -> dict[str, Any]:
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], list):
         raise ExifToolError("unexpected tag dump from exiftool")
     tags: dict[str, Any] = {}
+    warnings: list[str] = []
     for key, value in rows[0]:
         if key == "ExifTool:Error":
             # exiftool reports unreadable files here (stderr stays quiet with -json).
             raise ExifToolError("exiftool can't read this file", str(value))
         parts = key.split(":")
+        if len(parts) >= 2 and parts[0] == "ExifTool" and parts[-1] == "Warning":
+            warnings.append(str(value))
         if len(parts) < 2 or parts[0] in _SKIP_GROUPS:
             continue  # SourceFile, System:*, ExifTool:*, Composite:*
         base = f"{parts[0]}:{parts[-1]}"
@@ -306,7 +326,7 @@ def _dump_tags(et: ExifTool, path: Path) -> dict[str, Any]:
             n += 1
             name = f"{base}#{n}"
         tags[name] = value
-    return tags
+    return tags, warnings
 
 
 @contextlib.contextmanager
@@ -318,17 +338,54 @@ def _mapped(path: Path) -> Iterator[mmap.mmap]:
 
 def snapshot(et: ExifTool, path: Path) -> Snapshot:
     """Record ``path`` before writing. Raises ``ExifToolError`` if exiftool can't read it."""
-    image_hash = et.image_data_hash(path)
-    tags = _dump_tags(et, path)
+    tags, warnings = _dump_tags(et, path)
     with path.open("rb") as fh:
         fmt = detect_format(fh.read(16)) or "other"
+    unhashable: str | None = None
+    try:
+        image_hash = et.image_data_hash(path)
+    except ExifToolError:
+        # A valid file exiftool can't hash: a TIFF whose single image is
+        # JPEG-compressed strips, which it takes for a preview. Anything
+        # else it can't hash may well be corrupt.
+        if not (
+            fmt == "tiff"
+            and tags.get("IFD0:Compression") in (6, 7)
+            and "IFD0:PreviewImageStart" in tags
+            and "IFD0:StripOffsets" not in tags
+        ):
+            raise
+        image_hash = ""
+        unhashable = "it's a JPEG-compressed TIFF, whose image data exiftool can't hash"
     data = path.read_bytes() if fmt in _KEEP_BYTES else None
     xmp, unprovable = _inspect(path, fmt, data)
+    unprovable = unprovable or unhashable or _exiftool_limit(fmt, tags, warnings)
     if data is None:
         fp = fingerprint(path)
         return Snapshot(fmt, image_hash, fp.size, fp.sha256, tags, None, xmp, unprovable)
     digest = hashlib.sha256(data).hexdigest()
     return Snapshot(fmt, image_hash, len(data), digest, tags, data, xmp, unprovable)
+
+
+def _exiftool_limit(fmt: str, tags: dict[str, Any], warnings: list[str]) -> str | None:
+    """Why exiftool can't write the file unharmed, as its tag dump shows; None if it can."""
+    if any(warning.startswith("[Minor]") for warning in warnings):
+        # exiftool's mark for a part it skipped while reading (items past
+        # the 1000th of an XMP list, a huge array): the protected gate
+        # compares its reading, so it can't see that part.
+        return (
+            "exiftool reads only part of its metadata, so As If can't prove a write keeps the rest"
+        )
+    if any(k.partition("#")[0] == "JUMBF:JUMDLabel" and v == "c2pa" for k, v in tags.items()):
+        return structure.C2PA_PROBLEM  # read by exiftool, in case the bytes check misses it
+    if fmt == "tiff" and any(
+        _TIFF_OFFSET.fullmatch(base) and not _TIFF_MOVED.fullmatch(base)
+        for base in (key.partition("#")[0] for key in tags)
+    ):
+        return (
+            "it's a TIFF with an embedded preview that exiftool would move, which As If can't check"
+        )
+    return None
 
 
 def _inspect(path: Path, fmt: str, data: bytes | None) -> tuple[Counter[str], str | None]:
@@ -338,7 +395,7 @@ def _inspect(path: Path, fmt: str, data: bytes | None) -> tuple[Counter[str], st
     try:
         if data is not None:
             text = structure.read_xmp(data)
-            return text.values, text.problem
+            return text.values, text.problem or structure.write_hazard(data)
         with _mapped(path) as view:
             layout = structure.tiff_layout(view)
             text = structure.read_xmp(view)
@@ -378,7 +435,7 @@ def _protected(
     et: ExifTool, before: Snapshot, after: Path, compat: Literal["xmp", "wide"]
 ) -> GateResult:
     try:
-        tags = _dump_tags(et, after)
+        tags, _warnings = _dump_tags(et, after)
     except ExifToolError:
         return GateResult("protected", False, "exiftool can't read the written file")
     # The owner's values in fields As If writes are compared like any other tag.

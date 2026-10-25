@@ -24,7 +24,7 @@ git clone https://github.com/lonaivdev-cell/As-If---Private-EXIF-Caption-Creator
 cd as-if
 uv sync
 
-# 3. Check your machine (read-only; nothing is changed)
+# 3. Check your machine (read-only; nothing is changed, nothing goes online)
 uv run asif doctor
 ```
 
@@ -66,7 +66,7 @@ uv run asif caption ~/Pictures/test ~/Pictures/test-captioned \
 | Image fingerprint | `XMP-et:OriginalImageHash` (SHA-256 of the pixel data) | Once, never overwritten |
 | **Never touched** | Dates, GPS, orientation, colour profile, maker notes, previews, the image itself | A TIFF with maker notes is skipped, because exiftool would have to rewrite them |
 
-Formats written today: **JPEG, PNG, WebP, TIFF**. HEIC/AVIF, RAW (sidecars) and video are skipped and listed in the summary, and so is any file As If can't prove safe to write: a TIFF with maker notes or with data nothing points to, XMP with markup inside a value or unlinked extended XMP, an ImageMagick "raw profile" PNG, or a file whose extension doesn't match its content.
+Formats written today: **JPEG, PNG, WebP, TIFF**. HEIC/AVIF, RAW (sidecars) and video are skipped and listed in the summary, and so is any file As If can't prove safe to write: a photo with Content Credentials (C2PA), which any change would invalidate; a TIFF with maker notes, with data nothing points to, with JPEG-compressed strips or with a preview exiftool would move; XMP with markup inside a value or unlinked extended XMP; metadata exiftool can only read in part (like Photoshop's runaway "DocumentAncestors" list); an ImageMagick "raw profile" PNG or an Apple PNG whose iDOT index new XMP would break; or a file whose extension doesn't match its content.
 
 ---
 
@@ -84,11 +84,11 @@ Each one is a rule enforced by code and checked by the test suite, not just a pr
 | Nothing is clobbered | If the original changes while As If works on it, the photo is skipped. If it changed after its copy was made, a re-run says so instead of calling the old copy done. |
 | The copy on disk is the copy that was checked | It's written atomically, then read back and compared. |
 | Plaintext stays in RAM | Photos are worked on in a private RAM folder (tmpfs). Every copy, including the one exiftool replaces during the write, is overwritten and deleted after each photo. No RAM folder? As If refuses to start unless you pass `--allow-disk-workdir`. |
-| Stopping is safe | Ctrl+C, `kill`, closing the terminal: the RAM copy is wiped and every helper process stops before As If exits. Core dumps are off, so a crash can't write a photo to disk. If As If is killed outright, the next run wipes what it left in RAM. |
+| Stopping is safe | Ctrl+C, `kill`, closing the terminal: the RAM copy is wiped and every helper process stops before As If exits, and a second signal can't cut that cleanup short. On Linux, if As If is killed outright (`kill -9`), exiftool, the model worker and llama-server stop with it. Core dumps are off, so a crash can't write a photo to disk. If As If is killed outright, the next run wipes what it left in RAM. |
 | Private photos stay private | A copy never gets more permissions than its original effectively had: photos from a `0700` folder are copied into `0700` folders. |
 | No network in the main process | CI fails if orchestrator code imports networking modules (checked by importing all of it and by reading the source). At runtime an audit hook turns any socket use by Python code into a crash. Native code could get around a Python hook; the real wall is the sandbox in M3. |
 | The model can't be used by other programs | `llama-server` listens on 127.0.0.1 only, behind a random API key passed through the environment (not the command line), and the worker checks that the port really is its own server's before sending a photo. |
-| The model can't fetch or send anything | llama-server runs in offline mode, and extra `server_args` must be on an allow-list of speed, memory, GPU and logging options. Anything that downloads, loads other files, opens tunnels, runs tools or serves files is refused. |
+| The model can't fetch or send anything | llama-server runs in offline mode and sees none of your own llama.cpp settings: `LLAMA_*`, `MTMD_*`, `HF_*` and `HUGGING*` variables are removed, and it gets an empty private config folder, so `~/.config/llama.cpp/config.ini` is never read. A system-wide `/etc/llama.cpp/config.ini` can't be hidden yet (M3), so while one exists As If refuses to start llama-server and `asif doctor` says so. Extra `server_args` must be on an allow-list of speed, memory, GPU and logging options; anything that downloads, loads other files, opens tunnels, runs tools or serves files is refused. |
 | A bad model answer can't do damage | Output must match a strict JSON schema, and control characters are stripped, so a caption can't smuggle options into exiftool. |
 | Systematic bugs stop the run | More than 2 % failures in the last 200 photos stops everything. |
 | Telemetry stays home | The only log is a local timings file with stage durations. No file names, paths, sizes or captions (an allow-list enforces it), and photos are processed in a random order, so a log line doesn't point at a file. |

@@ -322,7 +322,10 @@ def _print_summary(summary: RunSummary, problems: list[ItemOutcome]) -> None:
             "other files ignored (not photos, hidden, links or special files)",
         )
     if not summary.outcomes:
-        console.print("No photos found.")
+        if summary.aborted:  # always set when a run is stopped early
+            console.print("No photo was finished before the run stopped.")
+        else:
+            console.print("No photos found.")
     else:
         console.print(Panel(counts, title=f"Run {summary.run_id}", expand=False))
 
