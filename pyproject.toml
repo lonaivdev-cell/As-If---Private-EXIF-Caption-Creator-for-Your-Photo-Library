@@ -1,0 +1,74 @@
+[project]
+name = "as-if"
+version = "0.1.0.dev0"
+description = "Private, offline AI captions for your photo library. Nothing about your photos leaves your machine."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "lonaivdev-cell" }]
+keywords = ["exif", "xmp", "captions", "privacy", "offline", "photos", "vlm"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "pydantic>=2.7",
+    "pillow>=10.4",
+]
+
+[project.scripts]
+asif = "asif.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/asif"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = [
+    "S101",  # assert is fine in tests
+    "S603",  # subprocess without shell=True is how we call tools
+    "S607",  # tools are resolved on PATH on purpose (doctor reports which)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B011"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src/asif"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["PIL.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: large fixtures (50 MP panorama); deselect with -m 'not slow'",
+    "exiftool: needs the exiftool binary on PATH",
+]
+addopts = "-ra"

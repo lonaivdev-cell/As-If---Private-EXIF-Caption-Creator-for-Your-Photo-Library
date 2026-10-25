@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["caption", "keywords", "has_text", "people_count", "setting"],
+  "properties": {
+    "caption":      { "type": "string", "minLength": 1, "maxLength": 240 },
+    "keywords":     { "type": "array", "minItems": 3, "maxItems": 15,
+                      "items": { "type": "string", "minLength": 1, "maxLength": 40 } },
+    "has_text":     { "type": "boolean" },
+    "people_count": { "type": "integer", "minimum": 0, "maximum": 50 },
+    "setting":      { "type": "string", "enum": ["indoor", "outdoor", "unclear"] }
+  }
+}

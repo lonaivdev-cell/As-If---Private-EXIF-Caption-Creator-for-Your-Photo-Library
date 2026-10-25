@@ -1,0 +1,134 @@
+# As If model catalogue: the shortlist from §9.2 of docs/DESIGN.md.
+#
+# weights_gb    the 4-bit (Q4) GGUF, as §9.2 gives it
+# projector_gb  the vision projector, where §9.2 gives it separately (else 0.0)
+# min_vram_gb   VRAM from which this is the GPU pick (§10); absent = not a GPU-tier model
+# min_ram_gb    RAM from which this is the CPU pick (§10)
+# languages     primary language subtags, or ["*"] for multilingual
+#
+# Nothing is pinned yet. `revision`, file names and `sha256` stay empty until
+# they are filled in when pinning (M2), copied from the upstream repo, never
+# guessed. `repo` is filled in only where the design names one; the others are
+# chosen when pinning, from official repos or well-known quantizers (§9.2).
+
+[[model]]
+id           = "minicpm-v-4.6-q4"
+name         = "MiniCPM-V 4.6"
+tier         = "T0"
+arch         = "dense"
+params       = "1.3B (SigLIP2-400M encoder + Qwen3.5-0.8B)"
+weights_gb   = 1.6
+projector_gb = 0.0                  # not given separately in §9.2; measured when pinning (M2)
+min_ram_gb   = 8.0                  # "any 8 GB machine, CPU"
+languages    = ["en", "zh"]         # the only listed languages
+licence      = "Apache-2.0"
+repo         = "ggml-org/MiniCPM-V-4.6-GGUF"
+revision     = ""                   # filled in when pinning (M2)
+notes        = "Best quality per byte. Lists English and Chinese only."
+files = [
+    # filled in when pinning (M2)
+    { role = "weights", name = "", sha256 = "" },
+    { role = "projector", name = "", sha256 = "" },
+]
+
+[[model]]
+id           = "gemma-4-e2b-q4"
+name         = "Gemma 4 E2B"
+tier         = "T0"
+arch         = "dense"
+params       = "2.3B effective"
+weights_gb   = 3.1
+projector_gb = 0.0                  # not given separately in §9.2; measured when pinning (M2)
+min_ram_gb   = 8.0                  # "8 GB RAM, CPU"
+languages    = ["*"]
+licence      = "Apache-2.0"
+repo         = ""                   # not named in the design; chosen when pinning (M2)
+revision     = ""                   # filled in when pinning (M2)
+notes        = "Multilingual fallback for small machines."
+files = [
+    # filled in when pinning (M2)
+    { role = "weights", name = "", sha256 = "" },
+    { role = "projector", name = "", sha256 = "" },
+]
+
+[[model]]
+id           = "gemma-4-e4b-q4"
+name         = "Gemma 4 E4B"
+tier         = "T1"
+arch         = "dense"
+params       = "4.5B effective"
+weights_gb   = 5.0
+projector_gb = 0.0                  # not given separately in §9.2; measured when pinning (M2)
+min_vram_gb  = 6.0                  # "or a 6 GB GPU"
+min_ram_gb   = 12.0                 # §10 threshold; catches "16 GB" machines that report less
+languages    = ["*"]
+licence      = "Apache-2.0"
+repo         = ""                   # not named in the design; chosen when pinning (M2)
+revision     = ""                   # filled in when pinning (M2)
+notes        = "Sensible CPU default: 16 GB RAM on CPU, or a 6 GB GPU."
+files = [
+    # filled in when pinning (M2)
+    { role = "weights", name = "", sha256 = "" },
+    { role = "projector", name = "", sha256 = "" },
+]
+
+[[model]]
+id           = "qwen3.5-9b-q4km"
+name         = "Qwen3.5-9B"
+tier         = "T2"
+arch         = "dense"
+params       = "9.6B"
+weights_gb   = 6.0                  # §9.2 gives 5.4-6.0 GB; the upper bound keeps fit checks safe
+projector_gb = 0.9                  # F16
+min_vram_gb  = 10.0                 # "10-12 GB VRAM"
+min_ram_gb   = 12.0
+languages    = ["*"]
+licence      = "Apache-2.0"
+repo         = "unsloth/Qwen3.5-9B-GGUF"
+revision     = ""                   # filled in when pinning (M2)
+notes        = "Best accuracy that fits a mid-range GPU. Prefer the F16 projector over BF16 (§2)."
+files = [
+    # filled in when pinning (M2)
+    { role = "weights", name = "", sha256 = "" },
+    { role = "projector", name = "", sha256 = "" },
+]
+
+[[model]]
+id           = "gemma-4-26b-a4b-q4"
+name         = "Gemma 4 26B-A4B"
+tier         = "T3"
+arch         = "moe"
+params       = "25.2B total / 3.8B active"
+weights_gb   = 17.0
+projector_gb = 0.0                  # not given separately in §9.2; measured when pinning (M2)
+min_ram_gb   = 28.0                 # §10 threshold; §9.2: fits 32 GB RAM
+languages    = ["*"]
+licence      = "Apache-2.0"
+repo         = ""                   # not named in the design; chosen when pinning (M2)
+revision     = ""                   # filled in when pinning (M2)
+notes        = "Big-model knowledge at ~4B speed. All ~17 GB of experts stay in memory."
+files = [
+    # filled in when pinning (M2)
+    { role = "weights", name = "", sha256 = "" },
+    { role = "projector", name = "", sha256 = "" },
+]
+
+[[model]]
+id           = "qwen3.5-35b-a3b-q4"
+name         = "Qwen3.5-35B-A3B"
+tier         = "T3"
+arch         = "moe"
+params       = "35B total / 3B active"
+weights_gb   = 20.0
+projector_gb = 0.86
+min_ram_gb   = 48.0                 # "48 GB+ RAM comfortable; 32 GB tight"
+languages    = ["*"]
+licence      = "Apache-2.0"
+repo         = ""                   # not named in the design; chosen when pinning (M2)
+revision     = ""                   # filled in when pinning (M2)
+notes        = "Strongest CPU-feasible option."
+files = [
+    # filled in when pinning (M2)
+    { role = "weights", name = "", sha256 = "" },
+    { role = "projector", name = "", sha256 = "" },
+]
