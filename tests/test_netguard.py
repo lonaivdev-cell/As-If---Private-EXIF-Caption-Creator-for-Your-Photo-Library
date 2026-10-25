@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import os
 import subprocess
@@ -184,17 +185,18 @@ def test_the_probe_catches_an_offender_hiding_behind_a_benign_import(tmp_path: P
 _DYNAMIC_IMPORTERS = {"import_module", "__import__"}
 
 
-def _imports_in(tree: ast.AST) -> tuple[set[str], list[str]]:
-    """Every module a source file can import, and its unresolvable dynamic imports."""
+def _imports_in(tree: ast.AST, package: str = "asif") -> tuple[set[str], list[str]]:
+    """Every module a source file in ``package`` can import, and its dynamic imports."""
     names: set[str] = set()
     dynamic: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            names.add(node.module)
-            # "from asif.infer import worker" imports the module asif.infer.worker.
-            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            # "from . import worker" inside asif/infer/ means asif.infer.worker.
+            base = importlib.util.resolve_name("." * node.level + (node.module or ""), package)
+            names.add(base)
+            names.update(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
         elif isinstance(node, ast.Call):
             func = node.func
             called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
@@ -221,7 +223,12 @@ def test_no_orchestrator_source_imports_networking_modules() -> None:
         module = ".".join(("asif", *path.relative_to(root).with_suffix("").parts))
         if module.removesuffix(".__init__") in NETWORK_CAPABLE:
             continue
-        names, dynamic = _imports_in(ast.parse(path.read_text(encoding="utf-8")))
+        package = (
+            module.removesuffix(".__init__")
+            if path.name == "__init__.py"
+            else (module.rpartition(".")[0])
+        )
+        names, dynamic = _imports_in(ast.parse(path.read_text(encoding="utf-8")), package)
         where = path.relative_to(root)
         offenders += [f"{where}: import by a computed name ({d})" for d in dynamic]
         for name in sorted(names):
@@ -247,6 +254,9 @@ def test_the_source_check_sees_lazy_and_dynamic_imports() -> None:
     names, dynamic = _imports_in(sample)
     assert {"socket", "asif.infer.worker", "http.client"} <= names
     assert dynamic == ["line 5"]
+    relative = ast.parse("def later():\n    from . import worker\n    from .worker import main\n")
+    names, _ = _imports_in(relative, "asif.infer")
+    assert {"asif.infer.worker", "asif.infer.worker.main"} <= names
 
 
 def test_pydantic_plugins_are_disabled_in_the_orchestrator() -> None:

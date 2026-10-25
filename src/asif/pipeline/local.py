@@ -416,7 +416,38 @@ class _ReadBackMismatch(Exception):
     """The copy on the destination isn't byte-identical to what was checked."""
 
 
-def _commit(ram_copy: Path, dest: Path, mode: int, expect_sha: str | None = None) -> bool:
+def _no_wider_than_the_original(fd: int, mode: int, gid: int | None) -> int:
+    """Make a new copy no more open than its original; returns the mode to set.
+
+    A file created in the destination folder can pick up that folder's
+    group (setgid folders, or a different primary group) and its default
+    ACL. Either would hand the copy to people who couldn't read the
+    original. So the inherited ACL goes, and the copy keeps the original's
+    group, or gets no group access at all.
+    """
+    removexattr = getattr(os, "removexattr", None)  # Linux
+    if removexattr is not None:
+        try:
+            removexattr(fd, "system.posix_acl_access")
+        except OSError as exc:
+            if exc.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+    if gid is not None and os.fstat(fd).st_gid != gid:
+        try:
+            os.fchown(fd, -1, gid)
+        except OSError:
+            mode &= ~0o070
+    return mode
+
+
+def _commit(
+    ram_copy: Path,
+    dest: Path,
+    mode: int,
+    *,
+    gid: int | None = None,
+    expect_sha: str | None = None,
+) -> bool:
     """Write ``ram_copy`` to ``dest`` without ever replacing an existing file.
 
     Returns False if ``dest`` appeared in the meantime. The bytes go to a
@@ -424,44 +455,53 @@ def _commit(ram_copy: Path, dest: Path, mode: int, expect_sha: str | None = None
     and no-clobber); on filesystems without hard links (FAT, exFAT, FUSE
     mounts such as rclone or sshfs) it falls back to an exclusive create.
     The temp name is short and fixed-length, so a long photo name can't push
-    it past the filesystem's name limit.
+    it past the filesystem's name limit. The copy gets ``mode``, the
+    original's group ``gid`` (or no group access) and no inherited ACL.
 
     With ``expect_sha``, the placed copy is read back and must hash to it,
     or ``_ReadBackMismatch`` is raised. A copy that was placed but not
-    confirmed (mismatch, error, Ctrl+C) is removed again, so nothing
-    unverified is ever left for a later run to take as done.
+    confirmed (mismatch, error, Ctrl+C, even mid-placement) is removed again,
+    so nothing unverified is ever left for a later run to take as done.
     """
     _make_private_dirs(dest.parent)
     tmp = dest.parent / f".asif-{secrets.token_hex(8)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with ram_copy.open("rb") as fin, os.fdopen(fd, "wb") as fout:
+            mode = _no_wider_than_the_original(fout.fileno(), mode, gid)
             while chunk := fin.read(_COPY_CHUNK):
                 fout.write(chunk)
             fout.flush()
             os.fsync(fout.fileno())
+            os.fchmod(fout.fileno(), mode & 0o777)
+        if _has_acl(tmp):
+            # An ACL that couldn't be removed: let its mask grant nothing.
+            os.chmod(tmp, mode & 0o707)
         st = ram_copy.stat()
-        os.chmod(tmp, mode & 0o777)
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        ours = os.stat(tmp)
         try:
-            os.link(tmp, dest)
-        except FileExistsError:
-            return False
-        except OSError as exc:
-            no_links = (errno.EPERM, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV)
-            if exc.errno not in no_links:
-                raise
-            # No hard links here. An exclusive rename isn't portable, so do
-            # the next best thing: refuse if anything is there, then move.
-            if dest.exists():
+            try:
+                os.link(tmp, dest)
+            except FileExistsError:
                 return False
-            os.replace(tmp, dest)
-        try:
+            except OSError as exc:
+                no_links = (errno.EPERM, errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EXDEV)
+                if exc.errno not in no_links:
+                    raise
+                # No hard links here. An exclusive rename isn't portable, so
+                # do the next best thing: refuse if anything is there, then move.
+                if dest.exists():
+                    return False
+                os.replace(tmp, dest)
             _fsync_dir(dest.parent)
             if expect_sha is not None and sha256_file(dest) != expect_sha:
                 raise _ReadBackMismatch
         except BaseException:
-            dest.unlink(missing_ok=True)
+            # Remove what we placed (never someone else's file in the way).
+            with contextlib.suppress(OSError):
+                if os.path.samestat(os.stat(dest, follow_symlinks=False), ours):
+                    dest.unlink()
             raise
         return True
     finally:
@@ -520,6 +560,9 @@ class _Ctx:
     log: TimingsLog
     run_id: str
     dry_run: bool
+    dest_root: Path
+    blocked_dirs: set[Path] = field(default_factory=set)
+    """Destination folders As If found it can't write into (permission denied)."""
 
 
 def _describe(ctx: _Ctx, ram: Path, img: str) -> CaptionResult:
@@ -550,11 +593,71 @@ def _only_minor_warnings(stderr: str) -> bool:
     )
 
 
-def _destination_problem(rel: str, exc: OSError) -> ItemOutcome:
+def _can_write_into(folder: Path) -> bool:
+    """Can a file be created in ``folder``? (Probes for real; os.access can lie.)"""
+    probe = folder / f".asif-probe-{secrets.token_hex(4)}"
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError:
+        return False
+    try:
+        os.close(fd)
+    finally:
+        probe.unlink(missing_ok=True)
+    return True
+
+
+def _blocked_folder(ctx: _Ctx, rel: str, dest: Path) -> ItemOutcome | None:
+    """The outcome for a photo whose destination folder As If already can't write into."""
+    for blocked in ctx.blocked_dirs:
+        if dest.parent == blocked or blocked in dest.parent.parents:
+            folder = Path(rel).parent.as_posix()
+            return ItemOutcome(
+                rel, State.FAILED_UPLOAD, f"can't write into the destination folder {folder}/"
+            )
+    return None
+
+
+def _destination_problem(ctx: _Ctx, rel: str, dest: Path, exc: OSError) -> ItemOutcome:
     """One photo's destination path is unusable; or raise if the destination is."""
     if exc.errno in _PER_PATH_ERRNOS:
         return ItemOutcome(rel, State.FAILED_UPLOAD, f"couldn't write the copy ({exc.strerror})")
+    # Permission denied inside a shared destination can be one subfolder
+    # (someone else's, or a 0700 one from another user's run): if the
+    # destination itself still takes files, skip that folder, not the run.
+    if (
+        exc.errno == errno.EACCES
+        and dest.parent != ctx.dest_root
+        and _can_write_into(ctx.dest_root)
+    ):
+        ctx.blocked_dirs.add(dest.parent)
+        blocked = _blocked_folder(ctx, rel, dest)
+        assert blocked is not None
+        return blocked
     raise _DestinationError(f"can't write to the destination ({exc.strerror or exc})") from exc
+
+
+def _list_bits(folder: Path) -> int:
+    """Group/other read bits of ``folder`` that its parents actually let them use."""
+    return folder.stat().st_mode & _reach_mask(folder) & 0o044
+
+
+def _listable_folder(ctx: _Ctx, src: Path, rel: str) -> str | None:
+    """The first existing destination subfolder more people can list than its original.
+
+    Names alone can say a lot, so a copy never goes where its own name, or
+    a folder name above it, would be visible to people who can't see the
+    original's. Folders As If creates are 0700, so only existing ones count.
+    """
+    folders = Path(rel).parents[:-1]  # "a/b/x.jpg": a/b, a (the root is checked up front)
+    src_root = src.parents[len(folders)]
+    for folder in reversed(folders):
+        mine = ctx.dest_root / folder
+        if not mine.is_dir():
+            return None
+        if _list_bits(mine) & ~_list_bits(src_root / folder):
+            return folder.as_posix()
+    return None
 
 
 def _source_problem(rel: str, exc: OSError, when: str) -> ItemOutcome:
@@ -571,12 +674,21 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
     if suffix in NOT_YET:
         return ItemOutcome(rel, State.SKIPPED_FORMAT, NOT_YET[suffix])
 
+    if (blocked := _blocked_folder(ctx, rel, dest)) is not None:
+        return blocked
     occupied = False
     if not ctx.dry_run:
         try:
             occupied = dest.exists() or dest.is_symlink()
+            if (folder := _listable_folder(ctx, src, rel)) is not None:
+                return ItemOutcome(
+                    rel,
+                    State.FAILED_UPLOAD,
+                    f"the destination folder {folder}/ can be listed by other users, "
+                    "but the original's folder can't",
+                )
         except OSError as exc:
-            return _destination_problem(rel, exc)
+            return _destination_problem(ctx, rel, dest, exc)
     if occupied:
         done = _already_done(ctx.et, src, dest)
         if done == "done":
@@ -698,7 +810,8 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
 
         try:
             unchanged = check_source_unchanged(fp_then, fingerprint(src))
-            mode = src.stat().st_mode & _reach_mask(src)
+            src_st = src.stat()
+            mode = src_st.st_mode & _reach_mask(src)
         except OSError as exc:
             return _source_problem(rel, exc, "while As If was working on it")
         if not unchanged.ok:
@@ -709,7 +822,7 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         processed_sha = sha256_file(ram)
         try:
             with ctx.log.timed("commit", img):
-                committed = _commit(ram, dest, mode, expect_sha=processed_sha)
+                committed = _commit(ram, dest, mode, gid=src_st.st_gid, expect_sha=processed_sha)
         except _ReadBackMismatch:
             return ItemOutcome(
                 rel,
@@ -718,7 +831,7 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
                 systematic=True,
             )
         except OSError as exc:
-            return _destination_problem(rel, exc)
+            return _destination_problem(ctx, rel, dest, exc)
         if not committed:
             return ItemOutcome(
                 rel, State.SKIPPED_CONFLICT, "a file appeared at the destination meanwhile"
@@ -760,12 +873,19 @@ def caption_folder(
         on_start(len(files))
     if not files:
         return summary
-    # A random order, so the log's per-run ids (i_000001, ...) say nothing
-    # about which file is which, even to someone who can list the folder.
+    # A random order, so the log's per-run ids (i_000001, ...) don't follow
+    # the folder listing. (The copies' own file times still show the order
+    # they were written in, so the log is only as private as that folder.)
     secrets.SystemRandom().shuffle(files)
 
     if not dry_run:
         try:
+            if dest.is_dir() and _list_bits(dest) & ~_list_bits(src):
+                raise CaptionError(
+                    f"other users can list the destination {dest} but not {src}, so they "
+                    f"would see your photos' names. Run `chmod 700 {dest}` or pick a new "
+                    "folder (As If creates new ones private)."
+                )
             _make_private_dirs(dest)
         except OSError as exc:
             raise CaptionError(
@@ -797,7 +917,9 @@ def caption_folder(
                     f"Wiped photo copies left in RAM by {work.swept} run(s) that were cut short."
                 )
 
-            ctx = _Ctx(cfg, model, et, InferenceClient(model.worker), work, log, run_id, dry_run)
+            ctx = _Ctx(
+                cfg, model, et, InferenceClient(model.worker), work, log, run_id, dry_run, dest
+            )
             stack.callback(lambda: ctx.client.close())
             log.event("run_start", n=len(files))
             try:

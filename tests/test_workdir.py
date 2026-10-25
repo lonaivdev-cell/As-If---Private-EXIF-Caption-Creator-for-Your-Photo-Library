@@ -170,3 +170,13 @@ def test_the_lock_is_held_and_never_left_under_a_temporary_name(tmp_path: Path) 
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(fd)
+
+
+def test_a_work_dir_used_before_is_swept_after_the_setting_changes(tmp_path: Path) -> None:
+    old = tmp_path / "old-ram"
+    with RamWorkDir(str(old), allow_disk=True):
+        pass
+    dead = _dead_run(old, "asif-cccccccccccc")  # a run there was killed
+    with RamWorkDir(str(tmp_path / "new-ram"), allow_disk=True) as work:
+        assert work.swept >= 1
+    assert not dead.exists()

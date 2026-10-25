@@ -155,7 +155,7 @@ DISCOVERED → STAGED → OPENED → DESCRIBED → WRITTEN → VERIFIED → UPLO
 | Store | Default location (Linux) | Contents | Protection | Lifetime |
 |---|---|---|---|---|
 | Staging | `~/.cache/asif/staging/` | downloaded originals | `age` encryption with an **ephemeral session key held only in memory** | until `CONFIRMED`; leftovers wiped at next start |
-| RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only; 0700, locked by its run | seconds; overwritten then unlinked; a dead run's leftovers are wiped by the next run |
+| RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only; 0700, locked by its run | seconds; overwritten then unlinked; a dead run's leftovers are wiped by the next run, which also checks every parent folder an earlier run used (remembered in the state dir) |
 | Vault | `~/.local/share/asif/vault.db` | catalogue, captions, keywords, hashes, 256 px thumbnails, undo journal | SQLCipher; key from your passphrase via Argon2id | until `asif wipe vault` |
 | Telemetry | `~/.local/state/asif/telemetry.db` | timings, resources, errors — **no** names, paths or captions | SQLCipher; separate key (HKDF from master key, distinct context) | rolling, user-set retention |
 | Credentials | OS secret store | Proton session (owned by the Proton CLI), rclone config password | OS (libsecret / Keychain / Credential Manager) | per provider |
@@ -496,7 +496,7 @@ bwrap --unshare-all --die-with-parent --new-session \
  "ms":4210,"ok":true,"model":"qwen3.5-9b-q4km","rss_mb":9120,"vram_mb":8740,"cpu_c":71.5}
 ```
 
-*Until M9* a minimal, unencrypted timings log stands in for this (`~/.local/state/asif/timings.jsonl`): same event shape, same "no names, paths or captions" rule, enforced by an allow-list of keys. It records no file sizes either, and photos are processed in a random order, so an id says nothing about which file it was. Durations and outcomes could still loosely correlate with a file someone already knows about; the encrypted store replaces this log.
+*Until M9* a minimal, unencrypted timings log stands in for this (`~/.local/state/asif/timings.jsonl`): same event shape, same "no names, paths or captions" rule, enforced by an allow-list of keys. It records no file sizes either, and photos are processed in a random order, so an id alone says nothing about which file it was. The copies' change times do record the order they were made in, so anyone who can read the destination folder can line the log up with it: the log is no more private than that folder. Durations and outcomes could still loosely correlate with a file someone already knows about; the encrypted store replaces this log.
 
 ---
 

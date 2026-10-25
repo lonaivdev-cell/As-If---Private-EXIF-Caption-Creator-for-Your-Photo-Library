@@ -713,3 +713,187 @@ def test_files_the_gates_cant_vouch_for_are_skipped_before_the_model(
     assert "Content Credentials" in reasons["signed.jpg"]
     assert "JPEG-compressed TIFF" in reasons["scan.tif"]
     assert len(described) == 1  # the model only ever saw the ordinary photo
+
+
+# -- round 3 -----------------------------------------------------------------
+
+
+def _other_gid() -> int:
+    gids = [g for g in range(1, 70000) if g != os.getgid()]
+    return next(g for g in gids if _gid_exists(g))
+
+
+def _gid_exists(gid: int) -> bool:
+    import grp
+
+    try:
+        grp.getgrgid(gid)
+    except KeyError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs to chown a folder to another group")
+def test_a_setgid_destination_never_gives_its_group_the_copy(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "a.jpg")
+    (src / "a.jpg").chmod(0o640)
+    dest = tmp_path / "shared"
+    dest.mkdir()
+    os.chown(dest, -1, _other_gid())
+    dest.chmod(0o2775)  # setgid: new files would take the folder's group
+    _run(src, dest, cfg, tmp_path)
+    copy = (dest / "a.jpg").stat()
+    original = (src / "a.jpg").stat()
+    assert copy.st_gid == original.st_gid or stat.S_IMODE(copy.st_mode) & 0o070 == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "setxattr"), reason="POSIX ACLs are Linux-only")
+def test_a_default_acl_on_the_destination_is_not_inherited(tmp_path: Path) -> None:
+    import struct
+
+    dest_dir = tmp_path / "out"
+    dest_dir.mkdir()
+    # user::rwx, user:65534:r-x, group::r-x, mask::r-x, other::---
+    entries = [
+        (0x01, 7, 0xFFFFFFFF),
+        (0x02, 5, 65534),
+        (0x04, 5, 0xFFFFFFFF),
+        (0x10, 5, 0xFFFFFFFF),
+        (0x20, 0, 0xFFFFFFFF),
+    ]
+    acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in entries)
+    try:
+        os.setxattr(dest_dir, "system.posix_acl_default", acl)
+    except OSError as exc:
+        pytest.skip(f"no ACL support here ({exc.strerror})")
+    ram = tmp_path / "ram.jpg"
+    ram.write_bytes(b"processed")
+    assert local._commit(ram, dest_dir / "a.jpg", 0o640)
+    assert not local._has_acl(dest_dir / "a.jpg")
+
+
+def test_a_stop_while_the_copy_is_placed_leaves_nothing_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ram = tmp_path / "ram.jpg"
+    ram.write_bytes(b"processed")
+    real_link = os.link
+
+    def link_then_interrupt(src: Any, dst: Any) -> None:
+        real_link(src, dst)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(local.os, "link", link_then_interrupt)
+    dest = tmp_path / "out" / "a.jpg"
+    with pytest.raises(KeyboardInterrupt):
+        local._commit(ram, dest, 0o644, expect_sha="0" * 64)
+    assert not dest.exists()
+    assert not list(dest.parent.iterdir())
+
+
+def test_one_unwritable_subfolder_doesnt_stop_the_run(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("x", "y"):
+        (photos / "theirs").mkdir(exist_ok=True)
+        shutil.copy2(photos / "p0.jpg", photos / "theirs" / f"{name}.jpg")
+    dest = tmp_path / "out"
+    real_commit = local._commit
+
+    def denied_in_theirs(ram: Path, target: Path, mode: int, **kw: Any) -> bool:
+        if target.parent.name == "theirs":
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_commit(ram, target, mode, **kw)
+
+    monkeypatch.setattr(local, "_commit", denied_in_theirs)
+    summary = _run(photos, dest, cfg, tmp_path)
+    states = _states(summary)
+    assert summary.aborted is None
+    assert states["theirs/x.jpg"] == states["theirs/y.jpg"] == State.FAILED_UPLOAD
+    assert summary.count(State.CLEAN) == 5
+
+
+def test_a_listable_destination_for_a_private_source_is_refused(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    import tempfile
+
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("needs a world-searchable dir")
+    open_root = Path(tempfile.mkdtemp(dir="/dev/shm"))
+    try:
+        open_root.chmod(0o755)
+        src = open_root / "private"
+        src.mkdir(mode=0o700)
+        shutil.copy2(fixtures_dir / "plain.jpg", src / "a.jpg")
+        dest = open_root / "public"
+        dest.mkdir(mode=0o755)
+        dest.chmod(0o755)
+        with pytest.raises(CaptionError, match="chmod 700"):
+            _run(src, dest, cfg, tmp_path)
+        assert not list(dest.iterdir())
+    finally:
+        shutil.rmtree(open_root)
+
+
+def test_cleanup_finishes_even_if_a_stop_signal_lands_during_it(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import signal
+
+    from asif import proc, workdir
+
+    saved = {s: signal.getsignal(s) for s in proc._STOP_SIGNALS}
+    proc.install_stop_signals()
+    try:
+        real_wipe = workdir.wipe_file
+        sent = {"done": False}
+
+        def wipe_with_a_signal(path: Path) -> None:
+            if not sent["done"]:
+                sent["done"] = True
+                os.kill(os.getpid(), signal.SIGTERM)  # lands mid-cleanup
+            real_wipe(path)
+
+        monkeypatch.setattr(workdir, "wipe_file", wipe_with_a_signal)
+        summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+    assert sent["done"]
+    assert summary.count(State.CLEAN) == 5
+    assert not summary.interrupted  # every photo was done before the signal
+    assert not any((tmp_path / "ram").iterdir())  # the work dir was wiped completely
+
+
+def test_a_listable_folder_above_the_copy_is_refused_too(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    import tempfile
+
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("needs a world-searchable dir")
+    open_root = Path(tempfile.mkdtemp(dir="/dev/shm"))
+    try:
+        open_root.chmod(0o755)
+        src = open_root / "src"
+        (src / "health" / "2024").mkdir(parents=True)
+        src.chmod(0o755)
+        (src / "health").chmod(0o700)
+        shutil.copy2(fixtures_dir / "plain.jpg", src / "health" / "2024" / "a.jpg")
+        shutil.copy2(fixtures_dir / "plain.jpg", src / "b.jpg")
+        dest = open_root / "dest"
+        (dest / "health").mkdir(parents=True)
+        dest.chmod(0o755)
+        (dest / "health").chmod(0o755)  # "2024" would be listed here
+        summary = _run(src, dest, cfg, tmp_path)
+        states = _states(summary)
+        assert states["health/2024/a.jpg"] == State.FAILED_UPLOAD
+        assert states["b.jpg"] == State.CLEAN
+        assert not list((dest / "health").iterdir())
+    finally:
+        shutil.rmtree(open_root)

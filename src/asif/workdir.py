@@ -9,7 +9,9 @@ to work unless you explicitly allow an on-disk work dir.
 Each run holds a lock on its own work dir. A run that was killed outright
 (SIGKILL, power loss on an on-disk dir) can't wipe its leftovers itself, so
 the next run wipes every work dir whose lock nobody holds any more, in every
-place a run of this user could have put one.
+place a run of this user could have put one: the usual RAM folders, plus
+every folder a run has used before (remembered in the state dir, so a
+changed ``work_dir`` setting doesn't strand a killed run's leftovers).
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
+
+from asif import paths
 
 _RAM_FSTYPES = frozenset({"tmpfs", "ramfs"})
 _DIR_NAME = re.compile(r"asif-[0-9a-f]{12}")
@@ -171,9 +175,38 @@ def sweep_stale(parent: Path) -> int:
     return removed
 
 
+def _registry() -> Path:
+    return paths.state_dir() / "workdir-parents"
+
+
+def _remembered_parents() -> list[Path]:
+    try:
+        lines = _registry().read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [Path(line) for line in lines if line.startswith("/")]
+
+
+def _remember_parent(parent: Path) -> None:
+    """Record ``parent`` before a work dir is made in it, so a later run can sweep it."""
+    entry = str(parent.resolve())
+    if "\n" in entry or Path(entry) in _remembered_parents():
+        return
+    registry = _registry()
+    paths.ensure_private_dir(registry.parent)
+    # Append-only, never rewritten: concurrent runs can't drop each other's
+    # entries (a duplicate is harmless), and a folder that is missing today
+    # (an unmounted drive) is still swept once it's back.
+    fd = os.open(registry, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(entry + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def _sweep_parents(override: str) -> list[Path]:
     """Every folder a run of this user could have put its work dir in."""
-    candidates = []
+    candidates = [*_remembered_parents()]
     if override:
         candidates.append(Path(override).expanduser())
     if runtime := os.environ.get("XDG_RUNTIME_DIR"):
@@ -213,6 +246,9 @@ class RamWorkDir:
             )
         parent = self.choice.path
         parent.mkdir(parents=True, exist_ok=True)
+        # Remembered before the work dir exists: a run killed right after
+        # creating it must still be findable.
+        _remember_parent(parent)
         self.swept = sum(sweep_stale(p) for p in _sweep_parents(str(parent)))
         path = parent / f"asif-{secrets.token_hex(6)}"
         path.mkdir(mode=0o700)

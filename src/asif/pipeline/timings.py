@@ -3,9 +3,11 @@
 One JSON object per line, in the shape of §14 of docs/DESIGN.md. It never
 contains file names, paths, sizes, captions or keywords: an image is only
 ever a per-run counter (``i_000123``) over a randomly shuffled processing
-order, and nothing records which file got which number. Durations and
-outcomes could still loosely correlate with a file someone already knows
-about; the encrypted telemetry store (M9) replaces this log.
+order, and nothing records which file got which number. But the captioned
+copies' own file times show the order they were written in, so anyone who
+can see those copies could line them up with the log's timestamps: treat
+the log as no less private than the destination folder. The encrypted
+telemetry store (M9) replaces this log.
 """
 
 from __future__ import annotations
