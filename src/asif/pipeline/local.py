@@ -61,7 +61,7 @@ from asif.meta.writer import Provenance, WritePlan, apply_write, plan_write, rea
 from asif.models.manifest import load_manifest
 from asif.pipeline.states import State
 from asif.pipeline.timings import TimingsLog
-from asif.workdir import NotInRamError, RamWorkDir, wipe_file
+from asif.workdir import NotInRamError, RamWorkDir, mount_of, wipe_file
 
 WRITABLE = frozenset({".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"})
 _SUFFIX_FORMAT = {
@@ -379,9 +379,11 @@ def _reach_mask(path: Path) -> int:
     """
     mask = 0o777
     try:
-        gid = path.stat().st_gid
+        gid = path.resolve().stat().st_gid
     except OSError:
         return 0o700
+    if _private_mount(path.resolve()):
+        return 0o700  # only we can enter that mount
     if _has_acl(path):
         mask &= ~0o070
     for parent in path.parents:
@@ -420,8 +422,9 @@ def _both(a: int, b: int, *, wide: bool) -> int:
 
 @functools.cache
 def _nobody_elses(gid: int) -> bool:
-    """Is ``gid`` a group with no one else in it: root's, or our own private one
-    (named after us, as most Linux systems make one per user)?"""
+    """Is ``gid`` a group with no one else in it: root's, or our own private
+    one (named after us, as most Linux systems make one per user, and no
+    one else's main group)?"""
     if gid == 0:
         return True
     if gid != os.getgid():
@@ -431,11 +434,27 @@ def _nobody_elses(gid: int) -> bool:
         group = grp.getgrgid(gid)
     except KeyError:
         return False
-    return group.gr_name == me and set(group.gr_mem) <= {me}
+    if group.gr_name != me or not set(group.gr_mem) <= {me}:
+        return False
+    return not any(user.pw_gid == gid and user.pw_name != me for user in pwd.getpwall())
 
 
 def _group(gid: int) -> int:
     return _NOBODY if _nobody_elses(gid) else gid
+
+
+def _someone_else(uid: int) -> bool:
+    return uid not in (os.getuid(), 0)
+
+
+def _private_mount(path: Path) -> bool:
+    """Is resolved ``path`` on a FUSE mount only the user who mounted it can enter?
+
+    sshfs, rclone and the like mount that way unless told ``allow_other``,
+    and since As If can enter it, that user is us.
+    """
+    mount = mount_of(str(path))
+    return mount is not None and mount[0].startswith("fuse") and "allow_other" not in mount[1]
 
 
 # POSIX ACL entry tags, as in system.posix_acl_access.
@@ -453,33 +472,111 @@ def _acl_entries(path: Path) -> list[tuple[int, int, int]] | None:
         return []  # there, but unreadable
 
 
-def _acl_audience(entries: list[tuple[int, int, int]], gid: int, perm: int) -> int:
-    """Who an ACL gives ``perm`` (4 read, 1 search), over-estimated."""
+def _acl_audience(entries: list[tuple[int, int, int]], gid: int, perm: int, *, wide: bool) -> int:
+    """Who a POSIX ACL gives ``perm`` (4 read, 1 search): over-estimated when
+    ``wide``, under-estimated otherwise."""
     if not entries:
-        return _ANYONE
+        return _ANYONE if wide else _NOBODY
     mask = next((p for tag, p, _ in entries if tag == _ACL_MASK), 7)
-    groups = set()
-    for tag, granted, ident in entries:
-        if tag == _ACL_OTHER and granted & perm:
+
+    def grants(tag: int, granted: int) -> bool:
+        return bool(granted & perm & (7 if tag == _ACL_OTHER else mask))
+
+    if not wide:
+        # A named user's entry decides for that user alone, even against
+        # what the group or others get; anyone in a group gets in if any of
+        # their groups' entries says so, and only then.
+        if any(t == _ACL_USER and _someone_else(i) and not grants(t, g) for t, g, i in entries):
+            return _NOBODY
+        allowed = [grants(t, g) for t, g, _ in entries if t in (_ACL_GROUP_OBJ, _ACL_GROUP)]
+        if all(allowed) and any(grants(t, g) for t, g, _ in entries if t == _ACL_OTHER):
             return _ANYONE
-        if granted & mask & perm:
-            if tag == _ACL_USER and ident not in (os.getuid(), 0):
-                return _ANYONE  # another person, by name
-            if tag in (_ACL_GROUP_OBJ, _ACL_GROUP):
-                groups.add(_group(gid if tag == _ACL_GROUP_OBJ else ident))
+        if any(grants(t, g) for t, g, _ in entries if t == _ACL_GROUP_OBJ):
+            return _group(gid)
+        return _NOBODY
+    groups: set[int] = set()
+    for tag, granted, ident in entries:
+        if not grants(tag, granted):
+            continue
+        if tag == _ACL_OTHER or (tag == _ACL_USER and _someone_else(ident)):
+            return _ANYONE  # everyone, or another person by name
+        if tag in (_ACL_GROUP_OBJ, _ACL_GROUP):
+            groups.add(_group(gid if tag == _ACL_GROUP_OBJ else ident))
     groups.discard(_NOBODY)
     return _NOBODY if not groups else groups.pop() if len(groups) == 1 else _ANYONE
+
+
+# NFSv4 ACLs, as the Linux client shows them (system.nfs4_acl, XDR).
+_NFS4_ALLOW, _NFS4_DENY = 0, 1
+_NFS4_READ = 0x1  # read data; list, for a folder
+_NFS4_EXECUTE = 0x20  # search, for a folder
+_NFS4_SPECIAL_WHO = frozenset({b"OWNER@", b"GROUP@", b"EVERYONE@"})
+
+
+def _nfs4_aces(target: Path | int) -> list[tuple[int, int, bytes]] | None:
+    """The NFSv4 ACL of ``target`` (a path or an open fd) as (type, access,
+    who); None where there is none (not NFSv4).
+
+    An NFS server can give files an ACL (inherited from their folder, say)
+    that the Linux client shows only as ``system.nfs4_acl``, never as a
+    POSIX ACL. One that can't be read comes back as granting everything to
+    someone unknown, so it's never taken as harmless.
+    """
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        return None
+    try:
+        raw = getxattr(target, "system.nfs4_acl")
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            return None
+        raise
+    unknown = [(_NFS4_ALLOW, 0xFFFFFFFF, b"?")]
+    aces = []
+    try:
+        (count,) = struct.unpack_from(">I", raw, 0)
+        pos = 4
+        for _ in range(count):
+            kind, _flags, access, length = struct.unpack_from(">IIII", raw, pos)
+            who = raw[pos + 16 : pos + 16 + length]
+            pos += 16 + (length + 3) // 4 * 4
+            if len(who) != length:
+                return unknown
+            aces.append((kind, access, who))
+    except struct.error:
+        return unknown
+    return aces
+
+
+def _nfs4_named(aces: list[tuple[int, int, bytes]], access: int, kind: int = _NFS4_ALLOW) -> bool:
+    """Does an entry for someone by name (not owner, group, everyone) allow (or deny) ``access``?"""
+    return any(k == kind and a & access and w not in _NFS4_SPECIAL_WHO for k, a, w in aces)
+
+
+def _nfs4_named_readers(fd: int) -> bool:
+    """Does an NFSv4 ACL on ``fd`` let someone read it by name?
+
+    Entries for the owner, group and everyone follow the mode As If sets;
+    any other that grants reading means someone else can.
+    """
+    aces = _nfs4_aces(fd)
+    return aces is not None and _nfs4_named(aces, _NFS4_READ)
 
 
 def _audience(path: Path, bits: int, *, wide: bool) -> int:
     """Who gets the ``bits`` access (read 0o444 or search 0o111) to ``path``."""
     st = path.stat()
     mode = st.st_mode
+    aces = _nfs4_aces(path)
+    if aces is not None:
+        access = _NFS4_READ if bits == 0o444 else _NFS4_EXECUTE
+        if wide and _nfs4_named(aces, access):
+            return _ANYONE  # someone by name; the mode doesn't show them
+        if not wide and _nfs4_named(aces, access, _NFS4_DENY):
+            return _NOBODY  # someone by name is kept out, whatever the mode says
     entries = _acl_entries(path)
     if entries is not None:
-        # A named entry can also deny someone what "others" get, so an
-        # original's folder with an ACL counts as private.
-        return _acl_audience(entries, st.st_gid, bits & 0o7) if wide else _NOBODY
+        return _acl_audience(entries, st.st_gid, bits & 0o7, wide=wide)
     other, group = mode & bits & 0o007, mode & bits & 0o070
     if other and (group or wide):
         return _ANYONE
@@ -488,18 +585,32 @@ def _audience(path: Path, bits: int, *, wide: bool) -> int:
     return _NOBODY  # (others but not the group: rare, so counted as nobody)
 
 
-def _folder_audience(folder: Path, *, wide: bool) -> int:
-    """Who besides the owner can list ``folder``: over-estimated when ``wide``
-    (a destination folder), under-estimated otherwise (an original's folder).
+def _folder_audience(folder: Path, *, wide: bool, bits: int = 0o444) -> int:
+    """Who besides the owner can list ``folder`` (or, with ``bits`` 0o111, get
+    to what's in it): over-estimated when ``wide`` (a destination folder),
+    under-estimated otherwise (an original's folder).
 
     Symlinks are followed: what counts is the folder the names end up in.
     """
     real = folder.resolve()
-    audience = _audience(real, 0o444, wide=wide)
-    if wide and real.stat().st_uid not in (os.getuid(), 0):
-        audience = _ANYONE  # someone else's folder: they can list it too
+    if _private_mount(real):
+        return _NOBODY
+    st = real.stat()
+    audience = _audience(real, bits, wide=wide)
+    if (
+        wide
+        and _someone_else(st.st_uid)
+        and (os.geteuid() == 0 or st.st_mode & 0o022 or _has_acl(real))
+    ):
+        # Someone else's folder that others can write in: its owner lists it
+        # too. (Someone else's 0700 folder we can write in is our own, seen
+        # through an ID mapping: sshfs, NFS.)
+        audience = _ANYONE
     for parent in real.parents:
-        audience = _both(audience, _audience(parent, 0o111, wide=wide), wide=wide)
+        search = _audience(parent, 0o111, wide=wide)
+        if wide and _someone_else(parent.stat().st_uid):
+            search = _ANYONE  # its owner gets through, whatever the bits say
+        audience = _both(audience, search, wide=wide)
     return audience
 
 
@@ -528,48 +639,37 @@ class _SourceUnreadable(Exception):
         self.exc = exc
 
 
-# NFSv4 ACLs, as the Linux client shows them (system.nfs4_acl, XDR).
-_NFS4_ALLOW = 0
-_NFS4_READ_DATA = 0x1
-_NFS4_SPECIAL_WHO = frozenset({b"OWNER@", b"GROUP@", b"EVERYONE@"})
-
-
-def _nfs4_named_readers(fd: int) -> bool:
-    """Does an NFSv4 ACL on ``fd`` let someone read it by name?
-
-    An NFS server can give new files an ACL inherited from their folder,
-    which the Linux client shows only as ``system.nfs4_acl`` (never as a
-    POSIX ACL). Entries for the owner, group and everyone follow the mode
-    As If sets; any other that grants reading means someone else can.
-    False when there is no such ACL (not NFSv4).
-    """
-    getxattr = getattr(os, "getxattr", None)
-    if getxattr is None:
-        return False
-    try:
-        raw = getxattr(fd, "system.nfs4_acl")
-    except OSError as exc:
-        if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
-            return False
-        raise
-    try:
-        (count,) = struct.unpack_from(">I", raw, 0)
-        pos = 4
-        for _ in range(count):
-            kind, _flags, access, length = struct.unpack_from(">IIII", raw, pos)
-            who = raw[pos + 16 : pos + 16 + length]
-            pos += 16 + (length + 3) // 4 * 4
-            if len(who) != length:
-                return True
-            if kind == _NFS4_ALLOW and access & _NFS4_READ_DATA and who not in _NFS4_SPECIAL_WHO:
-                return True
-    except struct.error:
-        return True  # unreadable: assume the worst
-    return False
-
-
 class _InheritedAcl(Exception):
     """The destination gives new files an ACL that As If can't take away."""
+
+
+class _ModeNotKept(Exception):
+    """The destination gave a copy more read access than As If set (a FAT or
+    exFAT drive, or a network share, whose permissions are fixed when mounted)."""
+
+
+class _FolderRefused(Exception):
+    """The destination can't hold a folder by this name (or a file inside it)."""
+
+    def __init__(self, folder: Path, exc: OSError) -> None:
+        super().__init__(str(exc))
+        self.folder, self.exc = folder, exc
+
+
+def _kept_private(fd: int, mode: int, folder: Path) -> None:
+    """Check a new file in ``folder`` really has no more access than ``mode``.
+
+    An ACL that couldn't be removed gets a mask that grants nothing (on an
+    NFS server with POSIX ACLs, that is what its NFSv4 ACL follows too).
+    Raises ``_InheritedAcl`` or ``_ModeNotKept`` if that's still not so.
+    """
+    if _has_acl(fd) or _nfs4_named_readers(fd):
+        os.fchmod(fd, mode & 0o707)
+        if _nfs4_named_readers(fd):
+            raise _InheritedAcl
+    forced = stat.S_IMODE(os.fstat(fd).st_mode) & 0o044 & ~mode
+    if forced and _folder_audience(folder, wide=True, bits=0o111) != _NOBODY:
+        raise _ModeNotKept
 
 
 def _fsync_dir(path: Path) -> None:
@@ -585,15 +685,39 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _make_private_dirs(path: Path) -> None:
-    """Create ``path`` and any missing parents as 0700, one level at a time."""
+def _make_private_dirs(path: Path, root: Path | None = None) -> list[Path]:
+    """Create ``path`` and any missing parents as 0700, one level at a time.
+
+    Returns the folders it created, top first. A name the destination can't
+    hold raises ``_FolderRefused`` for that folder. ``root`` itself is never
+    created: if it's gone (a drive unplugged, say), copies must not end up
+    on whatever disk is left in its place.
+    """
     missing = []
     while not path.exists():
+        if path == root:
+            raise FileNotFoundError(errno.ENOENT, "the destination folder is gone", str(root))
         missing.append(path)
         path = path.parent
+    created = []
     for folder in reversed(missing):
-        with contextlib.suppress(FileExistsError):
+        try:
             os.mkdir(folder, 0o700)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            if exc.errno in _PER_PATH_ERRNOS:
+                raise _FolderRefused(folder, exc) from exc
+            raise
+        created.append(folder)
+    return created
+
+
+def _remove_created(created: list[Path]) -> None:
+    """Remove folders As If just created, if still empty (their names stay private)."""
+    for folder in reversed(created):
+        with contextlib.suppress(OSError):
+            os.rmdir(folder)
 
 
 class _ReadBackMismatch(Exception):
@@ -632,6 +756,7 @@ def _commit(
     *,
     gid: int | None = None,
     expect_sha: str | None = None,
+    root: Path | None = None,
 ) -> bool:
     """Write ``ram_copy`` to ``dest`` without ever replacing an existing file.
 
@@ -642,16 +767,23 @@ def _commit(
     The temp name is short and fixed-length, so a long photo name can't push
     it past the filesystem's name limit. The copy gets ``mode``, the
     original's group ``gid`` (or no group access) and no inherited ACL;
-    ``_InheritedAcl`` is raised if an NFSv4 ACL would still let others read it.
+    ``_InheritedAcl`` is raised if an NFSv4 ACL would still let others read
+    it, and ``_ModeNotKept`` if the destination gives it more read access
+    than ``mode`` anyway. Folders created for it are then removed again.
 
     With ``expect_sha``, the placed copy is read back and must hash to it,
     or ``_ReadBackMismatch`` is raised. A copy that was placed but not
     confirmed (mismatch, error, Ctrl+C, even mid-placement) is removed again,
     so nothing unverified is ever left for a later run to take as done.
     """
-    _make_private_dirs(dest.parent)
+    created = _make_private_dirs(dest.parent, root)
     tmp = dest.parent / f".asif-{secrets.token_hex(8)}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        if exc.errno in _PER_PATH_ERRNOS - {errno.EEXIST}:
+            raise _FolderRefused(dest.parent, exc) from exc  # the temp name is short and plain
+        raise
     try:
         with ram_copy.open("rb") as fin, os.fdopen(fd, "wb") as fout:
             mode = _no_wider_than_the_original(fout.fileno(), mode, gid)
@@ -660,12 +792,11 @@ def _commit(
             fout.flush()
             os.fsync(fout.fileno())
             os.fchmod(fout.fileno(), mode & 0o777)
-            if _has_acl(fout.fileno()) or _nfs4_named_readers(fout.fileno()):
-                # An ACL that couldn't be removed: let its mask grant nothing
-                # (on an NFS server with POSIX ACLs this is what NFSv4 maps to).
-                os.fchmod(fout.fileno(), mode & 0o707)
-                if _nfs4_named_readers(fout.fileno()):
-                    raise _InheritedAcl
+            try:
+                _kept_private(fout.fileno(), mode, dest.parent)
+            except (_InheritedAcl, _ModeNotKept):
+                _remove_created(created)
+                raise
         st = ram_copy.stat()
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         ours = os.stat(tmp)
@@ -757,6 +888,8 @@ class _Ctx:
     dest_root: Path
     blocked: dict[Path, str] = field(default_factory=dict)
     """Destination folders As If found it can't use, and why."""
+    usable: set[Path] = field(default_factory=set)
+    """Destination folders a test file could be written to (and kept private) in."""
 
 
 def _describe(ctx: _Ctx, ram: Path, img: str) -> CaptionResult:
@@ -811,11 +944,20 @@ def _shown(ctx: _Ctx, folder: Path) -> str:
 
 
 def _blocked_folder(ctx: _Ctx, rel: str, dest: Path) -> ItemOutcome | None:
-    """The outcome for a photo whose destination folder already refused a copy."""
+    """The outcome for a photo whose destination folder already refused a copy.
+
+    That is the nearest existing folder, or a missing one on the way to it
+    that couldn't be created (nothing below that can exist either).
+    """
     if not ctx.blocked:
         return None
-    why = ctx.blocked.get(_nearest_existing(dest.parent, ctx.dest_root))
-    return None if why is None else ItemOutcome(rel, State.FAILED_UPLOAD, why)
+    nearest = _nearest_existing(dest.parent, ctx.dest_root)
+    for folder in (dest.parent, *dest.parent.parents):
+        if (why := ctx.blocked.get(folder)) is not None:
+            return ItemOutcome(rel, State.FAILED_UPLOAD, why)
+        if folder == nearest:
+            return None
+    return None
 
 
 def _block(ctx: _Ctx, rel: str, folder: Path, why: str) -> ItemOutcome:
@@ -831,10 +973,85 @@ def _destination_problem(ctx: _Ctx, rel: str, dest: Path, exc: OSError) -> ItemO
     # Permission denied is one folder's answer (someone else's in a shared
     # destination, or a 0700 one from another user's run): skip that folder,
     # not the run. Folders below it that the user can write to still work.
+    if not ctx.dest_root.is_dir():
+        raise _DestinationError(
+            f"the destination folder {ctx.dest_root} is gone (unplugged or unmounted?)"
+        ) from exc
     if exc.errno == errno.EACCES:
         folder = _nearest_existing(dest.parent, ctx.dest_root)
         return _block(ctx, rel, folder, f"can't write into {_shown(ctx, folder)}")
     raise _DestinationError(f"can't write to the destination ({exc.strerror or exc})") from exc
+
+
+def _permissions_not_kept(dest: Path, src: Path) -> bool:
+    """Does the destination give new files and folders more access than As If
+    sets, with people who can't see the originals able to get to them?
+
+    Tested for real with a file and a folder, then removed again. A root
+    that takes neither (a share where only some subfolders are yours) can't
+    be tested here; each copy is still checked as it's written.
+    """
+    forced = 0
+    name = f".asif-{secrets.token_hex(8)}"
+    try:
+        fd = os.open(dest / f"{name}.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            _no_wider_than_the_original(fd, 0o600, None)
+            os.fchmod(fd, 0o600)
+            forced |= stat.S_IMODE(os.fstat(fd).st_mode) & 0o077
+        finally:
+            os.close(fd)
+            (dest / f"{name}.tmp").unlink(missing_ok=True)
+        os.mkdir(dest / name, 0o700)
+        try:
+            forced |= stat.S_IMODE(os.stat(dest / name).st_mode) & 0o077
+        finally:
+            os.rmdir(dest / name)
+    except PermissionError:
+        return False
+    if not forced or _folder_audience(dest, wide=True, bits=0o111) == _NOBODY:
+        return False
+    try:
+        return _folder_audience(src, wide=False) != _ANYONE
+    except OSError as exc:
+        raise _SourceUnreadable(exc) from exc
+
+
+def _try_folder(ctx: _Ctx, rel: str, dest: Path) -> ItemOutcome | None:
+    """Make sure a copy can go where ``dest`` is, before the model runs.
+
+    A test file is written once in each folder a copy (or a folder for it)
+    would be created in: a folder that refuses it, or gives it access rules
+    As If can't remove, is skipped without spending a model run per photo.
+    """
+    folder = _nearest_existing(dest.parent, ctx.dest_root)
+    if folder in ctx.usable:
+        return None
+    probe = folder / f".asif-{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            _no_wider_than_the_original(fd, 0o600, None)
+            os.fchmod(fd, 0o600)
+            _kept_private(fd, 0o600, folder)
+        finally:
+            os.close(fd)
+            probe.unlink(missing_ok=True)
+    except _InheritedAcl:
+        return _block(ctx, rel, folder, _inherited_acl_reason(ctx, folder))
+    except _ModeNotKept:
+        pass  # the whole destination was checked up front; per photo at commit
+    except OSError as exc:
+        return _destination_problem(ctx, rel, dest, exc)
+    ctx.usable.add(folder)
+    return None
+
+
+def _inherited_acl_reason(ctx: _Ctx, folder: Path) -> str:
+    return (
+        f"{_shown(ctx, folder)} gives new files extra access rules (an inherited ACL) "
+        "that As If can't remove"
+    )
 
 
 def _listable_folder(ctx: _Ctx, src: Path, rel: str) -> Path | None:
@@ -869,17 +1086,10 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
     if suffix in NOT_YET:
         return ItemOutcome(rel, State.SKIPPED_FORMAT, NOT_YET[suffix])
 
-    if (blocked := _blocked_folder(ctx, rel, dest)) is not None:
-        return blocked
     occupied = False
     if not ctx.dry_run:
         try:
             occupied = dest.exists() or dest.is_symlink()
-            if (folder := _listable_folder(ctx, src, rel)) is not None:
-                why = f"other users can list {_shown(ctx, folder)}, but not the original's folder"
-                return _block(ctx, rel, folder, why)
-        except _SourceUnreadable as gone:
-            return _source_problem(rel, gone.exc, "before As If got to it")
         except OSError as exc:
             return _destination_problem(ctx, rel, dest, exc)
     if occupied:
@@ -891,6 +1101,20 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             "unknown": "a file is already at the destination and can't be checked",
         }.get(done, "a different file is already at the destination (As If never overwrites)")
         return ItemOutcome(rel, State.SKIPPED_CONFLICT, reason)
+
+    if (blocked := _blocked_folder(ctx, rel, dest)) is not None:
+        return blocked
+    if not ctx.dry_run:
+        try:
+            if (folder := _listable_folder(ctx, src, rel)) is not None:
+                why = f"other users can list {_shown(ctx, folder)}, but not the original's folder"
+                return _block(ctx, rel, folder, why)
+        except _SourceUnreadable as gone:
+            return _source_problem(rel, gone.exc, "before As If got to it")
+        except OSError as exc:
+            return _destination_problem(ctx, rel, dest, exc)
+        if (refused := _try_folder(ctx, rel, dest)) is not None:
+            return refused
 
     try:
         size = src.stat().st_size
@@ -1015,13 +1239,27 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         processed_sha = sha256_file(ram)
         try:
             with ctx.log.timed("commit", img):
-                committed = _commit(ram, dest, mode, gid=src_st.st_gid, expect_sha=processed_sha)
+                committed = _commit(
+                    ram, dest, mode, gid=src_st.st_gid, expect_sha=processed_sha, root=ctx.dest_root
+                )
         except _InheritedAcl:
-            why = (
-                f"{_shown(ctx, dest.parent)} gives new files extra access rules "
-                "(an inherited ACL) that As If can't remove"
+            # The folders made for it are gone again: the rule comes from above.
+            folder = _nearest_existing(dest.parent, ctx.dest_root)
+            return _block(ctx, rel, folder, _inherited_acl_reason(ctx, folder))
+        except _ModeNotKept:
+            return ItemOutcome(
+                rel,
+                State.FAILED_UPLOAD,
+                "the destination would let other users read the copy (it gives every file "
+                "the same permissions), but not the original",
             )
-            return _block(ctx, rel, dest.parent, why)
+        except _FolderRefused as refused:
+            folder = refused.folder
+            why = (
+                f"the destination can't hold a folder named {folder.name!r} "
+                f"({refused.exc.strerror or refused.exc})"
+            )
+            return _block(ctx, rel, folder, why)
         except _ReadBackMismatch:
             return ItemOutcome(
                 rel,
@@ -1079,13 +1317,27 @@ def caption_folder(
 
     if not dry_run:
         try:
-            if dest.is_dir() and _more_people_can_list(dest, src):
+            created = _make_private_dirs(dest)
+            if _permissions_not_kept(dest, src):
+                _remove_created(created)
+                raise CaptionError(
+                    f"other users on this computer could see and open the copies in {dest}: "
+                    "its drive gives every file the same permissions (FAT and exFAT drives and "
+                    "network shares often do), so As If can't keep them private. Use a folder "
+                    "only you can open, such as one in your home folder, or mount the drive "
+                    "just for you (for example with the options uid=$(id -u),umask=077)."
+                )
+            if _more_people_can_list(dest, src):
+                _remove_created(created)
                 raise CaptionError(
                     f"other users can list the destination {dest} but not {src}, so they "
                     f"would see your photos' names. Run `chmod 700 {dest}` if it's yours, or "
                     "name a new folder (As If creates new ones private)."
                 )
-            _make_private_dirs(dest)
+        except _FolderRefused as exc:
+            raise CaptionError(
+                f"can't create the destination folder {exc.folder}: {exc.exc.strerror}"
+            ) from exc
         except _SourceUnreadable as exc:
             raise CaptionError(f"can't read the source folder {src}: {exc.exc.strerror}") from exc
         except OSError as exc:

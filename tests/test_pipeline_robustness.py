@@ -1147,3 +1147,316 @@ def test_an_nfs4_acl_that_stays_is_refused(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(local._InheritedAcl):
         local._commit(ram, dest, 0o640)
     assert not list(dest.parent.iterdir())
+
+
+# -- round 5 -----------------------------------------------------------------
+
+
+def _count_model_runs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    runs: list[str] = []
+    real = local._describe
+
+    def counted(ctx: Any, ram: Path, img: str) -> Any:
+        runs.append(img)
+        return real(ctx, ram, img)
+
+    monkeypatch.setattr(local, "_describe", counted)
+    return runs
+
+
+def _library(fixtures_dir: Path, root: Path, *rels: str) -> Path:
+    for rel in rels:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(fixtures_dir / "plain.jpg", root / rel)
+    return root
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs a folder owned by someone else")
+def test_the_owner_of_a_folder_above_the_destination_counts(open_dir: Path) -> None:
+    src = _folder(open_dir / "private", 0o700)
+    share = _folder(open_dir / "bob" / "share", 0o700)
+    for folder in (share, share.parent):
+        os.chown(folder, 65534, -1)
+    # Bob lets us in; we make a folder with the usual 0755 inside his.
+    dest = _folder(share / "captioned", 0o755)
+    assert local._more_people_can_list(dest, src)
+    dest.chmod(0o700)
+    assert not local._more_people_can_list(dest, src)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs a folder owned by someone else")
+def test_our_own_folder_seen_through_an_id_mapping_is_not_someone_elses(
+    open_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # sshfs or NFS can show our own folder with the server's numbers.
+    src = _folder(open_dir / "private", 0o700)
+    dest = _folder(open_dir / "nas" / "captioned", 0o700)
+    os.chown(dest, 65534, -1)
+    monkeypatch.setattr(local.os, "geteuid", lambda: 1000)  # as a normal user
+    assert not local._more_people_can_list(dest, src)
+    dest.chmod(0o733)  # but one others can write in is really someone else's
+    assert local._more_people_can_list(dest, src)
+
+
+def test_a_fuse_mount_only_we_can_enter_is_private(
+    open_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _folder(open_dir / "private", 0o700)
+    dest = _folder(open_dir / "mnt" / "nas", 0o755)
+    assert local._more_people_can_list(dest, src)
+    monkeypatch.setattr(local, "mount_of", lambda entry: ("fuse.sshfs", ["rw", "user_id=0"]))
+    assert not local._more_people_can_list(dest, src)
+    assert local._reach_mask(dest) == 0o700  # an original there is private too
+    monkeypatch.setattr(local, "mount_of", lambda entry: ("fuse.sshfs", ["rw", "allow_other"]))
+    assert local._more_people_can_list(dest, src)
+
+
+def _forced_modes(monkeypatch: pytest.MonkeyPatch, under: Path) -> None:
+    """Make files and folders under ``under`` act like a FAT drive mounted umask=022."""
+    real_fchmod, real_mkdir = os.fchmod, os.mkdir
+
+    def fchmod(fd: int, mode: int) -> None:
+        inside = Path(os.readlink(f"/proc/self/fd/{fd}")).is_relative_to(under)
+        real_fchmod(fd, 0o644 if inside else mode)
+
+    def mkdir(path: Any, mode: int = 0o777, **kw: Any) -> None:
+        real_mkdir(path, mode, **kw)
+        if Path(path).is_relative_to(under):
+            os.chmod(path, 0o755)
+
+    monkeypatch.setattr(local.os, "fchmod", fchmod)
+    monkeypatch.setattr(local.os, "mkdir", mkdir)
+
+
+def test_a_drive_that_cant_keep_files_private_is_refused_up_front(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
+    dest = open_dir / "usb" / "captioned"
+    _folder(dest.parent, 0o755)
+    _forced_modes(monkeypatch, dest.parent)
+    with pytest.raises(CaptionError, match="same permissions"):
+        _run(src, dest, cfg, tmp_path)
+    assert not dest.exists()  # nothing named after the photos is left behind
+
+
+def test_such_a_drive_is_fine_where_nobody_else_can_get_in(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # /media/<user> on Ubuntu: a FAT drive under a folder only we can enter.
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
+    media = _folder(open_dir / "media", 0o700)
+    _folder(media / "usb", 0o755)
+    _forced_modes(monkeypatch, media / "usb")
+    summary = _run(src, media / "usb" / "captioned", cfg, tmp_path)
+    assert _states(summary) == {"a.jpg": State.CLEAN}
+
+
+def test_a_private_photo_isnt_copied_where_its_mode_wont_hold(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The source folder is public, so the drive is allowed; one photo isn't.
+    src = _library(fixtures_dir, _folder(open_dir / "public", 0o755), "open.jpg", "mine.jpg")
+    (src / "open.jpg").chmod(0o644)
+    (src / "mine.jpg").chmod(0o600)
+    dest = open_dir / "usb"
+    _forced_modes(monkeypatch, dest)
+    summary = _run(src, dest, cfg, tmp_path)
+    assert _states(summary) == {"open.jpg": State.CLEAN, "mine.jpg": State.FAILED_UPLOAD}
+    assert not (dest / "mine.jpg").exists()
+
+
+def test_an_unwritable_destination_costs_no_model_runs(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a/1.jpg", "a/2.jpg", "b/1.jpg", "c.jpg")
+    dest = tmp_path / "out"
+    for folder in ("a", "b"):
+        (dest / folder).mkdir(parents=True, mode=0o700)
+    runs = _count_model_runs(monkeypatch)
+    real_open = os.open
+
+    def refuse_tests(path: Any, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        target = Path(path)
+        if target.name.startswith(".asif-") and target.parent != dest:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, mode, **kw)
+
+    monkeypatch.setattr(local.os, "open", refuse_tests)
+    summary = _run(src, dest, cfg, tmp_path)
+    states = _states(summary)
+    assert summary.aborted is None
+    assert states.pop("c.jpg") == State.CLEAN
+    assert set(states.values()) == {State.FAILED_UPLOAD}
+    assert len(runs) == 1  # only c.jpg ran the model
+
+
+def test_a_destination_that_vanishes_stops_the_run(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg", "b.jpg", "c.jpg")
+    dest = tmp_path / "out"
+
+    def unmount(outcome: Any, index: int, total: int) -> None:
+        if index == 1:
+            shutil.rmtree(dest)
+
+    summary = _run(src, dest, cfg, tmp_path, on_progress=unmount)
+    assert summary.aborted is not None and "is gone" in summary.aborted
+    assert len(summary.outcomes) == 2
+    assert not dest.exists()  # never made again (on whatever disk is left)
+
+
+def test_finished_copies_in_a_refused_folder_still_count_as_done(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a/1.jpg", "a/2.jpg")
+    dest = tmp_path / "out"
+    _run(src, dest, cfg, tmp_path)
+    _library(fixtures_dir, src, "a/0.jpg")  # new, and first: the folder is refused then
+    real_open = os.open
+
+    def a_refuses(path: Any, flags: int, mode: int = 0o777, **kw: Any) -> int:
+        if Path(path).parent == dest / "a" and Path(path).name.startswith(".asif-"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, mode, **kw)
+
+    monkeypatch.setattr(local.os, "open", a_refuses)
+    monkeypatch.setattr(local.secrets, "SystemRandom", _KeepOrder)
+    states = _states(_run(src, dest, cfg, tmp_path))
+    assert states == {
+        "a/0.jpg": State.FAILED_UPLOAD,
+        "a/1.jpg": State.SKIPPED_DONE,
+        "a/2.jpg": State.SKIPPED_DONE,
+    }
+
+
+def test_a_folder_name_the_destination_cant_hold_costs_one_model_run(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(
+        fixtures_dir,
+        tmp_path / "src",
+        "Paris: day 1/1.jpg",
+        "Paris: day 1/2.jpg",
+        "Paris: day 1/x/3.jpg",
+        "ok/1.jpg",
+    )
+    dest = tmp_path / "out"
+    runs = _count_model_runs(monkeypatch)
+    real_mkdir = os.mkdir
+
+    def fat_mkdir(path: Any, mode: int = 0o777, **kw: Any) -> None:
+        if ":" in Path(path).name:  # FAT and exFAT refuse ':' in names
+            raise OSError(errno.EINVAL, "Invalid argument")
+        real_mkdir(path, mode, **kw)
+
+    monkeypatch.setattr(local.os, "mkdir", fat_mkdir)
+    summary = _run(src, dest, cfg, tmp_path)
+    states = _states(summary)
+    assert states.pop("ok/1.jpg") == State.CLEAN
+    assert set(states.values()) == {State.FAILED_UPLOAD}
+    assert len(runs) == 2  # one for ok/, one for the folder that couldn't be made
+    reasons = {o.reason for o in summary.outcomes if o.state == State.FAILED_UPLOAD}
+    assert reasons == {
+        "the destination can't hold a folder named 'Paris: day 1' (Invalid argument)"
+    }
+
+
+def _nfs4_inherited(monkeypatch: pytest.MonkeyPatch, under: Path) -> None:
+    """New files under ``under`` get an NFSv4 ACL letting bob read them."""
+    named = _nfs4_acl((0, 0x1, b"OWNER@"), (0, 0x1, b"bob@example"))
+
+    def getxattr(target: Any, name: str) -> bytes:
+        path = Path(os.readlink(f"/proc/self/fd/{target}") if isinstance(target, int) else target)
+        if name == "system.nfs4_acl" and path.is_relative_to(under) and path.is_file():
+            return named
+        raise OSError(errno.ENODATA, "No data available")
+
+    monkeypatch.setattr(local.os, "getxattr", getxattr, raising=False)
+
+
+def test_an_inherited_nfs4_acl_is_caught_before_the_model_runs(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "2024-01/1.jpg", "2024-02/1.jpg", "c.jpg")
+    dest = tmp_path / "out"
+    dest.mkdir(mode=0o700)
+    _nfs4_inherited(monkeypatch, dest)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(src, dest, cfg, tmp_path)
+    assert set(_states(summary).values()) == {State.FAILED_UPLOAD}
+    assert runs == []
+    assert not list(dest.iterdir())  # no folder named after a source folder
+
+
+def test_an_nfs4_acl_on_a_destination_folder_counts(
+    open_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _folder(open_dir / "private", 0o700)
+    dest = _folder(open_dir / "nfs" / "out", 0o700)
+    named = _nfs4_acl((0, 0x1, b"OWNER@"), (0, 0x1, b"family@example"))
+
+    def getxattr(target: Any, name: str) -> bytes:
+        if name == "system.nfs4_acl" and Path(target) == dest:
+            return named
+        raise OSError(errno.ENODATA, "No data available")
+
+    monkeypatch.setattr(local.os, "getxattr", getxattr, raising=False)
+    assert local._more_people_can_list(dest, src)
+
+
+def test_a_source_acl_is_read_not_just_noticed() -> None:
+    # (tag, permissions, id): user::rwx, group::r-x, other::r-x, mask::r-x
+    base = [(0x01, 7, 0), (0x04, 5, 0), (0x20, 5, 0), (0x10, 5, 0)]
+    gid = 4242  # not ours
+    audience = local._acl_audience
+    assert audience(base, gid, 4, wide=False) == local._ANYONE
+    assert audience([*base, (0x02, 5, 54321)], gid, 4, wide=False) == local._ANYONE
+    # Someone named and left out: nobody else is sure to get in.
+    assert audience([*base, (0x02, 0, 54321)], gid, 4, wide=False) == local._NOBODY
+    group_only = [(0x01, 7, 0), (0x04, 5, 0), (0x20, 0, 0), (0x10, 5, 0)]
+    assert audience(group_only, gid, 4, wide=False) == gid
+
+
+def test_a_private_group_isnt_private_if_someone_else_lives_in_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace as NS
+
+    monkeypatch.setattr(local.os, "getgid", lambda: 1000)
+    monkeypatch.setattr(local.os, "getuid", lambda: 1000)
+    monkeypatch.setattr(local.pwd, "getpwuid", lambda uid: NS(pw_name="alice"))
+    monkeypatch.setattr(local.grp, "getgrgid", lambda gid: NS(gr_name="alice", gr_mem=[]))
+    alice = NS(pw_name="alice", pw_gid=1000)
+    check = local._nobody_elses.__wrapped__
+    monkeypatch.setattr(local.pwd, "getpwall", lambda: [alice])
+    assert check(1000)
+    monkeypatch.setattr(local.pwd, "getpwall", lambda: [alice, NS(pw_name="svc", pw_gid=1000)])
+    assert not check(1000)
+
+
+def test_a_destination_root_we_cant_write_in_still_takes_copies_in_our_folders(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A NAS share: the root is the admin's, the year folders are ours.
+    src = _library(fixtures_dir, tmp_path / "src", "2024/a.jpg", "b.jpg")
+    dest = tmp_path / "share"
+    (dest / "2024").mkdir(parents=True, mode=0o700)
+    real_open, real_mkdir = os.open, os.mkdir
+
+    def root_refuses(path: Any, *a: Any, **kw: Any) -> Any:
+        if Path(path).parent == dest and Path(path).name.startswith(".asif-"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, *a, **kw)
+
+    def root_refuses_mkdir(path: Any, *a: Any, **kw: Any) -> None:
+        if Path(path).parent == dest:
+            raise PermissionError(errno.EACCES, "Permission denied")
+        real_mkdir(path, *a, **kw)
+
+    monkeypatch.setattr(local.os, "open", root_refuses)
+    monkeypatch.setattr(local.os, "mkdir", root_refuses_mkdir)
+    summary = _run(src, dest, cfg, tmp_path)
+    assert summary.aborted is None
+    assert _states(summary) == {"2024/a.jpg": State.CLEAN, "b.jpg": State.FAILED_UPLOAD}

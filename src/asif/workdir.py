@@ -229,28 +229,36 @@ def _unescape_mount(field: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
 
 
-def _is_remote(entry: str, mounts_file: Path = Path("/proc/mounts")) -> bool:
-    """Is the already-resolved path ``entry`` on a network or FUSE mount?
+def mount_of(entry: str, mounts_file: Path = Path("/proc/mounts")) -> tuple[str, list[str]] | None:
+    """The filesystem type and mount options of the mount holding ``entry``.
 
-    Decided from the mount table alone, without touching the path, which
-    could hang if the mount has stopped answering.
+    ``entry`` must be an already-resolved path. Decided from the mount table
+    alone, without touching the path, which could hang if the mount has
+    stopped answering. None if the table can't be read (not Linux).
     """
     try:
         lines = mounts_file.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return False
-    best: tuple[int, str] | None = None
+        return None
+    best: tuple[int, str, list[str]] | None = None
     for line in lines:
         parts = line.split()
-        if len(parts) < 3:
+        if len(parts) < 4:
             continue
         mount_point = _unescape_mount(parts[1])
         prefix = mount_point.rstrip("/") + "/"
         if entry == mount_point or entry.startswith(prefix):
             depth = len(Path(mount_point).parts)
+            # ">=": the mount listed last on the same path is the one on top.
             if best is None or depth >= best[0]:
-                best = (depth, parts[2])
-    return best is not None and best[1].startswith(_REMOTE_FSTYPES)
+                best = (depth, parts[2], parts[3].split(","))
+    return None if best is None else (best[1], best[2])
+
+
+def _is_remote(entry: str, mounts_file: Path = Path("/proc/mounts")) -> bool:
+    """Is the already-resolved path ``entry`` on a network or FUSE mount?"""
+    mount = mount_of(entry, mounts_file)
+    return mount is not None and mount[0].startswith(_REMOTE_FSTYPES)
 
 
 def _sweep_parents(override: str) -> list[Path]:

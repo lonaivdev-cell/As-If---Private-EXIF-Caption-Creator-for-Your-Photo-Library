@@ -71,7 +71,7 @@ BENIGN_IMPORTERS: dict[str, tuple[str, ...]] = {
 # forbidden module (with the importing file), not just the first one, so an
 # offender can't hide behind a harmless module that loaded it earlier.
 _PROBE = """
-import builtins, importlib, importlib.abc, json, pkgutil, sys, traceback
+import builtins, importlib, importlib.abc, json, pkgutil, sys, traceback, types
 
 FORBIDDEN = {forbidden!r}
 seen = []
@@ -115,15 +115,24 @@ for target in {targets!r}:
             importlib.import_module(info.name)
             imported.append(info.name)
     else:
-        try:
-            importlib.import_module(target)
-        except ModuleNotFoundError as exc:
-            if exc.name != target:
-                raise
-            # "from pkg import name": name is an attribute, perhaps one that
-            # loads a module on first use (concurrent.futures.ProcessPoolExecutor).
-            parent, _, attr = target.rpartition(".")
-            getattr(importlib.import_module(parent), attr, None)
+        # "from pkg import name" or "pkg.name.more": import the longest part
+        # that is a module, then get the rest as attributes, any of which may
+        # load a module on first use (concurrent.futures.ProcessPoolExecutor).
+        parts = target.split(".")
+        for i in range(len(parts), 0, -1):
+            name = ".".join(parts[:i])
+            try:
+                obj = importlib.import_module(name)
+                break
+            except ModuleNotFoundError as exc:
+                # Only the name (or its parent) may be missing, not a module it imports.
+                if i == 1 or not f"{{name}}.".startswith(f"{{exc.name}}."):
+                    raise
+        for attr in parts[i:]:
+            # Only a module's attributes load modules; stop at a class or function.
+            if not isinstance(obj, types.ModuleType):
+                break
+            obj = getattr(obj, attr, None)
         imported.append(target)
 builtins.__import__ = _real_import
 # Imports made *by* a forbidden module are already blamed on whoever loaded it.
@@ -196,17 +205,29 @@ _DYNAMIC_IMPORTERS = {"import_module", "__import__"}
 
 
 def _imports_in(tree: ast.AST, package: str = "asif") -> tuple[set[str], list[str]]:
-    """Every module a source file in ``package`` can import, and its dynamic imports."""
+    """Every module a source file in ``package`` can import (or attribute of
+    one it reaches), and its dynamic imports."""
     names: set[str] = set()
     dynamic: list[str] = []
+    # What each name bound by an import refers to: "import a.b" binds a.
+    bound: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
+            for alias in node.names:
+                if alias.asname:
+                    bound[alias.asname] = alias.name
+                else:
+                    top = alias.name.partition(".")[0]
+                    bound[top] = top
         elif isinstance(node, ast.ImportFrom):
             # "from . import worker" inside asif/infer/ means asif.infer.worker.
             base = importlib.util.resolve_name("." * node.level + (node.module or ""), package)
             names.add(base)
-            names.update(f"{base}.{alias.name}" for alias in node.names if alias.name != "*")
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(f"{base}.{alias.name}")
+                    bound[alias.asname or alias.name] = f"{base}.{alias.name}"
         elif isinstance(node, ast.Call):
             func = node.func
             called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
@@ -216,6 +237,16 @@ def _imports_in(tree: ast.AST, package: str = "asif") -> tuple[set[str], list[st
                     dynamic.append(f"line {node.lineno}")
                 else:
                     names.add(name)
+    # "concurrent.futures.ProcessPoolExecutor" after "import concurrent.futures":
+    # a module attribute can load a module on first use, as an import does.
+    for node in ast.walk(tree):
+        chain: list[str] = []
+        inner = node
+        while isinstance(inner, ast.Attribute):
+            chain.append(inner.attr)
+            inner = inner.value
+        if chain and isinstance(inner, ast.Name) and inner.id in bound:
+            names.add(".".join([bound[inner.id], *reversed(chain)]))
     return names, dynamic
 
 
@@ -300,13 +331,26 @@ def test_no_orchestrator_source_imports_networking_modules() -> None:
             "    return ProcessPoolExecutor()\n",
             os.path.join("multiprocessing", "connection.py"),
         ),
+        # The same attribute, reached through what was imported.
+        (
+            "def pool():\n"
+            "    import concurrent.futures\n"
+            "    return concurrent.futures.ProcessPoolExecutor()\n",
+            os.path.join("multiprocessing", "connection.py"),
+        ),
+        (
+            "def pool():\n"
+            "    from concurrent import futures\n"
+            "    return futures.ProcessPoolExecutor()\n",
+            os.path.join("multiprocessing", "connection.py"),
+        ),
     ],
-    ids=["submodule", "lazy-attribute"],
+    ids=["submodule", "lazy-attribute", "lazy-attribute-chain", "lazy-attribute-of-from-import"],
 )
 def test_the_source_check_imports_what_the_source_names(
     tmp_path: Path, source: str, importer: str
 ) -> None:
-    # Guards the guard. Importing just logging or concurrent loads no
+    # Guards the guard. Importing just logging or concurrent.futures loads no
     # networking module; what the source names does, once it runs.
     package = tmp_path / "lazy"
     package.mkdir()
@@ -315,6 +359,26 @@ def test_the_source_check_imports_what_the_source_names(
     offenders, bad = source_check(package, "lazy")
     assert offenders == []
     assert any(module == "socket" and path.endswith(importer) for module, path in bad), bad
+
+
+def test_the_source_check_follows_harmless_attributes_quietly(tmp_path: Path) -> None:
+    # Guards the guard. Attribute chains are probed too, including ones that
+    # go past a module into a class or function; ordinary ones must neither
+    # be reported nor break the probe.
+    source = (
+        "import datetime\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "def stamp(folder):\n"
+        "    return os.path.join(folder, datetime.datetime.now().isoformat()), Path.home()\n"
+    )
+    names, _ = _imports_in(ast.parse(source))
+    assert {"os.path.join", "datetime.datetime.now", "pathlib.Path.home"} <= names
+    package = tmp_path / "plain"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "later.py").write_text(source)
+    assert source_check(package, "plain") == ([], [])
 
 
 def test_the_source_check_sees_lazy_and_dynamic_imports() -> None:
@@ -335,6 +399,22 @@ def test_the_source_check_sees_lazy_and_dynamic_imports() -> None:
     relative = ast.parse("def later():\n    from . import worker\n    from .worker import main\n")
     names, _ = _imports_in(relative, "asif.infer")
     assert {"asif.infer.worker", "asif.infer.worker.main"} <= names
+    # Attributes of an imported name, by whatever name the import bound;
+    # other names' attributes aren't imports.
+    chains = ast.parse(
+        "import concurrent.futures as cf\n"
+        "from . import worker\n"
+        "def later(self):\n"
+        "    return cf.ProcessPoolExecutor, worker.main, self.worker.main\n"
+    )
+    names, _ = _imports_in(chains, "asif.infer")
+    assert names == {
+        "concurrent.futures",
+        "concurrent.futures.ProcessPoolExecutor",
+        "asif.infer",
+        "asif.infer.worker",
+        "asif.infer.worker.main",
+    }
 
 
 def test_pydantic_plugins_are_disabled_in_the_orchestrator() -> None:
