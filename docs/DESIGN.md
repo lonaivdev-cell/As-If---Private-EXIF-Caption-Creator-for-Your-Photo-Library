@@ -155,7 +155,7 @@ DISCOVERED → STAGED → OPENED → DESCRIBED → WRITTEN → VERIFIED → UPLO
 | Store | Default location (Linux) | Contents | Protection | Lifetime |
 |---|---|---|---|---|
 | Staging | `~/.cache/asif/staging/` | downloaded originals | `age` encryption with an **ephemeral session key held only in memory** | until `CONFIRMED`; leftovers wiped at next start |
-| RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only; 0700, locked by its run | seconds; overwritten then unlinked; a dead run's leftovers are wiped by the next run, which also checks every parent folder an earlier run used (remembered in the state dir) |
+| RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only; 0700, locked by its run | seconds; overwritten then unlinked; a dead run's leftovers are wiped by the next run, which also checks every parent folder an earlier run used (remembered in the state dir's `workdir-parents`; best effort; folders on network or FUSE mounts are skipped, since a dead mount would hang the run, until a run uses them again) |
 | Vault | `~/.local/share/asif/vault.db` | catalogue, captions, keywords, hashes, 256 px thumbnails, undo journal | SQLCipher; key from your passphrase via Argon2id | until `asif wipe vault` |
 | Telemetry | `~/.local/state/asif/telemetry.db` | timings, resources, errors — **no** names, paths or captions | SQLCipher; separate key (HKDF from master key, distinct context) | rolling, user-set retention |
 | Credentials | OS secret store | Proton session (owned by the Proton CLI), rclone config password | OS (libsecret / Keychain / Credential Manager) | per provider |

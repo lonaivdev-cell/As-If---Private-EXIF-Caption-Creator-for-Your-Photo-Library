@@ -578,10 +578,12 @@ def test_an_unsearchable_destination_subfolder_is_handled(
     summary = _run(photos, dest, cfg, tmp_path)
     states = _states(summary)
     assert states["p2.jpg"] == State.FAILED_UPLOAD  # only this photo's path
-    # EACCES means the destination itself: stop, and keep the summary so far.
-    assert summary.aborted is not None and "Permission denied" in summary.aborted
-    assert states["p3.jpg"] == State.FAILED_UPLOAD
-    assert "p4.jpg" not in states
+    # Permission denied is that folder's answer: later photos bound for it
+    # are skipped before the model runs, and the run goes on.
+    assert summary.aborted is None
+    assert states["p3.jpg"] == states["p4.jpg"] == State.FAILED_UPLOAD
+    reasons = {o.rel: o.reason for o in summary.outcomes}
+    assert reasons["p3.jpg"] == reasons["p4.jpg"] == "can't write into the destination folder"
     assert states["p0.jpg"] == states["p1.jpg"] == State.CLEAN
 
 
@@ -802,6 +804,7 @@ def test_one_unwritable_subfolder_doesnt_stop_the_run(
         (photos / "theirs").mkdir(exist_ok=True)
         shutil.copy2(photos / "p0.jpg", photos / "theirs" / f"{name}.jpg")
     dest = tmp_path / "out"
+    (dest / "theirs").mkdir(parents=True, mode=0o700)  # someone else's, say
     real_commit = local._commit
 
     def denied_in_theirs(ram: Path, target: Path, mode: int, **kw: Any) -> bool:
@@ -897,3 +900,250 @@ def test_a_listable_folder_above_the_copy_is_refused_too(
         assert not list((dest / "health").iterdir())
     finally:
         shutil.rmtree(open_root)
+
+
+# -- round 4 -----------------------------------------------------------------
+
+
+def _a_second_gid() -> int | None:
+    """A group other than our own we can give files to (root: any), or None."""
+    if os.geteuid() == 0:
+        return _other_gid()
+    others = [g for g in os.getgroups() if g != os.getegid()]
+    return others[0] if others else None
+
+
+@pytest.fixture
+def open_dir() -> Any:
+    """A folder everyone can search into (under /dev/shm), like a real home's parent."""
+    import tempfile
+
+    if not os.path.isdir("/dev/shm"):
+        pytest.skip("needs a world-searchable dir")
+    root = Path(tempfile.mkdtemp(dir="/dev/shm"))
+    root.chmod(0o755)
+    yield root
+    for path in [root, *root.rglob("*")]:
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o700)
+    shutil.rmtree(root)
+
+
+def _folder(path: Path, mode: int, gid: int | None = None) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    if gid is not None:
+        os.chown(path, -1, gid)
+    path.chmod(mode)
+    return path
+
+
+def test_a_group_shared_destination_counts_its_group_not_just_its_bits(open_dir: Path) -> None:
+    other = _a_second_gid()
+    if other is None:
+        pytest.skip("needs a second group")
+    me = os.getegid()
+    home = _folder(open_dir / "home", 0o750, me)
+    src = _folder(home / "Pictures", 0o755)
+    family = _folder(open_dir / "family", 0o2770, other)
+    dest = _folder(family / "alice-captioned", 0o755, other)
+    # Both are "group-listable", but by different groups.
+    assert local._more_people_can_list(dest, src)
+    # The everyday case still works: a 0755 folder next to the source.
+    assert not local._more_people_can_list(_folder(home / "captioned", 0o755), src)
+
+
+def test_others_one_level_down_are_counted(open_dir: Path) -> None:
+    other = _a_second_gid()
+    if other is None:
+        pytest.skip("needs a second group")
+    # 0705 inside a group-only folder: that group's members are "others" here.
+    parent = _folder(open_dir / "shared", 0o750, other)
+    dest = _folder(parent / "out", 0o705)
+    src = _folder(open_dir / "private", 0o700)
+    assert local._more_people_can_list(dest, src)
+
+
+@pytest.mark.skipif(not hasattr(os, "setxattr"), reason="POSIX ACLs are Linux-only")
+def test_a_named_user_acl_on_the_destination_counts(open_dir: Path) -> None:
+    import struct
+
+    src = _folder(open_dir / "private", 0o700)
+    dest = _folder(open_dir / "out", 0o700)
+    assert not local._more_people_can_list(dest, src)
+    # user::rwx, user:65534:r-x, group::---, mask::r-x, other::---
+    entries = [
+        (0x01, 7, 0xFFFFFFFF),
+        (0x02, 5, 65534),
+        (0x04, 0, 0xFFFFFFFF),
+        (0x10, 5, 0xFFFFFFFF),
+        (0x20, 0, 0xFFFFFFFF),
+    ]
+    acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in entries)
+    try:
+        os.setxattr(dest, "system.posix_acl_access", acl)
+    except OSError as exc:
+        pytest.skip(f"no ACL support here ({exc.strerror})")
+    assert local._more_people_can_list(dest, src)
+
+
+@pytest.mark.skipif(not hasattr(os, "setxattr"), reason="POSIX ACLs are Linux-only")
+def test_a_folder_only_we_can_enter_through_an_acl_is_still_private(open_dir: Path) -> None:
+    import struct
+
+    # Like /media/<user> on Ubuntu, where USB drives are mounted: 0750, and
+    # an ACL lets just that user in.
+    src = _folder(open_dir / "private", 0o700)
+    media = _folder(open_dir / "media", 0o750)
+    dest = _folder(media / "usb" / "captioned", 0o755)
+    entries = [
+        (0x01, 7, 0xFFFFFFFF),
+        (0x02, 5, os.getuid()),
+        (0x04, 0, 0xFFFFFFFF),
+        (0x10, 5, 0xFFFFFFFF),
+        (0x20, 0, 0xFFFFFFFF),
+    ]
+    acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *e) for e in entries)
+    try:
+        os.setxattr(media, "system.posix_acl_access", acl)
+    except OSError as exc:
+        pytest.skip(f"no ACL support here ({exc.strerror})")
+    assert not local._more_people_can_list(dest, src)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs a folder owned by someone else")
+def test_someone_elses_folder_counts_as_listable(open_dir: Path) -> None:
+    src = _folder(open_dir / "private", 0o700)
+    dest = _folder(open_dir / "theirs", 0o700)
+    os.chown(dest, 65534, -1)
+    assert local._more_people_can_list(dest, src)
+
+
+def test_a_symlinked_destination_folder_is_judged_where_it_points(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = _folder(open_dir / "private", 0o700)
+    _folder(src / "2024", 0o755)
+    shutil.copy2(fixtures_dir / "plain.jpg", src / "2024" / "a.jpg")
+    public = _folder(open_dir / "public" / "2024", 0o755)
+    dest = _folder(open_dir / "out", 0o700)
+    (dest / "2024").symlink_to(public)
+    summary = _run(src, dest, cfg, tmp_path)
+    [outcome] = summary.outcomes
+    assert outcome.state == State.FAILED_UPLOAD
+    assert outcome.reason.startswith("other users can list the destination folder 2024/")
+    assert not list(public.iterdir())
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs files in a group we're not the owner of")
+def test_the_copy_keeps_group_access_only_if_that_group_could_reach_the_original(
+    open_dir: Path,
+) -> None:
+    other = _other_gid()
+    home = _folder(open_dir / "home", 0o750)  # our own group's
+    photo = home / "a.jpg"
+    photo.write_bytes(b"x")
+    os.chown(photo, -1, other)
+    photo.chmod(0o640)
+    # Its group can't get into home, so it can't read the photo.
+    assert local._reach_mask(photo) & 0o070 == 0
+    os.chown(home, -1, other)
+    assert local._reach_mask(photo) & 0o070 == 0o070
+
+
+def test_a_source_folder_moved_mid_run_skips_its_photos_not_the_run(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src"
+    (src / "a").mkdir(parents=True)
+    for rel in ("a/x.jpg", "a/y.jpg", "b.jpg"):
+        shutil.copy2(fixtures_dir / "plain.jpg", src / rel)
+    monkeypatch.setattr(local.secrets, "SystemRandom", _KeepOrder)
+
+    def move_a(outcome: Any, index: int, total: int) -> None:
+        if outcome.rel == "a/x.jpg":
+            (src / "a").rename(src / "a-moved")  # a file manager, Syncthing...
+
+    summary = _run(src, tmp_path / "out", cfg, tmp_path, on_progress=move_a)
+    states = _states(summary)
+    assert summary.aborted is None
+    assert states == {
+        "a/x.jpg": State.CLEAN,
+        "a/y.jpg": State.SKIPPED_CONFLICT,
+        "b.jpg": State.CLEAN,
+    }
+
+
+def test_a_refused_folder_doesnt_block_writable_folders_inside_it(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = tmp_path / "src"
+    (src / "theirs" / "deep").mkdir(parents=True)
+    for rel in ("theirs/a.jpg", "theirs/deep/y.jpg", "mine.jpg"):
+        shutil.copy2(fixtures_dir / "plain.jpg", src / rel)
+    dest = tmp_path / "out"
+    (dest / "theirs" / "deep").mkdir(parents=True, mode=0o700)
+    real_commit = local._commit
+
+    def theirs_refuses(ram: Path, target: Path, mode: int, **kw: Any) -> bool:
+        if target.parent in (dest / "theirs", dest):  # the root refuses too
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_commit(ram, target, mode, **kw)
+
+    monkeypatch.setattr(local, "_commit", theirs_refuses)
+    monkeypatch.setattr(local.secrets, "SystemRandom", _KeepOrder)  # theirs/a.jpg first
+    summary = _run(src, dest, cfg, tmp_path)
+    states = _states(summary)
+    assert summary.aborted is None
+    assert states["theirs/a.jpg"] == states["mine.jpg"] == State.FAILED_UPLOAD
+    assert states["theirs/deep/y.jpg"] == State.CLEAN
+
+
+def test_a_copy_that_fails_its_read_back_is_removed_on_any_filesystem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # sshfs and CIFS (noserverino) give each name its own inode number.
+    monkeypatch.setattr(local.os.path, "samestat", lambda a, b: False)
+    ram = tmp_path / "ram.jpg"
+    ram.write_bytes(b"processed")
+    dest = tmp_path / "out" / "a.jpg"
+    with pytest.raises(local._ReadBackMismatch):
+        local._commit(ram, dest, 0o644, expect_sha="0" * 64)
+    assert not list(dest.parent.iterdir())
+
+
+def _nfs4_acl(*aces: tuple[int, int, bytes]) -> bytes:
+    """An NFSv4 ACL as Linux shows it: (type, access mask, who) per entry."""
+    import struct
+
+    out = struct.pack(">I", len(aces))
+    for kind, access, who in aces:
+        out += struct.pack(">IIII", kind, 0, access, len(who)) + who.ljust(
+            -(-len(who) // 4) * 4, b"\0"
+        )
+    return out
+
+
+def test_nfs4_acls_are_read_correctly(monkeypatch: pytest.MonkeyPatch) -> None:
+    trivial = _nfs4_acl((0, 0x1, b"OWNER@"), (0, 0x1, b"GROUP@"), (0, 0x1, b"EVERYONE@"))
+    named = _nfs4_acl((0, 0x1, b"OWNER@"), (0, 0x1, b"bob@example"))
+    denied = _nfs4_acl((0, 0x1, b"OWNER@"), (1, 0x1, b"bob@example"))
+    for raw, expected in [(trivial, False), (named, True), (denied, False), (named[:-3], True)]:
+        monkeypatch.setattr(local.os, "getxattr", lambda fd, name, raw=raw: raw, raising=False)
+        assert local._nfs4_named_readers(0) is expected
+
+
+def test_an_nfs4_acl_that_stays_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    named = _nfs4_acl((0, 0x1, b"OWNER@"), (0, 0x1, b"bob@example"))
+
+    def getxattr(target: Any, name: str) -> bytes:
+        if name == "system.nfs4_acl":
+            return named  # the server keeps granting bob, whatever the mode
+        raise OSError(errno.ENODATA, "No data available")
+
+    monkeypatch.setattr(local.os, "getxattr", getxattr, raising=False)
+    ram = tmp_path / "ram.jpg"
+    ram.write_bytes(b"processed")
+    dest = tmp_path / "out" / "a.jpg"
+    with pytest.raises(local._InheritedAcl):
+        local._commit(ram, dest, 0o640)
+    assert not list(dest.parent.iterdir())

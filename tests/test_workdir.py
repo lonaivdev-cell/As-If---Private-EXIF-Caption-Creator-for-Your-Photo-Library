@@ -180,3 +180,47 @@ def test_a_work_dir_used_before_is_swept_after_the_setting_changes(tmp_path: Pat
     with RamWorkDir(str(tmp_path / "new-ram"), allow_disk=True) as work:
         assert work.swept >= 1
     assert not dead.exists()
+
+
+def test_a_state_folder_that_cant_be_written_doesnt_stop_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "asif-home"
+    home.mkdir()
+    (home / "state").write_text("not a folder")
+    monkeypatch.setenv("ASIF_HOME", str(home))
+    with RamWorkDir(str(tmp_path / "ram"), allow_disk=True) as work:
+        assert work.path is not None and work.path.is_dir()
+        assert work.unremembered
+
+
+def test_remote_mounts_are_told_apart_without_touching_them(tmp_path: Path) -> None:
+    from asif import workdir
+
+    mounts = tmp_path / "mounts"
+    mounts.write_text(
+        "/dev/sda1 / ext4 rw 0 0\n"
+        "server:/photos /mnt/nas nfs4 rw 0 0\n"
+        "me@host: /home/me/my\\040box fuse.sshfs rw 0 0\n"
+        "/dev/sdb1 /mnt/nas/local ext4 rw 0 0\n"
+    )
+    assert workdir._is_remote("/mnt/nas/tmp", mounts)
+    assert workdir._is_remote("/home/me/my box/work", mounts)
+    assert not workdir._is_remote("/mnt/nas/local/work", mounts)  # deeper mount wins
+    assert not workdir._is_remote("/mnt/nasty", mounts)
+    assert not workdir._is_remote("/tmp", mounts)
+
+
+def test_remembered_folders_on_remote_mounts_are_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from asif import workdir
+
+    remote, local_dir = tmp_path / "remote", tmp_path / "local"
+    remote.mkdir()
+    local_dir.mkdir()
+    monkeypatch.setattr(workdir, "_remembered_parents", lambda: [remote, local_dir])
+    monkeypatch.setattr(workdir, "_is_remote", lambda entry: entry == str(remote))
+    parents = workdir._sweep_parents("")
+    assert local_dir.resolve() in parents and remote.resolve() not in parents
+    assert remote.resolve() in workdir._sweep_parents(str(remote))  # in use again: swept

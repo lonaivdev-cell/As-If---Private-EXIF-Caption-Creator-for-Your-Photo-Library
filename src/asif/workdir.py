@@ -188,7 +188,10 @@ def _remembered_parents() -> list[Path]:
 
 
 def _remember_parent(parent: Path) -> None:
-    """Record ``parent`` before a work dir is made in it, so a later run can sweep it."""
+    """Record ``parent`` before a work dir is made in it, so a later run can sweep it.
+
+    Raises OSError if the state dir can't be written.
+    """
     entry = str(parent.resolve())
     if "\n" in entry or Path(entry) in _remembered_parents():
         return
@@ -204,9 +207,60 @@ def _remember_parent(parent: Path) -> None:
         os.fsync(fh.fileno())
 
 
+# Filesystems that can stop answering (a server gone, a stalled FUSE daemon),
+# hanging anything that touches them in a way Ctrl+C can't interrupt.
+_REMOTE_FSTYPES = (
+    "nfs",
+    "cifs",
+    "smb",
+    "fuse",
+    "9p",
+    "ceph",
+    "gluster",
+    "afs",
+    "davfs",
+    "autofs",
+    "lustre",
+)
+
+
+def _unescape_mount(field: str) -> str:
+    """A path from /proc/mounts, where spaces and the like are octal escapes."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _is_remote(entry: str, mounts_file: Path = Path("/proc/mounts")) -> bool:
+    """Is the already-resolved path ``entry`` on a network or FUSE mount?
+
+    Decided from the mount table alone, without touching the path, which
+    could hang if the mount has stopped answering.
+    """
+    try:
+        lines = mounts_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    best: tuple[int, str] | None = None
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount_point = _unescape_mount(parts[1])
+        prefix = mount_point.rstrip("/") + "/"
+        if entry == mount_point or entry.startswith(prefix):
+            depth = len(Path(mount_point).parts)
+            if best is None or depth >= best[0]:
+                best = (depth, parts[2])
+    return best is not None and best[1].startswith(_REMOTE_FSTYPES)
+
+
 def _sweep_parents(override: str) -> list[Path]:
-    """Every folder a run of this user could have put its work dir in."""
-    candidates = [*_remembered_parents()]
+    """Every folder a run of this user could have put its work dir in.
+
+    Folders remembered from earlier runs are skipped while they are on a
+    network or FUSE mount (a dead one would hang every run); a run that uses
+    such a folder again sweeps it then.
+    """
+    candidates = [p for p in _remembered_parents() if not _is_remote(str(p))]
     if override:
         candidates.append(Path(override).expanduser())
     if runtime := os.environ.get("XDG_RUNTIME_DIR"):
@@ -236,6 +290,8 @@ class RamWorkDir:
         self.path: Path | None = None
         self.swept = 0
         """How many dead runs' leftovers were wiped on entry."""
+        self.unremembered: str | None = None
+        """Why the work dir's folder couldn't be noted for later sweeps, if it couldn't."""
         self._lock_fd: int | None = None
 
     def __enter__(self) -> RamWorkDir:
@@ -247,8 +303,12 @@ class RamWorkDir:
         parent = self.choice.path
         parent.mkdir(parents=True, exist_ok=True)
         # Remembered before the work dir exists: a run killed right after
-        # creating it must still be findable.
-        _remember_parent(parent)
+        # creating it must still be findable. Best effort: a state dir that
+        # can't be written (read-only, someone else's) mustn't stop the run.
+        try:
+            _remember_parent(parent)
+        except OSError as exc:
+            self.unremembered = exc.strerror or str(exc)
         self.swept = sum(sweep_stale(p) for p in _sweep_parents(str(parent)))
         path = parent / f"asif-{secrets.token_hex(6)}"
         path.mkdir(mode=0o700)
