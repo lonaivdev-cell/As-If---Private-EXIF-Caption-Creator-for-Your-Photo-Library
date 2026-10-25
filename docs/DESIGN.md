@@ -112,7 +112,7 @@ Use full-disk encryption and a machine you trust.
 ```
 
 **Components:**
-- **Orchestrator.** Python process that owns the state machine, keys, vault and telemetry. CI enforces "no network modules imported" for it (`tests/test_netguard.py` imports the whole orchestrator and fails if `socket`, `ssl`, `http` or `urllib.request` got loaded). At runtime a Python audit hook additionally turns any socket use in the orchestrator into a crash (`asif/netguard.py`).
+- **Orchestrator.** Python process that owns the state machine, keys, vault and telemetry. CI enforces "no network modules imported" for it (`tests/test_netguard.py` imports the whole orchestrator, and everything its source names even inside functions that never ran, and fails if `socket`, `ssl`, `http` or `urllib.request` got loaded). At runtime a Python audit hook additionally turns any socket use in the orchestrator into a crash (`asif/netguard.py`).
 - **Transfer sandbox.** Runs the provider tool. Its download output is piped straight into an encrypting writer, so plaintext never lands on disk.
 - **Inference sandbox.** Contains `llama-server`, listening on loopback *inside its own empty network namespace*, plus a tiny worker that relays JSON lines over stdin/stdout. There is no TCP path from the host to the model and no route from the model to anything.
 - **Writer sandbox.** exiftool in `-stay_open` batch mode (one long-lived process; much faster than spawning one per file).
@@ -235,7 +235,7 @@ There is no self-reported "confidence" field, because small models' confidence n
 | Data | Written to | Rule |
 |---|---|---|
 | caption | `XMP-dc:Description` (lang-alt: `x-default` + configured language) | only if no caption exists (XMP-dc:Description, IPTC Caption-Abstract, EXIF ImageDescription; camera filler ignored) or previously written by As If |
-| keywords | `XMP-dc:Subject` (+ `IPTC:Keywords` when `compat = "wide"`) | append + dedupe against XMP and IPTC; IPTC-only keywords are copied into XMP first (UTF-8 or ASCII only, else no XMP keywords are added); never remove existing. With `wide`, a `Photoshop:IPTCDigest` that matched the IPTC (or stood for no IPTC) is updated with it (JPEG); a TIFF with an IPTCDigest gets no IPTC, since exiftool can't keep it in step there; a digest that was already stale is left alone |
+| keywords | `XMP-dc:Subject` (+ `IPTC:Keywords` when `compat = "wide"`) | append + dedupe against XMP and IPTC; IPTC-only keywords are copied into XMP first (UTF-8 or ASCII only, else no XMP keywords are added); never remove existing. With `wide`, a `Photoshop:IPTCDigest` that matched the IPTC (or stood for no IPTC) is updated with it (JPEG); a TIFF with an IPTCDigest gets no IPTC, since exiftool can't keep it in step there, and neither does a JPEG with more than one IPTCDigest or one outside its APP13 Photoshop block (some scanners put one in EXIF), which exiftool would leave as it was; a digest that was already stale is left alone |
 | provenance | `XMP-asif:*` (custom namespace via exiftool config file): tool version, model id, model SHA-256, prompt version, run id, UTC timestamp | always |
 | integrity | `OriginalImageHash` / `OriginalImageHashType` | once; never overwritten |
 | **never touched** | dates, GPS, orientation, ICC, MakerNotes, embedded previews, RAW data | — |

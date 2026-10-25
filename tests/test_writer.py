@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from PIL import Image
 
 from asif.infer.schema import CAPTION_MAX, CaptionResult
 from asif.meta.exiftool import ExecResult, ExifTool, ExifToolError
@@ -290,6 +291,8 @@ def test_owner_caption_in_older_fields_is_kept(legacy: tuple[str, ...]) -> None:
         "Digital Still Camera",
         "LEICA DIGITAL CAMERA",
         "SANYO DIGITAL CAMERA",
+        "JENOPTIK DIGITAL CAMERA",  # in KPhotoAlbum's list of camera filler
+        "MEDION DIGITAL CAMERA",  # in PhotoPrism's
         "SAMSUNG DIGITAL CAMERA",
         "KODAK Digital Still Camera",
         "KODAK CX7530 ZOOM DIGITAL CAMERA",
@@ -585,6 +588,24 @@ def test_iptc_with_a_digest_exiftool_cant_update_is_left_alone(current: str | No
     assert p.add_subjects == ("garden", "shed", "sky")  # XMP keywords still go in
     # Without a digest there's nothing to keep in step.
     assert plan(replace(existing, iptc_digest=None), compat="wide").add_iptc
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        replace(UTF8_IPTC, iptc_digest=DIGEST_A, current_iptc_digest=DIGEST_A),
+        ExistingMeta(iptc_digest=EMPTY_MD5),
+    ],
+    ids=["in-step", "no-iptc"],
+)
+def test_iptc_with_a_digest_out_of_place_is_left_alone(existing: ExistingMeta) -> None:
+    # A second digest, or one in a scanner's Photoshop block inside EXIF:
+    # exiftool would update only the one in APP13, or add one there.
+    p = plan(replace(existing, iptc_digest_in_place=False), compat="wide")
+    assert p.add_iptc == () and not p.create_iptc and not p.update_iptc_digest
+    assert p.iptc_note is not None and "unusual place" in p.iptc_note
+    assert p.add_subjects == ("garden", "shed", "sky")  # XMP keywords still go in
+    assert "-Photoshop:IPTCDigest=new" not in build_args(p, PROV, lang="en")
 
 
 # -- plan_write: the image hash ------------------------------------------------
@@ -1389,6 +1410,62 @@ def test_tiff_iptc_with_a_digest_is_left_alone(et: ExifTool, fixture_copy: Copy)
     }
 
 
+def scan_with_exif_digest(et: ExifTool, path: Path, *owner: str) -> None:
+    """A JPEG some scanners make: a Photoshop block holding an IPTCDigest in
+    EXIF (IFD0 tag 0x8649), outside APP13, in step with the IPTC (or, with
+    none, the digest of nothing). ``owner``: exiftool assignments made first."""
+    placeholder = b"\xa5" * 16
+    image = Image.new("RGB", (64, 48), (120, 80, 40))
+    exif = image.getexif()
+    exif[0x8649] = b"8BIM\x04\x25\x00\x00\x00\x00\x00\x10" + placeholder
+    image.save(path, exif=exif, quality=90)
+    exiftool_set(et, path, *owner)
+    current = et.read_tags(path, "-File:CurrentIPTCDigest").get("File:CurrentIPTCDigest")
+    data = path.read_bytes()
+    assert data.count(placeholder) == 1
+    path.write_bytes(data.replace(placeholder, bytes.fromhex(current or EMPTY_MD5)))
+
+
+@pytest.mark.parametrize(
+    "owner_iptc",
+    [
+        (),
+        OWNER_UTF8_IPTC,
+        # And a second digest, where it belongs.
+        (*OWNER_UTF8_IPTC, "-Photoshop:IPTCDigest=new"),
+    ],
+    ids=["no-iptc", "iptc", "second-digest-in-app13"],
+)
+def test_iptc_with_a_digest_out_of_place_is_left_alone_in_the_file(
+    et: ExifTool, tmp_path: Path, owner_iptc: tuple[str, ...]
+) -> None:
+    # exiftool would update (or add) the digest in APP13 and leave the one
+    # in EXIF as it was, out of step with the new IPTC.
+    path = tmp_path / "scan.jpg"
+    scan_with_exif_digest(et, path, *OWNER_XMP, *owner_iptc)
+    places = et.execute_json("-a", "-api", "SavePath", "-G5", "-Photoshop:IPTCDigest", str(path))
+    assert "JPEG-APP1-IFD0-Photoshop:IPTCDigest" in places[0]
+    before = read_existing(et, path)
+    assert before.iptc_digest is not None and not before.iptc_digest_in_place
+    assert before.current_iptc_digest in (None, before.iptc_digest)
+    assert mwg(path) == {"Description": OWNER_XMP_CAPTION, "Keywords": ["Family", "Lisbon"]}
+    p, record = write_wide_and_check(et, path)
+    assert not p.update_iptc_digest and not record.iptc_created
+    assert record.iptc_added == ()
+    assert record.iptc_note is not None and "unusual place" in record.iptc_note
+    assert record.subjects_added == ("dog", "beach")
+    after = read_existing(et, path)
+    assert after.iptc_keywords == before.iptc_keywords
+    assert (after.iptc_digest, after.current_iptc_digest) == (
+        before.iptc_digest,
+        before.current_iptc_digest,
+    )
+    assert mwg(path) == {
+        "Description": OWNER_XMP_CAPTION,
+        "Keywords": ["Family", "Lisbon", "dog", "beach"],
+    }
+
+
 def test_owner_exif_caption_is_kept(et: ExifTool, fixture_copy: Copy) -> None:
     path = fixture_copy("exif.jpg")
     exiftool_set(et, path, "-EXIF:ImageDescription=Our wedding day, Lisbon")
@@ -1635,12 +1712,20 @@ def test_panorama(et: ExifTool, panorama: Path, tmp_path: Path) -> None:
 
 class ScriptedExifTool:
     """Answers ``execute`` and ``execute_json`` from a script; ``xmp`` is
-    the raw packet a ``-b -XMP`` read gets."""
+    the raw packet a ``-b -XMP`` read gets, ``places`` where each copy of
+    Photoshop:IPTCDigest is (by exiftool's SavePath)."""
 
     def __init__(
-        self, *, stdout: str, stderr: str = "", rows: list[dict[str, Any]], xmp: str = ""
+        self,
+        *,
+        stdout: str,
+        stderr: str = "",
+        rows: list[dict[str, Any]],
+        xmp: str = "",
+        places: Sequence[str] = ("JPEG-APP13-Photoshop:IPTCDigest",),
     ) -> None:
         self.stdout, self.stderr, self.rows, self.xmp = stdout, stderr, rows, xmp
+        self.places = places
         self.calls: list[tuple[str, ...]] = []
 
     def execute(self, *args: str) -> ExecResult:
@@ -1651,6 +1736,8 @@ class ScriptedExifTool:
         return ExecResult(self.stdout, self.stderr, warnings)
 
     def execute_json(self, *args: str) -> list[dict[str, Any]]:
+        if "SavePath" in args:
+            return [{"SourceFile": "x.jpg", **dict.fromkeys(self.places, DIGEST_A)}]
         return self.rows
 
 
@@ -1973,6 +2060,28 @@ def test_read_existing_refuses_values_the_filter_did_not_mark() -> None:
 def test_read_existing_refuses_an_empty_answer() -> None:
     with pytest.raises(ExifToolError):
         read_existing(cast(ExifTool, ScriptedExifTool(stdout="", rows=[])), Path("/ram/x.jpg"))
+
+
+@pytest.mark.parametrize(
+    ("places", "in_place"),
+    [
+        (("JPEG-APP13-Photoshop:IPTCDigest",), True),
+        (("JPEG-APP1-IFD0-Photoshop:IPTCDigest",), False),
+        (("JPEG-APP1-IFD0-Photoshop:Copy1:IPTCDigest", "JPEG-APP13-Photoshop:IPTCDigest"), False),
+        (("JPEG-APP13-Photoshop:Copy1:IPTCDigest", "JPEG-APP13-Photoshop:IPTCDigest"), False),
+        ((), False),  # gone between the two reads: assume the worst
+    ],
+    ids=["app13", "exif", "both", "two-in-app13", "none"],
+)
+def test_read_existing_knows_where_the_iptc_digest_is(
+    places: tuple[str, ...], in_place: bool
+) -> None:
+    rows = marked({"Photoshop:IPTCDigest": DIGEST_A, "File:FileType": "JPEG"})
+    tool = ScriptedExifTool(stdout="", rows=rows, places=places)
+    assert read_existing(cast(ExifTool, tool), Path("/ram/x.jpg")).iptc_digest_in_place is in_place
+    # Without a digest there is nothing to look for.
+    tool = ScriptedExifTool(stdout="", rows=marked({"File:FileType": "JPEG"}), places=())
+    assert read_existing(cast(ExifTool, tool), Path("/ram/x.jpg")).iptc_digest_in_place
 
 
 def test_the_source_hash_is_recorded_when_known() -> None:

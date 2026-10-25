@@ -19,6 +19,8 @@ import textwrap
 from collections.abc import Iterable
 from pathlib import Path
 
+import pytest
+
 import asif
 
 # Modules that are *meant* to reach the network (or loopback). Each one runs
@@ -113,7 +115,15 @@ for target in {targets!r}:
             importlib.import_module(info.name)
             imported.append(info.name)
     else:
-        importlib.import_module(target)
+        try:
+            importlib.import_module(target)
+        except ModuleNotFoundError as exc:
+            if exc.name != target:
+                raise
+            # "from pkg import name": name is an attribute, perhaps one that
+            # loads a module on first use (concurrent.futures.ProcessPoolExecutor).
+            parent, _, attr = target.rpartition(".")
+            getattr(importlib.import_module(parent), attr, None)
         imported.append(target)
 builtins.__import__ = _real_import
 # Imports made *by* a forbidden module are already blamed on whoever loaded it.
@@ -201,26 +211,48 @@ def _imports_in(tree: ast.AST, package: str = "asif") -> tuple[set[str], list[st
             func = node.func
             called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
             if called in _DYNAMIC_IMPORTERS:
-                arg = node.args[0] if node.args else None
-                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                    names.add(arg.value)
-                else:
+                name = _named_import(node, called)
+                if name is None:
                     dynamic.append(f"line {node.lineno}")
+                else:
+                    names.add(name)
     return names, dynamic
+
+
+def _named_import(call: ast.Call, called: str) -> str | None:
+    """The module an import_module() or __import__() call names, or None when
+    the source doesn't spell it out."""
+    arg = call.args[0] if call.args else None
+    if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+        return None
+    # __import__("pkg", globals(), None, ["mod"]) imports pkg.mod as well, and
+    # a level makes the name relative: only the plain form names its module.
+    if called == "__import__" and (call.keywords or not all(map(_empty, call.args[3:]))):
+        return None
+    return arg.value
+
+
+def _empty(node: ast.expr) -> bool:
+    """A literal empty fromlist, or level 0."""
+    if isinstance(node, ast.List | ast.Tuple):
+        return not node.elts
+    return isinstance(node, ast.Constant) and not node.value
 
 
 def _is_under(name: str, roots: Iterable[str]) -> bool:
     return any(name == r or name.startswith(r + ".") for r in roots)
 
 
-def test_no_orchestrator_source_imports_networking_modules() -> None:
-    # Catches what importing can't: imports inside functions that haven't
-    # run, dynamic imports, and lazy imports of a network-capable module.
-    root = Path(asif.__file__).parent
+def source_check(root: Path, top: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """Read every source file of package ``top`` (in ``root``).
+
+    Returns the files' own offending imports, and what importing everything
+    they name from outside ``top`` brings in, as ``forbidden_imports`` does.
+    """
     offenders = []
-    third_party: set[str] = set()
+    outside: set[str] = set()
     for path in sorted(root.rglob("*.py")):
-        module = ".".join(("asif", *path.relative_to(root).with_suffix("").parts))
+        module = ".".join((top, *path.relative_to(root).with_suffix("").parts))
         if module.removesuffix(".__init__") in NETWORK_CAPABLE:
             continue
         package = (
@@ -230,17 +262,59 @@ def test_no_orchestrator_source_imports_networking_modules() -> None:
         )
         names, dynamic = _imports_in(ast.parse(path.read_text(encoding="utf-8")), package)
         where = path.relative_to(root)
-        offenders += [f"{where}: import by a computed name ({d})" for d in dynamic]
+        offenders += [f"{where}: an import the source doesn't spell out ({d})" for d in dynamic]
         for name in sorted(names):
             if _is_under(name, FORBIDDEN) or _is_under(name, NETWORK_CAPABLE):
                 offenders.append(f"{where} imports {name}")
-            elif not _is_under(name, ("asif",)):
-                third_party.add(name.split(".")[0])
-    assert offenders == []
+            elif not _is_under(name, (top,)):
+                # Exactly what the source names: "import logging.handlers"
+                # loads socket, and logging alone doesn't.
+                outside.add(name)
+    _, bad = forbidden_imports(*sorted(outside))
+    return offenders, bad
+
+
+def test_no_orchestrator_source_imports_networking_modules() -> None:
+    # Catches what importing can't: imports inside functions that haven't
+    # run, dynamic imports, and lazy imports of a network-capable module.
     # And everything those files could ever import from outside As If, even
     # lazily, mustn't pull in networking either.
-    _, bad = forbidden_imports(*sorted(third_party))
+    offenders, bad = source_check(Path(asif.__file__).parent, "asif")
+    assert offenders == []
     assert bad == []
+
+
+@pytest.mark.parametrize(
+    ("source", "importer"),
+    [
+        (
+            "def open_log(path):\n"
+            "    import logging.handlers\n"
+            "    return logging.handlers.RotatingFileHandler(path)\n",
+            os.path.join("logging", "handlers.py"),
+        ),
+        # An attribute that loads its module on first use.
+        (
+            "def pool():\n"
+            "    from concurrent.futures import ProcessPoolExecutor\n"
+            "    return ProcessPoolExecutor()\n",
+            os.path.join("multiprocessing", "connection.py"),
+        ),
+    ],
+    ids=["submodule", "lazy-attribute"],
+)
+def test_the_source_check_imports_what_the_source_names(
+    tmp_path: Path, source: str, importer: str
+) -> None:
+    # Guards the guard. Importing just logging or concurrent loads no
+    # networking module; what the source names does, once it runs.
+    package = tmp_path / "lazy"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "later.py").write_text(source)
+    offenders, bad = source_check(package, "lazy")
+    assert offenders == []
+    assert any(module == "socket" and path.endswith(importer) for module, path in bad), bad
 
 
 def test_the_source_check_sees_lazy_and_dynamic_imports() -> None:
@@ -250,10 +324,14 @@ def test_the_source_check_sees_lazy_and_dynamic_imports() -> None:
         "    from asif.infer import worker\n"
         "    importlib.import_module('http.client')\n"
         "    __import__(name)\n"
+        "    __import__('asif.infer', globals(), None, ['worker'])\n"
+        "    __import__('urllib', fromlist=['request'])\n"
+        "    __import__('json', globals(), locals(), [], 0)\n"
     )
     names, dynamic = _imports_in(sample)
-    assert {"socket", "asif.infer.worker", "http.client"} <= names
-    assert dynamic == ["line 5"]
+    assert {"socket", "asif.infer.worker", "http.client", "json"} <= names
+    # A fromlist imports modules the call doesn't name.
+    assert dynamic == ["line 5", "line 6", "line 7"]
     relative = ast.parse("def later():\n    from . import worker\n    from .worker import main\n")
     names, _ = _imports_in(relative, "asif.infer")
     assert {"asif.infer.worker", "asif.infer.worker.main"} <= names

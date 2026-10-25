@@ -21,7 +21,8 @@ What goes where:
   read XMP first still show them. A ``Photoshop:IPTCDigest`` that matched
   the IPTC (or the file had no IPTC) is updated along with it, so apps
   following the MWG guidelines keep showing the XMP; where exiftool can't
-  do that (TIFF), the IPTC is left alone;
+  do that (TIFF, a digest outside a JPEG's own Photoshop block, or more
+  than one), the IPTC is left alone;
 - ``XMP-et:OriginalImageHash`` once, never overwritten;
 - provenance (``XMP-asif:*``), rewritten every time: tool, model, prompt,
   run, time, and exactly what As If added, including an IPTC record it
@@ -67,6 +68,10 @@ _IPTC_FILE_TYPES = frozenset({"JPEG", "MPO", "TIFF"})
 # writes. In a TIFF it pads the IPTC to whole 4-byte words after taking the
 # digest, so the digest it stores is never the one readers compute.
 _IPTC_DIGEST_FILE_TYPES = frozenset({"JPEG", "MPO"})
+# Where that digest belongs in a JPEG, as exiftool names the place with
+# "-api SavePath -G5" ("-G5:4" adds "Copy1" and so on to further copies).
+# exiftool updates (or adds) the one there and leaves any other as it was.
+_IPTC_DIGEST_HOME = "JPEG-APP13-Photoshop:IPTCDigest"
 
 # Provenance values are short identifiers. Keywords recorded by an earlier run
 # are re-recorded whole (undo must match them exactly), within reason.
@@ -115,8 +120,9 @@ _ASIF_LISTS = frozenset({"AddedKeywords", "AddedIPTCKeywords", "CopiedKeywords"}
 _CAMERA_FILLER = re.compile(
     r"""
     # DIGITAL CAMERA, OLYMPUS DIGITAL CAMERA, LEICA DIGITAL CAMERA, SANYO
-    # DIGITAL CAMERA: only these brands ("Vintage digital camera" is a caption)
-    (?:(?:olympus|leica|sanyo)\s+)?digital\s+(?:still\s+)?camera
+    # DIGITAL CAMERA, JENOPTIK DIGITAL CAMERA, MEDION DIGITAL CAMERA: only
+    # these brands ("Vintage digital camera" is a caption)
+    (?:(?:olympus|leica|sanyo|jenoptik|medion)\s+)?digital\s+(?:still\s+)?camera
     # KODAK Digital Still Camera, KODAK CX7530 ZOOM DIGITAL CAMERA, KODAK
     # EASYSHARE C813 ZOOM DIGITAL CAMERA, KONICA MINOLTA DIGITAL CAMERA,
     # SAMSUNG DIGITAL CAMERA: at most one model name, and it
@@ -158,6 +164,10 @@ _STALE_DIGEST_WARNING = r"^IPTCDigest is not current\. XMP may be out of sync$"
 _NOTE_IPTC_DIGEST = (
     "IPTC skipped: the file has a checksum (IPTCDigest) that keeps apps showing "
     "its XMP, and exiftool can't update it in this format"
+)
+_NOTE_IPTC_DIGEST_PLACE = (
+    "IPTC skipped: the file has more than one IPTC checksum (IPTCDigest), or one "
+    "in an unusual place, and exiftool can keep only the usual one in step"
 )
 
 
@@ -218,6 +228,11 @@ class ExistingMeta:
     """File:CurrentIPTCDigest, exiftool's MD5 of the IPTC as it is; None without IPTC."""
     iptc_digest_writable: bool = True
     """exiftool can keep Photoshop:IPTCDigest in step with IPTC it writes (JPEG)."""
+    iptc_digest_in_place: bool = True
+    """The file has no Photoshop:IPTCDigest, or just one, and it is in a
+    JPEG's own Photoshop block (APP13). Some scanners put a second Photoshop
+    block in EXIF: exiftool would leave a digest there as it was, and apps
+    may go by it."""
 
 
 @dataclass(frozen=True)
@@ -349,6 +364,8 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
 
     # Only a list that has items can lend a language tag to new ones.
     langs = bool(subjects) and _subject_langs(et.execute("-b", "-XMP", _file_arg(path)).stdout)
+    # The read above shows only one copy of the digest; another says where each is.
+    in_place = iptc_digest is None or _iptc_digest_in_place(et, path)
     return ExistingMeta(
         descriptions=descriptions,
         subjects=subjects,
@@ -364,7 +381,20 @@ def read_existing(et: ExifTool, path: Path) -> ExistingMeta:
         iptc_digest=iptc_digest,
         current_iptc_digest=current_digest,
         iptc_digest_writable=file_type in _IPTC_DIGEST_FILE_TYPES,
+        iptc_digest_in_place=in_place,
     )
+
+
+def _iptc_digest_in_place(et: ExifTool, path: Path) -> bool:
+    """Is the file's only Photoshop:IPTCDigest in a JPEG's own Photoshop block?
+
+    Only the tag names are read: they say where each copy is.
+    """
+    rows = et.execute_json(
+        "-a", "-api", "SavePath", "-G5:4", "-Photoshop:IPTCDigest", _file_arg(path)
+    )
+    places = [key for key in (rows[0] if rows else {}) if key != "SourceFile"]
+    return places == [_IPTC_DIGEST_HOME]
 
 
 def _subject_langs(packet: str) -> bool:
@@ -570,6 +600,10 @@ def _iptc_rule(
         # Changing the IPTC without its digest could make apps switch from
         # the owner's XMP to the IPTC.
         return (), False, False, _NOTE_IPTC_DIGEST
+    if not existing.iptc_digest_in_place:
+        # The same, for a digest exiftool leaves as it was: a second copy,
+        # or one in a Photoshop block of a scanner's EXIF.
+        return (), False, False, _NOTE_IPTC_DIGEST_PLACE
     have = {_key(k) for k in existing.iptc_keywords}
     new = [k for k in keywords if _key(k) not in have]
     fits = tuple(k for k in new if len(k.encode("utf-8")) <= IPTC_KEYWORD_MAX_BYTES)
