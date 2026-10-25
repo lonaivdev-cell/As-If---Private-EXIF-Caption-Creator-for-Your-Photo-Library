@@ -1208,25 +1208,6 @@ def _on_share(
     )
 
 
-def test_on_a_share_only_folders_as_if_made_count_as_private(
-    open_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    src = _folder(open_dir / "private", 0o700)
-    home = _folder(open_dir / "home", 0o700)  # nobody else gets past this here...
-    mount = _folder(home / "nas", 0o755)
-    _on_share(monkeypatch, mount)
-    # ...but the share's other users don't come through here, and what the
-    # share shows (sshfs uid=, gid=, umask=) can't be trusted: 0700 or not.
-    existing = _folder(mount / "family", 0o700)
-    assert local._more_people_can_list(existing, src)
-    mine = _folder(mount / "captioned", 0o700)
-    local._remember_own_folders([mine])
-    assert not local._more_people_can_list(mine, src)
-    # allow_other without default_permissions: every local user gets in.
-    _on_share(monkeypatch, mount, ["rw", "allow_other"])
-    assert local._more_people_can_list(mine, src)
-
-
 def test_an_original_on_a_mount_only_we_can_enter_is_private(
     open_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1585,41 +1566,6 @@ def test_a_share_that_shows_our_files_as_someone_elses_still_takes_copies(
 # -- round 7 -----------------------------------------------------------------
 
 
-def test_copies_go_onto_a_share_only_in_folders_as_if_made(
-    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg", "2024/b.jpg")
-    (src / "a.jpg").chmod(0o640)
-    mount = _folder(open_dir / "nas", 0o755)
-    _on_share(monkeypatch, mount)
-    _folder(mount / "family", 0o2770)  # someone's shared folder, shown as ours
-    with pytest.raises(CaptionError, match="only trusts folders it made itself"):
-        _run(src, mount / "family", cfg, tmp_path)
-    summary = _run(src, mount / "captioned", cfg, tmp_path)
-    assert set(_states(summary).values()) == {State.CLEAN}
-    copy = (mount / "captioned" / "a.jpg").stat()
-    assert stat.S_IMODE(copy.st_mode) & 0o077 == 0  # a share's groups are the server's
-    again = _run(src, mount / "captioned", cfg, tmp_path)  # and it can be resumed
-    assert set(_states(again).values()) == {State.SKIPPED_DONE}
-
-
-def test_a_share_that_ignores_permissions_is_refused_for_private_photos(
-    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
-    mount = _folder(open_dir / "cloud", 0o755)
-    _on_share(monkeypatch, mount)
-    real_fchmod = os.fchmod
-
-    def ignored(fd: int, mode: int) -> None:  # rclone: chmod does nothing
-        if not Path(os.readlink(f"/proc/self/fd/{fd}")).is_relative_to(mount):
-            real_fchmod(fd, mode)
-
-    monkeypatch.setattr(local.os, "fchmod", ignored)
-    with pytest.raises(CaptionError, match="doesn't keep the permissions"):
-        _run(src, mount / "captioned", cfg, tmp_path)
-
-
 def test_a_copy_whose_group_cant_be_kept_gets_only_what_everyone_had(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1711,70 +1657,6 @@ def test_public_photos_go_onto_a_share_with_fixed_permissions(
     assert len(runs) == 2
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="needs to make folders someone else's")
-def test_a_share_that_squashes_everyone_into_one_account_is_refused(
-    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
-    mount = _folder(open_dir / "nfs", 0o755)
-    _on_share(monkeypatch, mount, fstype="nfs4")
-    real_mkdir = os.mkdir
-
-    def all_squash(path: Any, *a: Any, **kw: Any) -> None:
-        real_mkdir(path, *a, **kw)
-        if Path(path).is_relative_to(mount):
-            os.chown(path, 65534, 65534)  # the server's anonymous account
-
-    monkeypatch.setattr(local.os, "mkdir", all_squash)
-    with pytest.raises(CaptionError, match="someone else's"):
-        _run(src, mount / "captioned", cfg, tmp_path)
-    assert not (mount / "captioned").exists()
-
-
-def test_a_folder_name_that_isnt_utf8_goes_onto_a_share_and_isnt_written_down(
-    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import re
-
-    from asif import paths
-
-    name = os.fsdecode(b"caf\xe9 private")  # Latin-1 bytes from an old camera or disk
-    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), f"{name}/a.jpg")
-    mount = _folder(open_dir / "nas", 0o755)
-    _on_share(monkeypatch, mount)
-    summary = _run(src, mount / "captioned", cfg, tmp_path)
-    assert set(_states(summary).values()) == {State.CLEAN}
-    noted = (paths.state_dir() / "own-folders-on-shares").read_text(encoding="ascii")
-    assert noted and all(re.fullmatch(r"[0-9a-f]{64}", line) for line in noted.split())
-
-
-def test_folders_made_for_a_copy_count_as_ours_even_if_the_copy_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    made: list[list[Path]] = []
-
-    def link_fails(*a: Any) -> None:
-        raise OSError(errno.EIO, "Input/output error")  # the share dropped mid-copy
-
-    real_rmdir = os.rmdir
-
-    def rmdir_fails(path: Any, *a: Any, **kw: Any) -> None:
-        if Path(path).name == "2024":  # and the folder couldn't go either
-            raise OSError(errno.EIO, "Input/output error")
-        real_rmdir(path, *a, **kw)
-
-    monkeypatch.setattr(local.os, "link", link_fails)
-    monkeypatch.setattr(local.os, "rmdir", rmdir_fails)
-    ram = tmp_path / "ram.jpg"
-    ram.write_bytes(b"x")
-    dest = tmp_path / "out" / "2024" / "a.jpg"
-    (tmp_path / "out").mkdir()
-    with pytest.raises(OSError):
-        local._commit(ram, dest, 0o600, on_made=made.append)
-    monkeypatch.undo()
-    assert made == [[dest.parent]]
-
-
 def test_the_destination_is_held_open_while_photos_are_done(
     fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1794,3 +1676,61 @@ def test_the_destination_is_held_open_while_photos_are_done(
     monkeypatch.setattr(local, "_describe", check)
     summary = _run(src, dest, cfg, tmp_path)
     assert summary.aborted is None and seen == [True]
+
+
+# -- network drives ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fstype", ["fuse.sshfs", "nfs4", "cifs", "fuse.rclone"])
+def test_private_photos_arent_put_on_a_network_drive(
+    open_dir: Path,
+    fixtures_dir: Path,
+    cfg: Config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fstype: str,
+) -> None:
+    # What a share shows (owners, groups, modes) isn't what its other users
+    # get: sshfs or cifs uid=/gid=/umask=, all_squash, a cloud's sharing.
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
+    mount = _folder(open_dir / "nas", 0o755)
+    _on_share(monkeypatch, mount, fstype=fstype)
+    _folder(mount / "mine", 0o700)
+    for dest in (mount / "new", mount / "mine"):
+        with pytest.raises(CaptionError, match="network drive"):
+            _run(src, dest, cfg, tmp_path)
+    assert not (mount / "new").exists()  # nothing named there is left behind
+
+
+def test_public_photos_can_go_on_a_network_drive(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = os.fsdecode(b"caf\xe9")  # a folder name that isn't UTF-8, too
+    src = _library(fixtures_dir, _folder(open_dir / "pub", 0o755), "open.jpg", f"{name}/team.jpg")
+    (src / "open.jpg").chmod(0o644)
+    (src / name / "team.jpg").chmod(0o640)  # its group may read it, others not
+    mount = _folder(open_dir / "nas", 0o755)
+    _on_share(monkeypatch, mount)
+    summary = _run(src, mount / "captioned", cfg, tmp_path)
+    assert set(_states(summary).values()) == {State.CLEAN}
+    mode = stat.S_IMODE((mount / "captioned" / name / "team.jpg").stat().st_mode)
+    assert mode & 0o077 == 0  # a share's groups are the server's: no more than others get
+    assert stat.S_IMODE((mount / "captioned" / "open.jpg").stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize(
+    ("fstype", "shared"),
+    [
+        ("nfs4", True),
+        ("cifs", True),
+        ("fuse.sshfs", True),
+        ("fuse.rclone", True),
+        ("fuse.unknown", True),
+        ("fuseblk", False),  # NTFS or exFAT on a USB drive
+        ("fuse.gocryptfs", False),  # an encrypted vault on this disk
+        ("fuse.mergerfs", False),  # local disks pooled into one
+        ("ext4", False),
+    ],
+)
+def test_which_mounts_count_as_network_drives(fstype: str, shared: bool) -> None:
+    assert local._shared_mount(("/mnt/x", fstype, ["rw"])) is shared

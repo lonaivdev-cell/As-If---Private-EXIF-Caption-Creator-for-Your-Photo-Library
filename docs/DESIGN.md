@@ -156,7 +156,6 @@ DISCOVERED → STAGED → OPENED → DESCRIBED → WRITTEN → VERIFIED → UPLO
 |---|---|---|---|---|
 | Staging | `~/.cache/asif/staging/` | downloaded originals | `age` encryption with an **ephemeral session key held only in memory** | until `CONFIRMED`; leftovers wiped at next start |
 | RAM work dir | private tmpfs (Linux) / RAM disk (macOS) | 1 (linear) to a few decrypted photos | RAM only; 0700, locked by its run | seconds; overwritten then unlinked; a dead run's leftovers are wiped by the next run, which also checks every parent folder an earlier run used (remembered in the state dir's `workdir-parents`; best effort; folders on network or FUSE mounts are skipped, since a dead mount would hang the run, until a run uses them again) |
-| Own folders on shares (*as built, M1*) | `~/.local/state/asif/own-folders-on-shares` | SHA-256 hashes of the full paths of folders As If made on network drives (never the names) | 0600 in a 0700 folder; on this computer, where the share's users can't add to it | kept, so a run can be resumed into them |
 | Vault | `~/.local/share/asif/vault.db` | catalogue, captions, keywords, hashes, 256 px thumbnails, undo journal | SQLCipher; key from your passphrase via Argon2id | until `asif wipe vault` |
 | Telemetry | `~/.local/state/asif/telemetry.db` | timings, resources, errors — **no** names, paths or captions | SQLCipher; separate key (HKDF from master key, distinct context) | rolling, user-set retention |
 | Credentials | OS secret store | Proton session (owned by the Proton CLI), rclone config password | OS (libsecret / Keychain / Credential Manager) | per provider |
@@ -427,6 +426,8 @@ Covers Nextcloud/WebDAV, S3, SFTP, OneDrive, Google Drive, SMB, and more.
 ### `local` — a folder on this machine (M1)
 
 Folder in, captioned copies out (`asif caption SRC DEST`). The "remote" is the source folder, so the remote-unchanged gate compares the source file's size, mtime and SHA-256. M1 only writes copies into a separate folder, never in place.
+
+*As built:* a copy never goes where more people could see it, or its name, than could see the original: As If works out who can list each destination folder (groups, POSIX and NFSv4 ACLs, the owners of the folders above it, symlinks, FUSE `allow_other`), tests that the destination keeps the permissions it sets (FAT and exFAT drives don't), and refuses otherwise. On a network drive (NFS, SMB, sshfs, cloud mounts) the share decides who sees files, and what it shows here (owners, groups, modes) can be made up by mount options or squashing, so private photos aren't put on one at all until the encrypted adapters (M5); photos everyone on this computer can already see may go.
 
 ---
 

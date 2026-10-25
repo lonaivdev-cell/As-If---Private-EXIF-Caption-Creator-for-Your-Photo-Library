@@ -44,7 +44,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from asif import __version__, paths, proc
+from asif import __version__, proc
 from asif.config import Config
 from asif.infer.client import InferenceClient, InferenceError, WorkerConfig
 from asif.infer.schema import PROMPT_VERSION, CaptionResult, SchemaError, parse_caption_json
@@ -478,7 +478,14 @@ def _modes_unenforced(mount: Mount) -> bool:
 # and FUSE ones, which mostly are network or cloud storage. For a folder on
 # one, the folders above its mount point keep none of them out.
 _SHARED_FSTYPES = ("nfs", "cifs", "smb", "ceph", "gluster", "afs", "davfs", "lustre", "9p", "fuse")
-_LOCAL_FUSE = ("fuseblk", "fuse.gocryptfs", "fuse.encfs", "fuse.cryfs", "fuse.securefs")
+_LOCAL_FUSE = (
+    "fuseblk",
+    "fuse.gocryptfs",
+    "fuse.encfs",
+    "fuse.cryfs",
+    "fuse.securefs",
+    "fuse.mergerfs",
+)
 
 
 def _shared_mount(mount: Mount) -> bool:
@@ -487,50 +494,6 @@ def _shared_mount(mount: Mount) -> bool:
         and mount[1].startswith(_SHARED_FSTYPES)
         and not mount[1].startswith(_LOCAL_FUSE)
     )
-
-
-def _own_folders_file() -> Path:
-    return paths.state_dir() / "own-folders-on-shares"
-
-
-# Folders this run just made, trusted while they're being checked and only
-# written down once the run goes ahead (a refused one is removed again).
-_MADE_NOW: set[str] = set()
-
-
-def _folder_key(folder: Path) -> str:
-    """How a folder is noted: a hash of its full path, so no folder names are kept."""
-    return hashlib.sha256(os.fsencode(folder.resolve())).hexdigest()
-
-
-def _own_folders_on_shares() -> set[str]:
-    """Folders on network drives that As If made itself (private), so it can trust them.
-
-    Kept on this computer, where the share's other users can't add to it,
-    as hashes of their paths (``_folder_key``).
-    """
-    try:
-        made = set(_own_folders_file().read_text(encoding="ascii").split())
-    except (OSError, UnicodeDecodeError):
-        made = set()
-    return made | _MADE_NOW
-
-
-def _remember_own_folders(folders: list[Path]) -> None:
-    """Note folders As If just made, those on a network drive (best effort)."""
-    entries = [_folder_key(f) for f in folders if _shared_mount(mount_of(str(f.resolve())))]
-    if not entries:
-        return
-    try:
-        registry = _own_folders_file()
-        paths.ensure_private_dir(registry.parent)
-        fd = os.open(registry, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="ascii") as fh:
-            fh.write("".join(f"{e}\n" for e in entries))
-            fh.flush()
-            os.fsync(fh.fileno())
-    except OSError:
-        pass  # those folders then just count as anyone's on a later run
 
 
 def _chmod_ignored(fd: int) -> bool:
@@ -546,21 +509,6 @@ def _chmod_ignored(fd: int) -> bool:
         if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
             return True
     return False
-
-
-def _squashed(folder: Path, mount: Mount) -> bool:
-    """Does a kernel NFS or SMB share show a folder As If made as someone else's?
-
-    Then the server gives what anyone makes to one shared account
-    (all_squash, "map all users", Samba's force user), and every user of
-    the share can open it. (sshfs and other FUSE clients show their own
-    numbers, so there the owner shown means nothing.)
-    """
-    return (
-        mount is not None
-        and not mount[1].startswith("fuse")
-        and _someone_else(folder.stat().st_uid)
-    )
 
 
 def _within(path: Path, mount_point: str) -> bool:
@@ -712,12 +660,8 @@ def _folder_audience(folder: Path, *, wide: bool, bits: int = 0o444) -> int:
     if wide and _shared_mount(mount):
         # What a share shows as owners, groups and modes may not be what its
         # other users get (sshfs or cifs uid=, gid=, umask=; all_squash), and
-        # they never pass through this computer's folders. Only a folder As
-        # If made there itself, private, counts as private (going by the
-        # mode it set: who it shows as the owner means nothing there).
-        if _folder_key(real) not in _own_folders_on_shares() or _squashed(real, mount):
-            return _ANYONE
-        return _audience(real, bits, wide=True)
+        # they never pass through this computer's folders: As If can't tell.
+        return _ANYONE
     st = real.stat()
     audience = _audience(real, bits, wide=wide)
     if wide and _someone_else(st.st_uid):
@@ -913,7 +857,6 @@ def _commit(
     expect_sha: str | None = None,
     root: Path | None = None,
     root_id: tuple[int, int] | None = None,
-    on_made: Callable[[list[Path]], None] | None = None,
 ) -> bool:
     """Write ``ram_copy`` to ``dest`` without ever replacing an existing file.
 
@@ -928,9 +871,7 @@ def _commit(
     would still let others read it, and ``_ModeNotKept`` if the destination
     gives it more read access than ``mode`` anyway. Folders created for a
     copy that isn't placed are removed again, and nothing is written once
-    ``root`` isn't the folder with ``root_id`` any more. ``on_made`` gets the
-    folders made for the copy as soon as they are made (they are As If's
-    own even if a failure leaves them behind).
+    ``root`` isn't the folder with ``root_id`` any more.
 
     With ``expect_sha``, the placed copy is read back and must hash to it,
     or ``_ReadBackMismatch`` is raised. A copy that was placed but not
@@ -942,8 +883,6 @@ def _commit(
     tmp = dest.parent / f".asif-{secrets.token_hex(8)}.tmp"
     done = False
     try:
-        if on_made is not None and created:
-            on_made(created)
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except OSError as exc:
@@ -1181,10 +1120,7 @@ def _permissions_not_kept(dest: Path, src: Path) -> bool:
         return False
     if not ignored and (not forced or _folder_audience(dest, wide=True, bits=0o111) == _NOBODY):
         return False
-    try:
-        return _folder_audience(src, wide=False) != _ANYONE
-    except OSError as exc:
-        raise _SourceUnreadable(exc) from exc
+    return _source_is_private(src)
 
 
 def _dest_gone(ctx: _Ctx) -> bool:
@@ -1450,7 +1386,6 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
                     expect_sha=processed_sha,
                     root=ctx.dest_root,
                     root_id=ctx.dest_id,
-                    on_made=_remember_own_folders,
                 )
         except _InheritedAcl:
             # The folders made for it are gone again: the rule comes from above.
@@ -1486,15 +1421,14 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
 
 def _destination_ok(dest: Path, src: Path) -> None:
     """Raise ``CaptionError`` if copies of ``src`` mustn't go into ``dest``."""
-    mount = mount_of(str(dest.resolve()))
-    on_share = _shared_mount(mount)
+    if _shared_mount(mount_of(str(dest.resolve()))) and _source_is_private(src):
+        raise CaptionError(
+            f"{dest} is on a network drive, and As If can't tell who can see files there "
+            "(the share decides, not this computer), so it doesn't put copies of private "
+            "photos on one yet. Caption into a folder on this computer; syncing to a NAS or "
+            "cloud, encrypted, comes in a later version."
+        )
     if _permissions_not_kept(dest, src):
-        if on_share:
-            raise CaptionError(
-                f"other people could see and open the copies in {dest}: this network "
-                "drive doesn't keep the permissions As If sets, so it can't keep them "
-                "private. Use a folder on this computer."
-            )
         raise CaptionError(
             f"other users on this computer could see and open the copies in {dest}: "
             "its drive gives every file the same permissions (FAT and exFAT drives "
@@ -1502,29 +1436,20 @@ def _destination_ok(dest: Path, src: Path) -> None:
             "open, such as one in your home folder, or mount the drive just for you "
             "(for example with the options uid=$(id -u),umask=077)."
         )
-    if not _more_people_can_list(dest, src):
-        return
-    hint = ""
-    if (
-        on_share
-        and _folder_key(dest) in _own_folders_on_shares()
-        and _squashed(dest.resolve(), mount)
-    ):
+    if _more_people_can_list(dest, src):
         raise CaptionError(
-            f"this network drive makes {dest}, and everything As If creates there, someone "
-            "else's (all_squash, \"map all users\" or Samba's force user), so every user of "
-            "the share could open the copies. Use a folder on this computer, or a share "
-            "that keeps your own account."
+            f"other users can list the destination {dest} but not {src}, so they "
+            f"would see your photos' names. Run `chmod 700 {dest}` if it's yours, or "
+            "name a new folder (As If creates new ones private)."
         )
-    if on_share:
-        hint = (
-            " On a network drive As If only trusts folders it made itself, so name a new one there."
-        )
-    raise CaptionError(
-        f"other users can list the destination {dest} but not {src}, so they "
-        f"would see your photos' names. Run `chmod 700 {dest}` if it's yours, or "
-        f"name a new folder (As If creates new ones private).{hint}"
-    )
+
+
+def _source_is_private(src: Path) -> bool:
+    """Can anyone besides us not list the source folder?"""
+    try:
+        return _folder_audience(src, wide=False) != _ANYONE
+    except OSError as exc:
+        raise _SourceUnreadable(exc) from exc
 
 
 def caption_folder(
@@ -1564,18 +1489,14 @@ def caption_folder(
     secrets.SystemRandom().shuffle(files)
 
     if not dry_run:
-        _MADE_NOW.clear()
         created: list[Path] = []
         try:
             try:
                 created = _make_private_dirs(dest)
-                _MADE_NOW.update(_folder_key(f) for f in created)
                 _destination_ok(dest, src)
-                _remember_own_folders(created)
             except BaseException:
                 # Nothing it made is left behind (its name would say something).
                 _remove_created(created)
-                _MADE_NOW.clear()
                 raise
         except _FolderRefused as exc:
             raise CaptionError(
