@@ -1,16 +1,23 @@
-"""The orchestrator has no network capability, and CI proves it two ways.
+"""The orchestrator has no network capability, and CI proves it three ways.
 
 1. Importing every orchestrator module must not load a networking module,
-   not even indirectly through a dependency.
-2. At runtime, the netguard audit hook turns any socket use into a crash.
+   not even indirectly through a dependency (apart from a short, reasoned
+   list of harmless importers).
+2. No orchestrator source file imports one, even lazily inside a function.
+3. At runtime, the netguard audit hook turns any socket use into a crash.
 """
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+import asif
 
 # Modules that are *meant* to reach the network (or loopback). Each one runs
 # in its own child process, never inside the orchestrator. Adding to this
@@ -19,11 +26,9 @@ NETWORK_CAPABLE = {
     "asif.infer.worker",  # talks to llama-server on loopback, inside the inference sandbox
 }
 
-# Not "_socket": typing_extensions (via pydantic) imports that C module on
-# Python < 3.14 only to borrow its capsule type, never to open anything. The
-# audit hook below still blocks every socket, _socket's included.
 FORBIDDEN = (
     "socket",
+    "_socket",
     "ssl",
     "_ssl",
     "http",
@@ -41,44 +46,166 @@ FORBIDDEN = (
     "webbrowser",
 )
 
+# Imports of a forbidden module known to be harmless: the module, and the
+# files whose import statements may load it. The audit hook still blocks any
+# actual socket use in the orchestrator, these included.
+BENIGN_IMPORTERS: dict[str, tuple[str, ...]] = {
+    # The capsule type, which typing_extensions (via pydantic) looks up:
+    # Python 3.13's types.CapsuleType imports _socket to get it, and on 3.12
+    # typing_extensions does the same itself. Nothing is opened.
+    "_socket": (
+        os.sep + "types.py",
+        os.sep + "typing_extensions.py",
+    ),
+    # On Python 3.12 the stdlib's email.utils imports socket at module level,
+    # only for make_msgid()'s getfqdn(). It's reached through
+    # importlib.metadata (pydantic's plugin loader). Python 3.13 made it lazy.
+    "socket": (os.sep + os.path.join("email", "utils.py"),),
+}
 
-def _run(code: str) -> subprocess.CompletedProcess[str]:
+# Runs in a fresh interpreter. Records every import statement that names a
+# forbidden module (with the importing file), not just the first one, so an
+# offender can't hide behind a harmless module that loaded it earlier.
+_PROBE = """
+import builtins, importlib, importlib.abc, json, pkgutil, sys, traceback
+
+FORBIDDEN = {forbidden!r}
+seen = []
+
+
+def forbidden(name):
+    return any(name == f or name.startswith(f + ".") for f in FORBIDDEN)
+
+
+class Spy(importlib.abc.MetaPathFinder):
+    # First loads, including importlib.import_module(), which skips __import__.
+    def find_spec(self, name, path, target=None):
+        if forbidden(name):
+            # Skip importlib's frames and this probe's own (the __import__ wrapper).
+            frames = [f.filename for f in traceback.extract_stack()[:-1]
+                      if not f.filename.startswith(("<frozen", "<string>"))]
+            seen.append((name, frames[-1] if frames else "?"))
+        return None
+
+
+_real_import = builtins.__import__
+
+
+def _import(name, globals=None, locals=None, fromlist=(), level=0):
+    # Every import statement, even of a module that is already loaded.
+    if level == 0 and forbidden(name):
+        seen.append((name, (globals or {{}}).get("__file__") or "?"))
+    return _real_import(name, globals, locals, fromlist, level)
+
+
+startup = sorted(m for m in sys.modules if forbidden(m))
+sys.meta_path.insert(0, Spy())
+builtins.__import__ = _import
+imported = []
+for target in {targets!r}:
+    if target == "*":
+        import asif
+        for info in pkgutil.walk_packages(asif.__path__, "asif."):
+            if info.name in {skipped!r} or info.name == "asif.__main__":
+                continue
+            importlib.import_module(info.name)
+            imported.append(info.name)
+    else:
+        importlib.import_module(target)
+        imported.append(target)
+builtins.__import__ = _real_import
+# Imports made *by* a forbidden module are already blamed on whoever loaded it.
+inside = sorted(getattr(sys.modules[m], "__file__", None) or "" for m in sys.modules
+                if forbidden(m))
+print(json.dumps({{"imported": imported, "seen": sorted(set(seen)), "startup": startup,
+                  "inside": inside}}))
+"""
+
+
+def _run(code: str, *, extra_path: str | None = None) -> subprocess.CompletedProcess[str]:
+    env = dict(os.environ)
+    if extra_path:
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [extra_path, env.get("PYTHONPATH")]))
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code)],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
+        env=env,
     )
 
 
-def test_orchestrator_never_imports_networking_modules() -> None:
+def forbidden_imports(
+    *targets: str, extra_path: str | None = None
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Import ``targets`` ("*" = every orchestrator module) in a fresh interpreter.
+
+    Returns what was imported, and every (forbidden module, importing file)
+    pair that isn't on the benign list.
+    """
     proc = _run(
-        f"""
-        import importlib, json, pkgutil, sys
-        import asif
-        skipped = {sorted(NETWORK_CAPABLE)!r}
-        imported = []
-        for info in pkgutil.walk_packages(asif.__path__, "asif."):
-            if info.name in skipped or info.name == "asif.__main__":
-                continue
-            importlib.import_module(info.name)
-            imported.append(info.name)
-        forbidden = {FORBIDDEN!r}
-        bad = sorted(m for m in sys.modules
-                     if any(m == f or m.startswith(f + ".") for f in forbidden))
-        print(json.dumps({{"imported": imported, "bad": bad}}))
-        """
+        _PROBE.format(forbidden=FORBIDDEN, targets=list(targets), skipped=sorted(NETWORK_CAPABLE)),
+        extra_path=extra_path,
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(proc.stdout)
-    assert "asif.cli" in report["imported"]
-    assert "asif.pipeline.local" in report["imported"]
-    assert "asif.infer.client" in report["imported"]
-    assert report["bad"] == [], (
-        f"orchestrator code pulled in networking modules: {report['bad']}. "
+    assert report["startup"] == [], f"loaded before any import: {report['startup']}"
+    inside = set(report["inside"]) - {""}
+    bad = [
+        (module, importer)
+        for module, importer in report["seen"]
+        if importer not in inside and not importer.endswith(BENIGN_IMPORTERS.get(module, ()))
+    ]
+    return report["imported"], bad
+
+
+def test_orchestrator_never_imports_networking_modules() -> None:
+    imported, bad = forbidden_imports("*")
+    assert "asif.cli" in imported
+    assert "asif.pipeline.local" in imported
+    assert "asif.infer.client" in imported
+    assert bad == [], (
+        f"orchestrator code pulled in networking modules (module, importer): {bad}. "
         "Move network use into a separate, sandboxed process."
     )
+
+
+def test_the_probe_catches_an_offender_hiding_behind_a_benign_import(tmp_path: Path) -> None:
+    # Guards the guard. asif.config loads pydantic first, which on Python 3.12
+    # already pulls in socket harmlessly; the offender's own import must still
+    # be reported.
+    (tmp_path / "offender.py").write_text("import asif.config\nimport socket\n")
+    _, bad = forbidden_imports("offender", extra_path=str(tmp_path))
+    assert ("socket", str(tmp_path / "offender.py")) in bad
+
+
+def test_no_orchestrator_source_imports_networking_modules() -> None:
+    # Catches what an import can't: imports inside functions that haven't run.
+    root = Path(asif.__file__).parent
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        module = ".".join(("asif", *path.relative_to(root).with_suffix("").parts))
+        if module.removesuffix(".__init__") in NETWORK_CAPABLE:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module]
+            for name in names:
+                if any(name == f or name.startswith(f + ".") for f in FORBIDDEN):
+                    offenders.append(f"{path.relative_to(root)}:{node.lineno} imports {name}")
+    assert offenders == []
+
+
+def test_pydantic_plugins_are_disabled_in_the_orchestrator() -> None:
+    # Plugins are third-party entry-point code that pydantic would otherwise
+    # run inside this process.
+    proc = _run("import asif, os; print(os.environ.get('PYDANTIC_DISABLE_PLUGINS'))")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "__all__"
 
 
 def test_audit_hook_blocks_sockets_dns_and_urls() -> None:

@@ -25,7 +25,7 @@ from asif.infer import worker
 from asif.infer.client import InferenceClient, InferenceError, WorkerConfig
 from asif.infer.schema import PROMPT_VERSION, parse_caption_json
 from tests.fake_llama_server import FakeLlama, process_gone
-from tests.test_netguard import FORBIDDEN
+from tests.test_netguard import forbidden_imports
 
 SCRIPTED_WORKER = r"""
 import json, os, signal, sys, time
@@ -532,18 +532,8 @@ def test_error_details_carry_a_bounded_stderr_tail(
 
 @pytest.mark.parametrize("module", ["asif.infer.client", "asif.infer.preprocess"])
 def test_importing_does_not_load_networking_modules(module: str) -> None:
-    code = textwrap.dedent(
-        f"""
-        import json, sys
-        import {module}
-        print(json.dumps(sorted(sys.modules)))
-        """
-    )
-    proc = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=True, timeout=60
-    )
-    loaded = json.loads(proc.stdout)
-    bad = [m for m in loaded if any(m == f or m.startswith(f + ".") for f in FORBIDDEN)]
+    imported, bad = forbidden_imports(module)
+    assert imported == [module]
     assert bad == []
 
 
