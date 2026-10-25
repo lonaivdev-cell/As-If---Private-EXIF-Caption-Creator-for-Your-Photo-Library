@@ -110,9 +110,9 @@ asif config path | show | init    where settings live; what's in effect; a start
 asif version
 ```
 
-Exit codes: `0` all good · `1` some photos failed or were quarantined (or a folder couldn't be read) · `2` bad options or setup (including a failed `asif doctor` check) · `3` run stopped early (failure budget, full destination, model worker gone) · `130` stopped by Ctrl+C or a signal.
+Exit codes: `0` all good · `1` some photos failed or were quarantined (or a folder couldn't be read, or was a link to a folder, which As If doesn't follow) · `2` bad options or setup (including a failed `asif doctor` check, a config file that isn't UTF-8 or a state folder As If can't write) · `3` run stopped early (failure budget, full destination, model worker gone) · `130` stopped by Ctrl+C or a signal.
 
-Settings live in `~/.config/asif/config.toml`; `asif config init` writes a commented starter file. Set `ASIF_HOME` to keep everything (config, logs, later the vault) in one folder, such as an encrypted volume.
+Settings live in `~/.config/asif/config.toml`; `asif config init` writes a commented starter file. Set `ASIF_HOME` to keep everything (config, logs, later the vault) in one folder, such as an encrypted volume. As If never creates the folders `ASIF_HOME` is in, so if they're missing (say the volume isn't mounted), a run stops with "Can't start" instead of writing to the disk underneath.
 
 ---
 

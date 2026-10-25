@@ -59,14 +59,28 @@ class Compat(StrEnum):
 _state = _State()
 
 
+def _safe(text: str) -> str:
+    """``text`` ready to print: markup escaped, and fine on any UTF-8 terminal.
+
+    A name that isn't UTF-8 (Latin-1 from an old camera card or a Windows zip)
+    arrives with its odd bytes as stand-in characters that a strict UTF-8
+    terminal refuses to print. They're shown as ``\\xe9`` instead.
+    """
+    try:
+        raw = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:  # a stand-in no file name decodes to
+        raw = text.encode("utf-8", "backslashreplace")
+    return escape(raw.decode("utf-8", "backslashreplace"))
+
+
 def _load() -> Config:
     if _state.config_path is not None and not _state.config_path.is_file():
-        err.print(f"[red]Config problem:[/] {escape(str(_state.config_path))} doesn't exist.")
+        err.print(f"[red]Config problem:[/] {_safe(str(_state.config_path))} doesn't exist.")
         raise typer.Exit(EXIT_USAGE)
     try:
         return load_config(_state.config_path)
     except ConfigError as exc:
-        err.print(f"[red]Config problem:[/] {escape(str(exc))}")
+        err.print(f"[red]Config problem:[/] {_safe(str(exc))}")
         raise typer.Exit(EXIT_USAGE) from exc
 
 
@@ -183,13 +197,13 @@ def caption(
             cfg.resources.allow_disk_workdir = True
     except ValidationError as exc:
         problem = exc.errors()[0]
-        err.print(f"[red]Invalid option:[/] {escape(str(problem['msg']))}")
+        err.print(f"[red]Invalid option:[/] {_safe(str(problem['msg']))}")
         raise typer.Exit(EXIT_USAGE) from exc
 
     try:
-        choice = choose_model(cfg, notice=lambda msg: err.print(f"[dim]{escape(msg)}[/]"))
+        choice = choose_model(cfg, notice=lambda msg: err.print(f"[dim]{_safe(msg)}[/]"))
     except CaptionError as exc:
-        err.print(f"[red]Can't start:[/] {escape(str(exc))}")
+        err.print(f"[red]Can't start:[/] {_safe(str(exc))}")
         raise typer.Exit(EXIT_USAGE) from exc
 
     if choice.backend == "stub":
@@ -204,11 +218,21 @@ def caption(
         )
 
     run_id = new_run_id()
-    log_path: Path | None = None
+    log = TimingsLog(None, run_id=run_id, model=choice.model_id)
     if cfg.telemetry.enabled and not dry_run:
-        log_path = paths.state_dir() / "timings.jsonl"
-        prune(log_path, cfg.telemetry.retention_days)
-    log = TimingsLog(log_path, run_id=run_id, model=choice.model_id)
+        state = paths.state_dir()
+        try:
+            paths.ensure_private_dir(state)
+            prune(state / "timings.jsonl", cfg.telemetry.retention_days)
+            log = TimingsLog(state / "timings.jsonl", run_id=run_id, model=choice.model_id)
+        except OSError as exc:
+            err.print(
+                f"[red]Can't start:[/] As If can't write to its state folder {_safe(str(state))} "
+                f"({_safe(exc.strerror or str(exc))}). If it's on a drive or encrypted volume, "
+                "check that it's mounted. Or turn the timings log off: enabled = false under "
+                "\\[telemetry] in your config."
+            )
+            raise typer.Exit(EXIT_USAGE) from exc
 
     progress = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -246,12 +270,12 @@ def caption(
         err.print("Stopped before any photo was started.")
         raise typer.Exit(EXIT_INTERRUPTED) from exc
     except CaptionError as exc:
-        err.print(f"[red]Can't start:[/] {escape(str(exc))}")
+        err.print(f"[red]Can't start:[/] {_safe(str(exc))}")
         if "RAM-backed" in str(exc):
             err.print(
                 "As If keeps photos in RAM while it works on them. On Linux that needs a "
                 "tmpfs (/dev/shm or $XDG_RUNTIME_DIR); you can point [bold]work_dir[/] under "
-                "[resources] at one. To accept the weaker option, pass "
+                "\\[resources] at one. To accept the weaker option, pass "
                 "[bold]--allow-disk-workdir[/]."
             )
         raise typer.Exit(EXIT_USAGE) from exc
@@ -259,19 +283,19 @@ def caption(
         err.print(f"[red]The model couldn't start[/] ({exc.kind}).")
         if exc.detail:
             err.print(
-                Panel(escape(exc.detail[-2000:]), title="model log (tail)", border_style="red")
+                Panel(_safe(exc.detail[-2000:]), title="model log (tail)", border_style="red")
             )
         err.print("Run [bold]asif doctor[/] to check llama-server and your model files.")
         raise typer.Exit(EXIT_USAGE) from exc
 
     for message in notices:
-        err.print(f"[yellow]Note:[/] {escape(message)}")
+        err.print(f"[yellow]Note:[/] {_safe(message)}")
     _print_summary(summary, list(iter_problems(summary)))
     if summary.interrupted:
         raise typer.Exit(EXIT_INTERRUPTED)
     if summary.aborted:
         raise typer.Exit(EXIT_ABORTED)
-    if summary.failed or summary.unreadable_dirs:
+    if summary.failed or summary.unreadable_dirs or summary.linked_dirs:
         raise typer.Exit(EXIT_ITEMS_FAILED)
 
 
@@ -285,12 +309,12 @@ def _print_summary(summary: RunSummary, problems: list[ItemOutcome]) -> None:
             if o.plan is None:
                 continue
             caption_cell = (
-                escape(o.plan.caption)
+                _safe(o.plan.caption)
                 if o.plan.caption is not None
                 else "[dim](your caption is kept)[/]"
             )
-            keywords = ", ".join(o.plan.add_subjects) or "[dim](none new)[/]"
-            table.add_row(escape(o.rel), caption_cell, escape(keywords))
+            keywords = _safe(", ".join(o.plan.add_subjects)) or "[dim](none new)[/]"
+            table.add_row(_safe(o.rel), caption_cell, keywords)
         if table.row_count:
             console.print(table)
 
@@ -324,19 +348,29 @@ def _print_summary(summary: RunSummary, problems: list[ItemOutcome]) -> None:
     if not summary.outcomes:
         if summary.aborted:  # always set when a run is stopped early
             console.print("No photo was finished before the run stopped.")
+        elif summary.linked_dirs:
+            console.print(
+                "No photos found, but some folders are links, which As If doesn't follow."
+            )
         else:
             console.print("No photos found.")
     else:
         console.print(Panel(counts, title=f"Run {summary.run_id}", expand=False))
 
-    if problems or summary.unreadable_dirs:
+    if problems or summary.unreadable_dirs or summary.linked_dirs:
         table = Table(title="Needs a look")
         table.add_column("Photo", overflow="fold")
         table.add_column("What happened")
         for folder in summary.unreadable_dirs:
-            table.add_row(escape(folder + "/"), "folder couldn't be read (permission denied?)")
+            table.add_row(_safe(folder + "/"), "folder couldn't be read (permission denied?)")
+        for folder in summary.linked_dirs:
+            table.add_row(
+                _safe(folder + "/"),
+                "a link to a folder: As If doesn't follow links; "
+                "caption the folder it points to directly",
+            )
         for item in problems:
-            table.add_row(escape(item.rel), escape(item.reason))
+            table.add_row(_safe(item.rel), _safe(item.reason))
         console.print(table)
     notes = [o for o in summary.outcomes if o.note]
     if notes:
@@ -344,10 +378,10 @@ def _print_summary(summary: RunSummary, problems: list[ItemOutcome]) -> None:
         table.add_column("Photo", overflow="fold")
         table.add_column("Note")
         for item in notes:
-            table.add_row(escape(item.rel), escape(item.note))
+            table.add_row(_safe(item.rel), _safe(item.note))
         console.print(table)
     if summary.aborted:
-        err.print(f"[red bold]Run stopped:[/] {escape(summary.aborted)}")
+        err.print(f"[red bold]Run stopped:[/] {_safe(summary.aborted)}")
 
 
 @models_app.command("list")
@@ -393,7 +427,7 @@ def models_recommend() -> None:
 @config_app.command("path")
 def config_path() -> None:
     """Print where the config file is (or would be)."""
-    console.print(str(_state.config_path or paths.config_file()))
+    console.print(_safe(str(_state.config_path or paths.config_file())))
 
 
 @config_app.command("show")
@@ -409,11 +443,15 @@ def config_init(
     """Write a commented starter config file."""
     target = _state.config_path or paths.config_file()
     if target.exists() and not force:
-        err.print(f"{target} already exists. Use --force to replace it.")
+        err.print(f"{_safe(str(target))} already exists. Use --force to replace it.")
         raise typer.Exit(EXIT_USAGE)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(STARTER_CONFIG, encoding="utf-8")
-    console.print(f"Wrote {target}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(STARTER_CONFIG, encoding="utf-8")
+    except OSError as exc:
+        err.print(f"[red]Can't write[/] {_safe(str(target))} ({_safe(exc.strerror or str(exc))}).")
+        raise typer.Exit(EXIT_USAGE) from exc
+    console.print(f"Wrote {_safe(str(target))}")
 
 
 STARTER_CONFIG = """\

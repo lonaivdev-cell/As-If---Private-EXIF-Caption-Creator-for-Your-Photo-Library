@@ -50,6 +50,21 @@ def test_bad_config_is_a_clear_error(tmp_path: Path, body: str, fragment: str) -
     assert str(path) in str(info.value)
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'# Configura\xe7\xe3o\n[general]\ncaption_lang = "pt-BR"\n',  # Latin-1
+        "[general]\n".encode("utf-16"),  # Notepad's "Unicode"
+    ],
+)
+def test_a_config_that_isnt_utf8_is_a_clear_error(tmp_path: Path, body: bytes) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(body)
+    with pytest.raises(ConfigError, match="save it as UTF-8") as info:
+        load_config(path)
+    assert str(path) in str(info.value)
+
+
 @pytest.mark.parametrize("lang", ["en", "pt-BR", "zh-Hant", "zh-Hant-TW", "es-419", "fil"])
 def test_language_tags_accepted(lang: str) -> None:
     cfg = Config()
@@ -89,3 +104,15 @@ def test_ensure_private_dir(tmp_path: Path) -> None:
     path = paths.ensure_private_dir(tmp_path / "a" / "b")
     assert path.is_dir()
     assert path.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_private_dir_never_creates_the_folders_asif_home_is_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An encrypted volume that isn't mounted, or a typo: nothing goes on the disk underneath.
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path / "Vault" / "asif"))
+    with pytest.raises(FileNotFoundError, match="Vault doesn't exist"):
+        paths.ensure_private_dir(paths.state_dir())
+    assert not (tmp_path / "Vault").exists()
+    (tmp_path / "Vault").mkdir()  # mounted
+    assert paths.ensure_private_dir(paths.state_dir()).is_dir()

@@ -129,13 +129,19 @@ class Config(_Section):
 def load_config(path: Path | None = None) -> Config:
     """Load ``path`` (default: the platform config file). Missing file = defaults."""
     path = path or paths.config_file()
-    if not path.exists():
-        return Config()
     try:
+        if not path.exists():
+            return Config()
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path}: not valid TOML: {exc}") from exc
+    except UnicodeDecodeError as exc:  # an editor that saved it as Latin-1 or UTF-16
+        raise ConfigError(
+            f"{path}: not UTF-8 text (at byte {exc.start}); save it as UTF-8"
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(f"{path}: can't be read ({exc.strerror or exc})") from exc
     try:
         return Config.model_validate(raw)
     except ValidationError as exc:

@@ -8,6 +8,7 @@ volume.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
 from pathlib import Path
@@ -75,7 +76,20 @@ def models_dir() -> Path:
 
 
 def ensure_private_dir(path: Path) -> Path:
-    """Create ``path`` (and parents) and make the leaf readable only by us."""
+    """Create ``path`` (and parents) and make the leaf readable only by us.
+
+    The folders ``ASIF_HOME`` sits in are never created: if they're missing
+    (an encrypted volume that isn't mounted, a typo), this raises
+    ``FileNotFoundError`` rather than quietly making them on whatever disk is
+    underneath.
+    """
+    root = _asif_home()
+    if root is not None and path.is_relative_to(root):
+        try:
+            root.mkdir(exist_ok=True)
+        except FileNotFoundError as exc:
+            missing = str(root.parent)
+            raise FileNotFoundError(errno.ENOENT, f"{missing} doesn't exist", missing) from exc
     path.mkdir(parents=True, exist_ok=True)
     path.chmod(0o700)
     return path
