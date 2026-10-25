@@ -11,6 +11,7 @@ import hashlib
 import io
 import mmap
 import struct
+import tracemalloc
 import zlib
 from collections import Counter
 from pathlib import Path
@@ -34,6 +35,7 @@ from asif.meta.structure import (
     read_xmp,
     tiff_layout,
     write_hazard,
+    xmp_property,
 )
 
 SECRET = b"GPS -22.951916 my secret caption"
@@ -1045,7 +1047,7 @@ def test_tiff_layout_takes_a_memory_map(tmp_path: Path) -> None:
     path.write_bytes(t.done(t.page(4, 4, undefined(0x02BC, xmp_packet("<dc:title>x</dc:title>")))))
     with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
         assert tiff_layout(view).unreferenced == 0
-        assert read_xmp(view).values == Counter({"x": 1})
+        assert read_xmp(view).values == Counter({(dc("title"), "x"): 1})
     # Leaving the block closed the map: nothing kept a view of it. Not even on an error:
     path.write_bytes(_loop())
     with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
@@ -1102,6 +1104,27 @@ _NAMESPACES = (
 )
 
 
+# Properties as ``read_xmp`` names them: namespace URI, a space, local name.
+DC = "http://purl.org/dc/elements/1.1/ "
+PS = "http://ns.adobe.com/photoshop/1.0/ "
+
+
+def dc(name: str) -> bytes:
+    return xmp_property(DC + name)
+
+
+def ps(name: str) -> bytes:
+    return xmp_property(PS + name)
+
+
+def texts(xmp: XmpText) -> Counter[str]:
+    """The values alone, whatever property they are in."""
+    out: Counter[str] = Counter()
+    for (_prop, value), n in xmp.values.items():
+        out[value] += n
+    return out
+
+
 def xmp_packet(body: str, attrs: str = "") -> bytes:
     return (
         '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>'
@@ -1144,7 +1167,15 @@ OWNER_XMP = xmp_packet(
     "<xmpNote:HasExtendedXMP>0123456789ABCDEF0123456789ABCDEF</xmpNote:HasExtendedXMP>",
     attrs='photoshop:City="  Rio  " asif:ModelId="stub" rdf:nodeID="n1"',
 )
-OWNER_VALUES = Counter({"Garden": 1, "family": 2, "http://example.com/x": 1, "a & c": 1, "Rio": 1})
+OWNER_VALUES = Counter(
+    {
+        (dc("title"), "Garden"): 1,
+        (dc("subject"), "family"): 2,
+        (ps("Source"), "http://example.com/x"): 1,  # rdf:resource: the element's value
+        (ps("Instructions"), "a & c"): 1,
+        (ps("City"), "Rio"): 1,
+    }
+)
 
 
 def test_xmp_values_skip_syntax_and_as_ifs_own_record() -> None:
@@ -1152,6 +1183,120 @@ def test_xmp_values_skip_syntax_and_as_ifs_own_record() -> None:
     assert text.values == OWNER_VALUES
     assert text.problem is None
     assert "Garden" not in repr(text)
+
+
+_HISTORY_NS = (
+    'xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/" '
+    'xmlns:stEvt="http://ns.adobe.com/xap/1.0/sType/ResourceEvent#"'
+)
+_SUBJECT = "<dc:subject><rdf:Bag><rdf:li>family</rdf:li></rdf:Bag></dc:subject>"
+_EVENT = "<xmpMM:History><rdf:Seq><rdf:li {}</rdf:li></rdf:Seq></xmpMM:History>"
+# The same values in each of the forms XMP allows, all of which exiftool
+# reads, and writes back in a form of its own.
+SAME_VALUES = {
+    "elements": xmp_packet(
+        "<photoshop:City>Rio</photoshop:City>"
+        + _SUBJECT
+        + _EVENT.format('rdf:parseType="Resource"><stEvt:action>saved</stEvt:action>'),
+        attrs=_HISTORY_NS,
+    ),
+    "attributes": xmp_packet(
+        _SUBJECT + _EVENT.format('stEvt:action="saved">'),
+        attrs=f'{_HISTORY_NS} photoshop:City="Rio"',
+    ),
+    "split-descriptions": xmp_packet(
+        "<photoshop:City>Rio</photoshop:City></rdf:Description>"
+        f'<rdf:Description rdf:about="uuid:1234" {_NAMESPACES}>{_SUBJECT}</rdf:Description>'
+        f'<rdf:Description rdf:about="uuid:1234" {_HISTORY_NS}>'
+        + _EVENT.format("><rdf:Description stEvt:action='saved'/>"),
+    ),
+}
+
+
+def test_xmp_values_belong_to_their_property_however_it_is_written() -> None:
+    history = "http://ns.adobe.com/xap/1.0/mm/ History"
+    action = "http://ns.adobe.com/xap/1.0/sType/ResourceEvent# action"
+    expected = Counter(
+        {
+            (ps("City"), "Rio"): 1,
+            (dc("subject"), "family"): 1,  # a list item: its list's property
+            # A struct field: the struct's, and its own.
+            (xmp_property(history, action), "saved"): 1,
+        }
+    )
+    for name, packet in SAME_VALUES.items():
+        assert read_xmp(jpeg_xmp(std_xmp(packet))).values == expected, name
+
+
+MICROSOFT_PHOTO = 'xmlns:MicrosoftPhoto="http://ns.microsoft.com/photo/1.0{}"'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("<MicrosoftPhoto:Rating>50</MicrosoftPhoto:Rating>", id="property"),
+        pytest.param(
+            "<MicrosoftPhoto:LastKeywordXMP><rdf:Bag><rdf:li>piano</rdf:li></rdf:Bag>"
+            "</MicrosoftPhoto:LastKeywordXMP>",
+            id="list-item",
+        ),
+        pytest.param(
+            '<MicrosoftPhoto:Info rdf:parseType="Resource"><photoshop:City>Rio</photoshop:City>'
+            "</MicrosoftPhoto:Info>",
+            id="field-of-a-renamed-struct",
+        ),
+        pytest.param(
+            '<photoshop:Info rdf:parseType="Resource"><MicrosoftPhoto:Rating>50'
+            "</MicrosoftPhoto:Rating></photoshop:Info>",
+            id="renamed-field",
+        ),
+    ],
+)
+def test_a_renamed_namespace_moves_its_values(body: str) -> None:
+    # Windows' URI ends in "/", exiftool's doesn't, and exiftool "fixes" it:
+    # the same prefix, names and text, in another property.
+    old, new = (
+        read_xmp(jpeg_xmp(std_xmp(xmp_packet(body, attrs=MICROSOFT_PHOTO.format(end)))))
+        for end in ("/", "")
+    )
+    assert texts(old) == texts(new)
+    assert old.values != new.values
+
+
+_DEPTH = 2000
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("<dc:title>" + "<dc:x>" * _DEPTH + "v" + "</dc:x>" * _DEPTH, id="deep"),
+        pytest.param(
+            "".join(f'<dc:x dc:a="{i}">' for i in range(_DEPTH)) + "</dc:x>" * _DEPTH,
+            id="a-value-at-every-level",
+        ),
+        pytest.param(
+            f"<dc:{'L' * 20_000} " + " ".join(f'dc:a{i}="{i}"' for i in range(_DEPTH)) + "/>",
+            id="many-values-in-a-long-named-property",
+        ),
+    ],
+)
+def test_reading_xmp_takes_memory_in_proportion_to_its_size(body: str) -> None:
+    # A crafted file (from the web, say): each value's property must not
+    # spell out the whole path to it, or a few hundred KB of nested or
+    # long-named XMP takes gigabytes and minutes to read.
+    if body.startswith("<dc:title>"):
+        body += "</dc:title>"
+    data = _xmp_in("png", xmp_packet(body))
+    tracemalloc.start()
+    try:
+        text = read_xmp(data)
+        _now, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert text.problem is None and text.values
+    assert all(len(prop) == 16 for prop, _value in text.values)
+    # About 30 times the file's size; spelled-out paths took 800 to 2,900 times.
+    assert peak < 100 * len(data), (peak, len(data))
 
 
 def test_no_xmp_means_no_values() -> None:
@@ -1215,7 +1360,7 @@ def test_markup_inside_a_value_is_a_problem(body: str) -> None:
     # exiftool keeps the elements as a structure and drops the text around them.
     text = read_xmp(jpeg_xmp(std_xmp(xmp_packet(body))))
     assert text.problem == "its XMP has markup inside a value, which exiftool can't carry over"
-    assert "credit" in text.values or "bold" in text.values  # the values are still counted
+    assert texts(text)["credit"] or texts(text)["bold"]  # the values are still counted
 
 
 @pytest.mark.parametrize(
@@ -1232,7 +1377,7 @@ def test_markup_inside_a_cdata_value_is_a_problem(cdata: str) -> None:
     body = f"<photoshop:City><![CDATA[{cdata}]]></photoshop:City>"
     text = read_xmp(jpeg_xmp(std_xmp(xmp_packet(body))))
     assert text.problem == "its XMP has markup inside a value, which exiftool can't carry over"
-    assert text.values[cdata] == 1
+    assert text.values[ps("City"), cdata] == 1
 
 
 @pytest.mark.parametrize(
@@ -1285,6 +1430,7 @@ def test_old_adobe_toolkit_attribute_is_not_a_value() -> None:
 # Adobe's apps rewrite a packet in place: a shorter one can leave the end of
 # the older one behind, after the trailer.
 WITH_TRAILER = xmp_packet("<dc:title>Pier</dc:title>")
+PIER = Counter({(dc("title"), "Pier"): 1})
 
 
 @pytest.mark.parametrize(
@@ -1299,7 +1445,7 @@ WITH_TRAILER = xmp_packet("<dc:title>Pier</dc:title>")
 def test_leftovers_holding_nothing_are_read_past(tail: bytes, fmt: str) -> None:
     data = _xmp_in(fmt, WITH_TRAILER + tail)
     assert read_xmp(data) == read_xmp(_xmp_in(fmt, WITH_TRAILER))
-    assert read_xmp(data).values == Counter({"Pier": 1})
+    assert read_xmp(data).values == PIER
 
 
 @pytest.mark.parametrize(
@@ -1316,7 +1462,7 @@ def test_leftovers_that_may_hold_values_are_a_problem(tail: bytes, fmt: str) -> 
     # the write: a limit of the file, not corruption.
     text = read_xmp(_xmp_in(fmt, WITH_TRAILER + tail))
     assert text.problem == LEFTOVERS_PROBLEM
-    assert text.values == Counter({"Pier": 1})  # the packet itself is still compared
+    assert text.values == PIER  # the packet itself is still compared
     assert "Someone" not in LEFTOVERS_PROBLEM
 
 
@@ -1336,7 +1482,7 @@ def test_leftovers_after_anything_but_a_well_formed_packet_still_raise(packet: b
 def test_a_well_formed_packet_is_read_whole() -> None:
     # Comments and processing instructions may follow the root: no leftovers.
     packet = WITH_TRAILER + b"<!-- Pier -->\n<?other x?>"
-    assert read_xmp(_xmp_in("jpeg", packet)) == XmpText(Counter({"Pier": 1}))
+    assert read_xmp(_xmp_in("jpeg", packet)) == XmpText(PIER)
 
 
 def _xmp_in(fmt: str, packet: bytes) -> bytes:
@@ -1354,7 +1500,7 @@ def test_extended_xmp_linked_from_the_main_packet() -> None:
     main = xmp_packet("", attrs=f'xmpNote:HasExtendedXMP="{guid.decode()}"')
     text = read_xmp(jpeg_xmp(std_xmp(main), *ext_xmp(guid, extended, parts=3)))
     assert text.problem is None
-    assert text.values == Counter({("long history " * 50).strip(): 1})
+    assert text.values == Counter({(ps("History"), ("long history " * 50).strip()): 1})
 
 
 @pytest.mark.parametrize("link", ["", 'xmpNote:HasExtendedXMP="FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"'])
@@ -1408,7 +1554,7 @@ def test_unreadable_xmp_raises(data: bytes) -> None:
 
 def test_fixture_xmp(fixtures_dir: Path) -> None:
     text = read_xmp((fixtures_dir / "user_xmp.jpg").read_bytes())
-    assert {"Grandma's garden, summer 2003", "Garden", "family"} <= text.values.keys()
+    assert {"Grandma's garden, summer 2003", "Garden", "family"} <= texts(text).keys()
     assert text.problem is None
     for name in ("plain.jpg", "plain.png", "lossy.webp", "plain.tif"):
         assert read_xmp((fixtures_dir / name).read_bytes()).problem is None

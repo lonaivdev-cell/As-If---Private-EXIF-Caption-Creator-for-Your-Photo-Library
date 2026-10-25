@@ -239,6 +239,8 @@ _WRITE_ONCE_IPTC = frozenset(
 # - Captions: one may change only if it was As If's own, i.e. it hashes to
 #   the XMP-asif:CaptionDigest recorded *before* the write.
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+# The caption's property, as ``structure.read_xmp`` files it.
+_DC_DESCRIPTION = structure.xmp_property("http://purl.org/dc/elements/1.1/ description")
 
 
 def _is_caption(base: str) -> bool:
@@ -341,8 +343,9 @@ class Snapshot:
     """The full tag dump, keyed ``Group:Tag`` (``Group:Tag#2`` for a second copy)."""
     data: bytes | None = field(repr=False)
     """The whole file for JPEG, PNG and WebP; None otherwise (TIFFs can be huge)."""
-    xmp: Counter[str] = field(repr=False)
-    """The XMP's own values, read without exiftool (``structure.read_xmp``)."""
+    xmp: Counter[tuple[bytes, str]] = field(repr=False)
+    """The XMP's own values with their properties, read without exiftool
+    (``structure.read_xmp``)."""
     unprovable: str | None
     """Why no write to this file can be proven safe, in plain words, or None.
 
@@ -559,7 +562,9 @@ def _numbers(value: object) -> list[int]:
     return []
 
 
-def _inspect(path: Path, fmt: str, data: bytes | None) -> tuple[Counter[str], str | None]:
+def _inspect(
+    path: Path, fmt: str, data: bytes | None
+) -> tuple[Counter[tuple[bytes, str]], str | None]:
     """The XMP's own values, and why no write can be proven safe (None if one can)."""
     if fmt not in _KEEP_BYTES and fmt != "tiff":
         return Counter(), "As If can't check this file type byte by byte"
@@ -747,24 +752,31 @@ def _structure(
         if not diffs:  # a file that changed format can't be read as before: said already
             diffs.append("the written XMP can't be read")
     elif lost := _xmp_lost(before, text.values):
-        diffs.append(f"{lost} of the original XMP's values went missing")
+        diffs.append(f"{lost} of the original XMP's values went missing or moved")
     if diffs:
         more = f" (+{len(diffs) - 3} more)" if len(diffs) > 3 else ""
         return GateResult("structure", False, "; ".join(diffs[:3]) + more)
     return GateResult("structure", True)
 
 
-def _xmp_lost(before: Snapshot, after: Counter[str]) -> int:
-    """How many of the original XMP's values are gone, As If's own old caption aside.
+def _xmp_lost(before: Snapshot, after: Counter[tuple[bytes, str]]) -> int:
+    """How many of the original XMP's values are gone from their property,
+    As If's own old caption aside.
 
     exiftool reads the XMP into tags and writes it back from them, so a
     value its parser misses (text beside markup, say) vanishes without a
-    warning, and the protected gate, which uses the same parser, can't see
-    it. This compares the packets' own text.
+    warning, and a namespace URI it "fixes" (Windows' MicrosoftPhoto) moves
+    the owner's values into another property, or merges them with one. The
+    protected gate, which uses the same parser, sees neither. This compares
+    the packets' own text, property by property.
     """
     digest = before.tags.get("XMP-asif:CaptionDigest")
     missing = before.xmp - after
-    return sum(n for value, n in missing.items() if not _ours_or_blank(value, digest))
+    return sum(
+        n
+        for (prop, value), n in missing.items()
+        if not (prop == _DC_DESCRIPTION and _ours_or_blank(value, digest))
+    )
 
 
 def _size(before: Snapshot, after: Path) -> GateResult:

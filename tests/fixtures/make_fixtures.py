@@ -489,6 +489,29 @@ def thumbnail_overrun_jpeg(seed: int, overrun: int) -> bytes:
     return b"\xff\xd8" + exif + app2 + jpeg_body(scene_jpeg((320, 240), seed))
 
 
+MICROSOFT_PHOTO = "http://ns.microsoft.com/photo/1.0/"
+"""The namespace Windows (Photo Viewer, File Explorer) puts its rating and
+keyword fields in. exiftool knows it without the final "/", and "fixes" it
+on every write, with a [minor] warning."""
+
+
+def windows_rated_jpeg(seed: int, prefix: str = "MicrosoftPhoto") -> bytes:
+    """A JPEG rated and tagged in Windows Photo Viewer, like the corpus's
+    "Canon EOS REBEL T2i" and "Issue 587": its own MicrosoftPhoto Rating and
+    LastKeywordXMP list in a separate rdf:Description. Some apps name the
+    prefix ``MicrosoftPhoto_1_`` ("Issue 80")."""
+    body = (
+        "<xmp:Rating>3</xmp:Rating>"
+        "<dc:subject><rdf:Bag><rdf:li>piano</rdf:li></rdf:Bag></dc:subject>"
+        f"</rdf:Description><rdf:Description rdf:about='' xmlns:{prefix}='{MICROSOFT_PHOTO}'>"
+        f"<{prefix}:Rating>50</{prefix}:Rating>"
+        f"<{prefix}:LastKeywordXMP><rdf:Bag><rdf:li>piano</rdf:li></rdf:Bag>"
+        f"</{prefix}:LastKeywordXMP>"
+    )
+    xmp = segment(0xE1, XMP_HEADER + xmp_packet("Adobe XMP Core 5.1.0-jc003", body))
+    return b"\xff\xd8" + xmp + jpeg_body(scene_jpeg((320, 240), seed))
+
+
 def png_chunk(ctype: bytes, data: bytes) -> bytes:
     crc = zlib.crc32(ctype + data) & 0xFFFFFFFF
     return struct.pack(">I", len(data)) + ctype + data + struct.pack(">I", crc)

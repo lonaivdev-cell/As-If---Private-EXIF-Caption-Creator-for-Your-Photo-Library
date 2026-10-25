@@ -21,6 +21,7 @@ somebody's photos.
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import re
 import struct
@@ -635,6 +636,7 @@ def _tiff_filler(gap: memoryview, magic: bytes) -> bool:
 # -- XMP text ------------------------------------------------------------------
 
 _RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+_META = "adobe:ns:meta/"
 _XMP_NOTE = "http://ns.adobe.com/xmp/note/"
 # As If's own namespace (asif_ns.config): its record is rewritten every time.
 _ASIF_NS = "http://ns.as-if.invalid/1.0/"
@@ -654,8 +656,8 @@ _XMP_NOT_VALUES = frozenset(
         f"{_RDF} parseType",
         f"{_RDF} nodeID",
         "http://www.w3.org/XML/1998/namespace lang",
-        "adobe:ns:meta/ xmptk",
-        "adobe:ns:meta/ xaptk",
+        f"{_META} xmptk",
+        f"{_META} xaptk",
         _HAS_EXTENDED,
     }
 )
@@ -698,9 +700,10 @@ refuses the write."""
 class XmpText:
     """What every XMP packet in a file says, read with an XML parser."""
 
-    values: Counter[str] = field(repr=False)
-    """Every non-blank text and attribute value, stripped, with how often it
-    occurs. Excluded: RDF syntax, xml:lang, the toolkit name, the
+    values: Counter[tuple[bytes, str]] = field(repr=False)
+    """Every non-blank text and attribute value, stripped, with the property
+    it belongs to (``xmp_property``), as ``(property, value)``, and how
+    often it occurs. Excluded: RDF syntax, xml:lang, the toolkit name, the
     extended-XMP link, and everything in As If's own namespace."""
     problem: str | None = None
     """Why a write can't keep this XMP, or the Content Credentials it links
@@ -710,14 +713,15 @@ class XmpText:
 class _XmpReader:
     """Collects the values of XMP packets, through expat. No DTD, so no entity tricks."""
 
-    def __init__(self, values: Counter[str], links: set[str]) -> None:
+    def __init__(self, values: Counter[tuple[bytes, str]], links: set[str]) -> None:
         self.values, self.links = values, links
         self.markup = False
         self.c2pa_link = False
         self.leftovers = False
         """A packet was followed by leftovers that may hold values."""
-        # Per open element: ([skipped, has children, has text, parseType Literal], text so far).
-        self.stack: list[tuple[list[bool], list[str]]] = []
+        # Per open element: ([skipped, has children, has text, parseType Literal],
+        # text so far, the property its text belongs to).
+        self.stack: list[tuple[list[bool], list[str], bytes]] = []
         self.cdata: list[str] | None = None
         """The text of the CDATA section being read, if any."""
 
@@ -766,31 +770,36 @@ class _XmpReader:
         raise StructureError("the XMP has a DTD, which XMP doesn't allow")
 
     def _flush(self) -> None:
-        flags, text = self.stack[-1]
+        flags, text, prop = self.stack[-1]
         value = "".join(text).strip()
         text.clear()
         if value:
             flags[2] = True
             if not flags[0]:
-                self.values[value] += 1
+                self.values[prop, value] += 1
 
     def _start(self, name: str, attrs: dict[str, str]) -> None:
         skip = name.startswith(_ASIF_NS + " ") or name == _HAS_EXTENDED
         if name == _DCTERMS_PROVENANCE or _DCTERMS_PROVENANCE in attrs:
             self.c2pa_link = True
+        prop = _TOP
         if self.stack:
             self._flush()
             self.stack[-1][0][1] = True
             skip = skip or self.stack[-1][0][0]
+            prop = self.stack[-1][2]
+        prop = _property(prop, name)
         for key, value in attrs.items():
             if key == _HAS_EXTENDED:
                 self.links.add(value.strip())
             elif value.strip() and not (
                 skip or key in _XMP_NOT_VALUES or key.startswith(_ASIF_NS + " ")
             ):
-                self.values[value.strip()] += 1
+                # The attribute form of a property or struct field, or
+                # (rdf:resource) the value of the element it is on.
+                self.values[_property(prop, key), value.strip()] += 1
         literal = attrs.get(f"{_RDF} parseType") == "Literal"
-        self.stack.append(([skip, False, False, literal], []))
+        self.stack.append(([skip, False, False, literal], [], prop))
 
     def _text(self, data: str) -> None:
         if self.stack:
@@ -810,7 +819,7 @@ class _XmpReader:
             self.markup = True
 
     def _end(self, name: str) -> None:
-        flags, text = self.stack[-1]
+        flags, text, _prop = self.stack[-1]
         if name == _HAS_EXTENDED:
             self.links.add("".join(text).strip())
         self._flush()
@@ -821,6 +830,45 @@ class _XmpReader:
         if children and (has_text or literal) and not skipped:
             self.markup = True
         self.stack.pop()
+
+
+_TOP = bytes(16)
+"""The property of a value outside any property (``xmp_property()``)."""
+
+
+def xmp_property(*path: str) -> bytes:
+    """The key ``read_xmp`` files a value under: its property, then the
+    field inside it, and so on, each named by namespace URI, a space and
+    local name (``"http://purl.org/dc/elements/1.1/ description"``).
+
+    A property is named by its namespace URI and local name, so when
+    exiftool "fixes" a namespace (Windows' MicrosoftPhoto URI) every value
+    in it moves to another property. RDF's own syntax (rdf:Description,
+    rdf:Bag, rdf:li, rdf:value, rdf:resource) and the x:xmpmeta wrapper
+    don't count: a property reads the same written as an element or an
+    attribute, in one rdf:Description or several, and a list item belongs
+    to its list. Anything else inside a property is a field of it, so a
+    struct's fields move with a renamed struct, as list items do with a
+    renamed list.
+
+    The key is a fixed-size digest of the whole path, not the path itself:
+    every open element and every value carries one, so a path that grew
+    with each level of nesting (or with the length of a crafted name) would
+    make memory and time grow with the square of the XMP's size.
+    """
+    prop = _TOP
+    for name in path:
+        prop = _property(prop, name)
+    return prop
+
+
+def _property(outer: bytes, name: str) -> bytes:
+    """The key of element or attribute ``name`` inside ``outer`` (the key of
+    the element it is in; ``_TOP`` at the top). See ``xmp_property``."""
+    if name.startswith((f"{_RDF} ", f"{_META} ")):
+        return outer
+    # ``outer`` is always 16 bytes, so no two paths hash the same input.
+    return hashlib.blake2b(outer + name.encode("utf-8", "surrogatepass"), digest_size=16).digest()
 
 
 def read_xmp(data: Buffer) -> XmpText:
@@ -853,7 +901,7 @@ def read_xmp(data: Buffer) -> XmpText:
         else:
             raise StructureError("not a JPEG, PNG, WebP or TIFF file")
 
-    values: Counter[str] = Counter()
+    values: Counter[tuple[bytes, str]] = Counter()
     links: set[str] = set()
     reader = _XmpReader(values, links)
     for packet in packets:

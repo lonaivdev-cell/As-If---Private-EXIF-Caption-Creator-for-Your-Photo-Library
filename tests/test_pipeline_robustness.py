@@ -25,6 +25,7 @@ from asif.pipeline.local import CaptionError, RunSummary, caption_folder, choose
 from asif.pipeline.states import State
 from asif.pipeline.timings import TimingsLog
 from tests.conftest import requires_exiftool
+from tests.fixtures.make_fixtures import windows_rated_jpeg
 
 pytestmark = requires_exiftool
 
@@ -1767,3 +1768,197 @@ def test_a_network_drive_linked_inside_a_local_destination_counts_too(
 )
 def test_which_mounts_count_as_network_drives(fstype: str, shared: bool) -> None:
     assert local._shared_mount(("/mnt/x", fstype, ["rw"])) is shared
+
+
+# -- round 11: the test write before the model ---------------------------------
+
+
+def _photo_files(tmp_path: Path) -> list[Path]:
+    """The photos in the RAM work dir right now (its lock file aside)."""
+    return [p for p in (tmp_path / "ram").rglob("*") if p.is_file() and p.name != ".lock"]
+
+
+@pytest.mark.parametrize("prefix", ["MicrosoftPhoto", "MicrosoftPhoto_1_"])
+def test_a_photo_exiftool_wont_write_as_it_is_is_skipped_before_the_model(
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    # Rated in Windows: every write makes exiftool "fix" the namespace of
+    # Windows' own fields. That doesn't depend on the caption, so it is
+    # found before the model, as a limit of the file, not a bug.
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(6):  # more than the failure budget would allow if these counted as bugs
+        (src / f"rated{i}.jpg").write_bytes(windows_rated_jpeg(50 + i, prefix))
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is None
+    assert runs == []
+    assert {(o.state, o.reason, o.systematic) for o in summary.outcomes} == {
+        (
+            State.SKIPPED_FORMAT,
+            "can't be written safely: a test write showed exiftool would repair or drop "
+            "part of its metadata",
+            False,
+        )
+    }
+    assert not (tmp_path / "out").exists() or not any((tmp_path / "out").iterdir())
+    assert _ram_is_empty(tmp_path)
+
+
+def test_a_test_write_the_gates_refuse_stops_the_run_before_the_model(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A gate refusing the placeholder caption would refuse any caption: a
+    # bug as likely as a limit of the file, so it counts against the
+    # failure budget, as a refused write after the model did. Found before
+    # the model, it costs no model time.
+    from asif.meta.gates import GateResult
+
+    for i in range(5, 8):  # more than the failure budget allows
+        shutil.copy2(photos / "p0.jpg", photos / f"p{i}.jpg")
+    refused = [GateResult("protected", False, "changed: X"), GateResult("structure", False, "")]
+    monkeypatch.setattr(local, "check_written", lambda *_a, **_kw: refused)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is not None and "failure budget" in summary.aborted
+    assert runs == []
+    assert [(o.state, o.reason, o.systematic) for o in summary.outcomes] == 5 * [
+        (
+            State.FAILED_GATE,
+            "gate failed on a test write: protected (changed: X), structure",
+            True,
+        )
+    ]
+    assert _ram_is_empty(tmp_path)
+
+
+def test_no_room_for_the_test_copy_counts_against_the_failure_budget(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The RAM check before the photo's copy left room for the test's: a
+    # RAM work dir that fills up anyway is a problem for every photo.
+    real = local._copy_and_fingerprint
+
+    def full(src: Path, dest: Path) -> Any:
+        if src.parent == dest.parent:  # RAM to RAM: the test copy
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(src, dest)
+
+    for i in range(5, 8):
+        shutil.copy2(photos / "p0.jpg", photos / f"p{i}.jpg")
+    monkeypatch.setattr(local, "_copy_and_fingerprint", full)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert summary.aborted is not None and "failure budget" in summary.aborted
+    assert runs == []
+    assert {(o.state, o.reason, o.systematic) for o in summary.outcomes} == {
+        (
+            State.FAILED_GATE,
+            "couldn't make a test copy in the RAM work dir (No space left on device)",
+            True,
+        )
+    }
+    assert _ram_is_empty(tmp_path)
+
+
+def test_the_test_copy_is_wiped_before_the_model_sees_the_photo(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    written: list[Path] = []
+    real_write = local.apply_write
+    monkeypatch.setattr(
+        local,
+        "apply_write",
+        lambda et, path, *a, **kw: written.append(path) or real_write(et, path, *a, **kw),
+    )
+    seen: list[list[Path]] = []
+    real = local._describe
+
+    def describe(ctx: Any, ram: Path, img: str) -> Any:
+        seen.append(_photo_files(tmp_path))
+        return real(ctx, ram, img)
+
+    monkeypatch.setattr(local, "_describe", describe)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert summary.count(State.CLEAN) == 5
+    assert len(written) == 10  # a test write and the real one for each photo
+    assert len(set(written)) == 10  # each into a file of its own
+    assert len(seen) == 5 and all(len(files) == 1 for files in seen)  # only the photo's copy
+
+
+def test_ctrl_c_during_the_test_write_wipes_both_copies(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(*_a: Any, **_kw: Any) -> Any:
+        assert len(_photo_files(tmp_path)) == 2  # the photo's copy and the test's
+        raise KeyboardInterrupt
+
+    left: list[list[Path]] = []
+    real_process = local._process
+
+    def process(*a: Any, **kw: Any) -> Any:
+        try:
+            return real_process(*a, **kw)
+        except KeyboardInterrupt:
+            left.append(_photo_files(tmp_path))  # before the work dir itself is wiped
+            raise
+
+    monkeypatch.setattr(local, "check_written", interrupted)
+    monkeypatch.setattr(local, "_process", process)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert summary.interrupted
+    assert left == [[]]
+    assert runs == []
+    assert _ram_is_empty(tmp_path)
+
+
+def test_room_for_the_test_write_is_checked_before_copying(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    size = (photos / "p0.jpg").stat().st_size
+    # Three copies fit, which the test write needs at once, but nothing to spare.
+    monkeypatch.setattr(local.RamWorkDir, "free_bytes", lambda self: size * 7 // 2)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert {(o.state, o.reason) for o in summary.outcomes} == {
+        (State.QUARANTINE, "too big for the RAM work dir")
+    }
+    assert runs == []
+
+
+def test_a_dry_run_skips_before_the_model_what_a_real_run_would(
+    photos: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The preview mustn't show captions for photos the real run skips, nor
+    # spend model time on them. The test write only touches the RAM copy.
+    for i in range(2):
+        (photos / f"rated{i}.jpg").write_bytes(windows_rated_jpeg(60 + i))
+    originals = {p: p.read_bytes() for p in photos.iterdir()}
+    written: list[Path] = []
+    real_write = local.apply_write
+    monkeypatch.setattr(
+        local,
+        "apply_write",
+        lambda et, path, *a, **kw: written.append(path) or real_write(et, path, *a, **kw),
+    )
+    runs = _count_model_runs(monkeypatch)
+    preview = _run(photos, tmp_path / "out", cfg, tmp_path, dry_run=True)
+    states = {o.rel: (o.state, o.reason) for o in preview.outcomes}
+    skipped = (
+        State.SKIPPED_FORMAT,
+        "can't be written safely: a test write showed exiftool would repair or drop "
+        "part of its metadata",
+    )
+    assert states["rated0.jpg"] == states["rated1.jpg"] == skipped
+    assert preview.count(State.DESCRIBED) == 5
+    assert len(runs) == 5  # the model never saw the rated photos
+    assert len(written) == 7 and all(p.parent.parent == tmp_path / "ram" for p in written)
+    assert '"test_write"' in (tmp_path / "timings.jsonl").read_text()
+    assert not (tmp_path / "out").exists()
+    assert {p: p.read_bytes() for p in photos.iterdir()} == originals
+    assert _ram_is_empty(tmp_path)
+    # What the real run then does: the same.
+    real = _run(photos, tmp_path / "out", cfg, tmp_path)
+    assert {o.rel: (o.state, o.reason) for o in real.outcomes}["rated0.jpg"] == skipped
+    assert real.count(State.CLEAN) == 5

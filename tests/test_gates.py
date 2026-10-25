@@ -72,11 +72,14 @@ from tests.fixtures.make_fixtures import (
     shared_strips_tiff,
     sony_jpeg,
     thumbnail_overrun_jpeg,
+    windows_rated_jpeg,
     with_mpf,
     xmp_leftovers_png,
 )
 from tests.test_structure import (
     LITERAL,
+    PIER,
+    SAME_VALUES,
     Tiff,
     app11,
     ascii_entry,
@@ -1320,7 +1323,8 @@ def test_xmp_exiftool_cant_carry_over_is_refused_and_caught(
     unflagged = dataclasses.replace(before, unprovable=None)
     results = check_written(et, unflagged, path, compat="xmp")
     assert failing(results) == {"structure"}
-    assert by_name(results)["structure"].detail == "2 of the original XMP's values went missing"
+    detail = by_name(results)["structure"].detail
+    assert detail == "2 of the original XMP's values went missing or moved"
     assert_private(results, "Jane", "Use only")
 
 
@@ -1517,7 +1521,8 @@ def test_cdata_markup_exiftool_cant_carry_over_is_refused(
     # Why: exiftool read the markup as a structure and dropped the value.
     unflagged = dataclasses.replace(before, unprovable=None)
     results = check_written(et, unflagged, path, compat="xmp")
-    assert by_name(results)["structure"].detail == "1 of the original XMP's values went missing"
+    detail = by_name(results)["structure"].detail
+    assert detail == "1 of the original XMP's values went missing or moved"
     assert_private(results, "Lisbon", "old town")
 
 
@@ -2181,7 +2186,8 @@ def test_owner_caption_overwritten_by_exiftool_fails(
     results = check_written(et, before, path, compat="xmp")
     assert failing(results) == {"protected", "structure"}
     assert by_name(results)["protected"].detail == "changed: XMP-dc:Description"
-    assert by_name(results)["structure"].detail == "1 of the original XMP's values went missing"
+    detail = by_name(results)["structure"].detail
+    assert detail == "1 of the original XMP's values went missing or moved"
     assert_private(results, "Grandma")
 
 
@@ -2379,7 +2385,7 @@ def test_xmp_leftovers_holding_nothing_pass(et: ExifTool, tmp_path: Path, compat
     path.write_bytes(xmp_leftovers_png(33, b">"))
     before = snapshot(et, path)
     assert before.unprovable is None
-    assert before.xmp == Counter({"Pier": 1})
+    assert before.xmp == PIER
     legit_write(et, path, compat, before.image_hash)
     assert all_ok(results := check_written(et, before, path, compat=compat)), results
 
@@ -2391,3 +2397,39 @@ def test_xmp_leftovers_that_may_hold_values_are_refused(et: ExifTool, tmp_path: 
     before = snapshot(et, path)
     assert before.unprovable == LEFTOVERS_PROBLEM
     assert not LEFTOVERS_PROBLEM.startswith("its structure can't be checked")  # not quarantined
+
+
+# -- round 11 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fmt", ["jpeg", "tiff"])
+@pytest.mark.parametrize("form", SAME_VALUES)
+def test_xmp_exiftool_writes_back_in_its_own_form_passes(
+    et: ExifTool, fixture_copy: FixtureCopy, form: str, fmt: str
+) -> None:
+    # exiftool turns attributes into elements and puts each namespace in an
+    # rdf:Description of its own: the same properties, so no value moved.
+    path = _with_xmp(fmt, fixture_copy("plain.jpg"), SAME_VALUES[form])
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    legit_write(et, path, "xmp", before.image_hash)
+    assert all_ok(results := check_written(et, before, path, compat="xmp")), results
+
+
+@pytest.mark.parametrize("prefix", ["MicrosoftPhoto", "MicrosoftPhoto_1_"])
+def test_a_namespace_exiftool_rewrites_is_caught(et: ExifTool, tmp_path: Path, prefix: str) -> None:
+    # Windows writes its rating and keywords under ".../photo/1.0/", which
+    # exiftool knows without the final "/". Every write "fixes" it with a
+    # [minor] warning; forced through (-m), each value is still there, but in
+    # another property, and exiftool's own reading can't tell.
+    path = tmp_path / "rated.jpg"
+    path.write_bytes(windows_rated_jpeg(42, prefix))
+    before = snapshot(et, path)
+    assert before.unprovable is None
+    assert not et.execute("-m", "-overwrite_original", "-XMP-dc:Subject+=dog", str(path)).warnings
+    assert b"'http://ns.microsoft.com/photo/1.0'" in path.read_bytes()
+    results = check_written(et, before, path, compat="xmp")
+    assert failing(results) == {"structure"}
+    detail = by_name(results)["structure"].detail
+    assert detail == "2 of the original XMP's values went missing or moved"
+    assert_private(results, "piano")

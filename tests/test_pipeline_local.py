@@ -219,10 +219,55 @@ def test_original_changing_mid_run_is_a_conflict(
 def test_failed_gates_never_write_and_trip_the_failure_budget(
     library: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A bug that fails every write: the test write before the model finds it.
     def failing(*_a: Any, **_kw: Any) -> list[GateResult]:
         return [GateResult("equality", False, "hash differs")]
 
     monkeypatch.setattr(local, "check_written", failing)
+    dest = tmp_path / "out"
+    summary = _run(library, dest, cfg, tmp_path)
+    assert summary.aborted is not None and "failure budget" in summary.aborted
+    # 2% of 200 is 4: the fifth systematic failure stops the run.
+    assert summary.count(State.FAILED_GATE) == 5
+    assert {o.reason for o in summary.outcomes if o.state == State.FAILED_GATE} == {
+        "gate failed on a test write: equality (hash differs)"
+    }
+    assert not dest.exists() or not any(p.is_file() for p in dest.rglob("*"))
+
+
+def test_exiftool_failing_every_write_trips_the_failure_budget(
+    library: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An exiftool that behaves differently from the one As If was built
+    # against, or a bad argument in the writer: not a limit of any one photo.
+    def refused(*_a: Any, **_kw: Any) -> Any:
+        raise local.ExifToolError("exiftool failed", "Warning: Tag 'Nope' is not defined")
+
+    monkeypatch.setattr(local, "apply_write", refused)
+    dest = tmp_path / "out"
+    summary = _run(library, dest, cfg, tmp_path)
+    assert summary.aborted is not None and "failure budget" in summary.aborted
+    assert summary.count(State.FAILED_GATE) == 5
+    assert {o.reason for o in summary.outcomes if o.state == State.FAILED_GATE} == {
+        "exiftool refused a test write"
+    }
+    assert not [o for o in summary.outcomes if "test write" in o.reason and not o.systematic]
+    assert not dest.exists() or not any(p.is_file() for p in dest.rglob("*"))
+
+
+def test_failed_gates_after_the_model_trip_the_failure_budget_too(
+    library: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = local.check_written
+
+    def failing_after_the_model(
+        et: ExifTool, before: Any, path: Path, *, compat: Literal["xmp", "wide"]
+    ) -> list[GateResult]:
+        if b"asiftestwrite" in path.read_bytes():  # the test write before the model passes
+            return real(et, before, path, compat=compat)
+        return [GateResult("equality", False, "hash differs")]
+
+    monkeypatch.setattr(local, "check_written", failing_after_the_model)
     dest = tmp_path / "out"
     summary = _run(library, dest, cfg, tmp_path)
     assert summary.aborted is not None and "failure budget" in summary.aborted
@@ -268,7 +313,16 @@ def test_timings_log_never_mentions_files_or_captions(
             assert caption and caption not in text
             assert caption.split(":")[0] not in text  # not even a fragment ("Stub caption")
     stages = {json.loads(line)["stage"] for line in text.splitlines()}
-    assert {"run_start", "model_load", "open", "infer", "write", "gates", "commit"} <= stages
+    assert {
+        "run_start",
+        "model_load",
+        "open",
+        "test_write",
+        "infer",
+        "write",
+        "gates",
+        "commit",
+    } <= stages
 
 
 def test_discover_ignores_hidden_files_links_and_special_files(library: Path) -> None:

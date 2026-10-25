@@ -9,6 +9,8 @@ Per photo (states from §5 of docs/DESIGN.md)::
 
     copy into RAM (hashing as we go)  -> OPENED
     snapshot: ImageDataHash, tags, bytes
+    test write and gates on a 2nd copy                ([minor] warnings: SKIPPED_FORMAT,
+                                                       else FAILED_GATE; dry runs too)
     model -> JSON -> schema            -> DESCRIBED   (retry <= 2, then QUARANTINE)
     additive-only write on the copy    -> WRITTEN
     gates (equality, protected fields,
@@ -51,13 +53,22 @@ from asif.infer.schema import PROMPT_VERSION, CaptionResult, SchemaError, parse_
 from asif.meta.exiftool import ExifTool, ExifToolError
 from asif.meta.gates import (
     Fingerprint,
+    GateResult,
+    Snapshot,
     all_ok,
     check_source_unchanged,
     check_written,
     fingerprint,
     snapshot,
 )
-from asif.meta.writer import Provenance, WritePlan, apply_write, plan_write, read_existing
+from asif.meta.writer import (
+    ExistingMeta,
+    Provenance,
+    WritePlan,
+    apply_write,
+    plan_write,
+    read_existing,
+)
 from asif.models.manifest import load_manifest
 from asif.pipeline.states import State
 from asif.pipeline.timings import TimingsLog
@@ -1061,6 +1072,79 @@ def _describe(ctx: _Ctx, ram: Path, img: str) -> CaptionResult:
     raise last
 
 
+def _provenance(ctx: _Ctx, source_sha256: str) -> Provenance:
+    return Provenance(
+        tool_version=__version__,
+        model_id=ctx.model.model_id,
+        model_sha256=ctx.model.model_sha256,
+        prompt_version=PROMPT_VERSION,
+        run_id=ctx.run_id,
+        timestamp=datetime.now(UTC).strftime("%Y:%m:%d %H:%M:%SZ"),
+        source_sha256=source_sha256,
+    )
+
+
+_TEST_CAPTION = CaptionResult(
+    caption="As If test write",
+    keywords=("asiftestwrite",),
+    has_text=False,
+    people_count=0,
+    setting="unclear",
+)
+"""The placeholder answer the test write before the model writes."""
+
+
+def _test_write(
+    ctx: _Ctx, rel: str, ram: Path, before: Snapshot, existing: ExistingMeta, prov: Provenance
+) -> ItemOutcome | None:
+    """Write a placeholder caption into a second RAM copy of the photo, planned
+    as the real write will be, and run every gate on it. Returns the photo's
+    outcome if that went wrong, or None if nothing did. The test copy is
+    wiped whatever happens. Raises ``ValueError`` if the writer refuses its
+    own plan, which is a bug.
+
+    Only exiftool's "minor" warnings are a limit of this file. Anything else
+    (exiftool failing, a gate refusing the write, no room for the copy) would
+    have failed the real write too, and is as likely a bug that hits every
+    photo: it counts against the failure budget, as it did after the model.
+    """
+    lang, compat = ctx.cfg.general.caption_lang, ctx.cfg.general.compat
+    plan = plan_write(
+        existing, _TEST_CAPTION, lang=lang, compat=compat, image_hash=before.image_hash
+    )
+    test = ctx.work.new_path(ram.suffix)
+    try:
+        try:
+            _copy_and_fingerprint(ram, test)
+        except OSError as exc:
+            why = f"couldn't make a test copy in the RAM work dir ({exc.strerror or exc})"
+            return ItemOutcome(rel, State.FAILED_GATE, why, systematic=True)
+        try:
+            apply_write(ctx.et, test, plan, prov, lang=lang)
+        except ExifToolError as exc:
+            if _only_minor_warnings(exc.stderr):
+                why = (
+                    "can't be written safely: a test write showed exiftool would repair "
+                    "or drop part of its metadata"
+                )
+                return ItemOutcome(rel, State.SKIPPED_FORMAT, why)
+            return ItemOutcome(
+                rel, State.FAILED_GATE, "exiftool refused a test write", systematic=True
+            )
+        gates = check_written(ctx.et, before, test, compat=compat)
+        if not all_ok(gates):
+            why = f"gate failed on a test write: {_failed_gates(gates)}"
+            return ItemOutcome(rel, State.FAILED_GATE, why, systematic=True)
+        return None
+    finally:
+        wipe_file(test)
+
+
+def _failed_gates(gates: list[GateResult]) -> str:
+    """The gates that failed, with why, as "protected (changed: X), structure"."""
+    return ", ".join(f"{g.name} ({g.detail})" if g.detail else g.name for g in gates if not g.ok)
+
+
 def _only_minor_warnings(stderr: str) -> bool:
     """True if exiftool only objected to this file's own metadata.
 
@@ -1329,7 +1413,10 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         forced = ctx.forced.get(_nearest_existing(dest.parent, ctx.dest_root), 0)
         if forced & ~_copy_mode(ctx, src, src_st, dest):
             return ItemOutcome(rel, State.FAILED_UPLOAD, _MODE_NOT_KEPT)
-    if size * 3 > ctx.work.free_bytes():
+    # The test write puts three copies in RAM at once: the photo's, the
+    # test's and the new file exiftool writes for it, which can come out
+    # bigger. Room for a fourth leaves some to spare.
+    if size * 4 > ctx.work.free_bytes():
         return ItemOutcome(rel, State.QUARANTINE, "too big for the RAM work dir")
 
     ram = ctx.work.new_path(suffix)
@@ -1365,6 +1452,30 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
                 rel, State.SKIPPED_FORMAT, f"can't be written safely: {before.unprovable}"
             )
 
+        lang = ctx.cfg.general.caption_lang
+        compat = ctx.cfg.general.compat
+        try:
+            existing = read_existing(ctx.et, ram)
+        except (ExifToolError, ValueError):
+            return ItemOutcome(
+                rel, State.FAILED_GATE, "couldn't read the existing metadata", systematic=True
+            )
+        # A write that fails whatever the caption fails now, not after the
+        # model: a limit of this file is skipped, anything else stops the run
+        # sooner. Only a copy in RAM is written, so a dry run tests too: it
+        # shows what a real run would do.
+        try:
+            with ctx.log.timed("test_write", img) as ev:
+                prov = _provenance(ctx, fp_then.sha256)
+                tested = _test_write(ctx, rel, ram, before, existing, prov)
+                ev["ok"] = tested is None
+        except ValueError:
+            return ItemOutcome(
+                rel, State.FAILED_GATE, "exiftool refused the write", systematic=True
+            )
+        if tested is not None:
+            return tested
+
         try:
             result = _describe(ctx, ram, img)
         except SchemaError:
@@ -1379,14 +1490,11 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
                 return ItemOutcome(rel, State.QUARANTINE, "the image can't be decoded (corrupt?)")
             raise
 
-        lang = ctx.cfg.general.caption_lang
-        compat = ctx.cfg.general.compat
         try:
-            existing = read_existing(ctx.et, ram)
             plan = plan_write(
                 existing, result, lang=lang, compat=compat, image_hash=before.image_hash
             )
-        except (ExifToolError, ValueError):
+        except ValueError:
             return ItemOutcome(
                 rel, State.FAILED_GATE, "couldn't read the existing metadata", systematic=True
             )
@@ -1394,15 +1502,7 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         if ctx.dry_run:
             return ItemOutcome(rel, State.DESCRIBED, plan.caption_reason, result=result, plan=plan)
 
-        prov = Provenance(
-            tool_version=__version__,
-            model_id=ctx.model.model_id,
-            model_sha256=ctx.model.model_sha256,
-            prompt_version=PROMPT_VERSION,
-            run_id=ctx.run_id,
-            timestamp=datetime.now(UTC).strftime("%Y:%m:%d %H:%M:%SZ"),
-            source_sha256=fp_then.sha256,
-        )
+        prov = _provenance(ctx, fp_then.sha256)
         try:
             with ctx.log.timed("write", img):
                 record = apply_write(ctx.et, ram, plan, prov, lang=lang)
@@ -1429,10 +1529,8 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             gates = check_written(ctx.et, before, ram, compat=compat)
             ev["ok"] = all_ok(gates)
         if not all_ok(gates):
-            names = ", ".join(
-                f"{g.name} ({g.detail})" if g.detail else g.name for g in gates if not g.ok
-            )
-            return ItemOutcome(rel, State.FAILED_GATE, f"gate failed: {names}", systematic=True)
+            why = f"gate failed: {_failed_gates(gates)}"
+            return ItemOutcome(rel, State.FAILED_GATE, why, systematic=True)
 
         try:
             unchanged = check_source_unchanged(fp_then, fingerprint(src))
