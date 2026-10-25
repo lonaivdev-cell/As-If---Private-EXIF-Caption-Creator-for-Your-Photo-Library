@@ -5,7 +5,7 @@ A model on *your* machine describes each photo, and the description and keywords
 
 - 🔒 **Offline by design.** The model runs locally, in its own process. The main `asif` process has no network code at all, and any Python code in it that tries to open a socket crashes it.
 - 🧾 **Your data stays yours.** It only *adds* to empty fields and never overwrites your own captions or keywords. The file itself records exactly what As If added, so `asif undo` (M6) can remove just that.
-- 🛡️ **Your pixels stay as they are.** Before any copy is written, As If proves the image data, dates, GPS, orientation, colour profile, previews and the rest of your metadata are unchanged. For JPEG, PNG and WebP that means every byte outside the caption; a file it can't prove that for is skipped, not risked.
+- 🛡️ **Your pixels stay as they are.** Before any copy is written, As If proves the image data, dates, GPS, orientation, colour profile, previews and the rest of your metadata are unchanged. For JPEG, PNG and WebP that means every byte outside the XMP packet (and the IPTC block with `--compat wide`), and every value you had inside it (exiftool does rewrite the packet's layout); a file it can't prove that for is skipped, not risked.
 
 > **Status: early (M0 + M1 of 11).** It captions a local folder into a separate folder of copies. Cloud sync, sandboxing, encryption and search are designed but not built yet. See [Status](#status).
 

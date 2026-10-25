@@ -402,3 +402,43 @@ def test_a_dry_run_shows_finished_photos_as_done(
     states = {o.rel: o.state for o in preview.outcomes}
     assert all(states[rel] == State.SKIPPED_DONE for rel in finished)
     assert len(calls) == sum(1 for s in states.values() if s == State.DESCRIBED)
+
+
+def test_links_to_folders_already_in_the_library_arent_reported(tmp_path: Path) -> None:
+    src = tmp_path / "lib"
+    (src / "2024" / "best").mkdir(parents=True)
+    (src / ".private" / "x").mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (src / "Favourites").symlink_to(src / "2024" / "best")  # a shortcut: walked anyway
+    (src / "all").symlink_to(src)
+    (src / "hidden-ones").symlink_to(src / ".private" / "x")  # never walked
+    (src / "phone").symlink_to(outside)
+    assert discover(src).linked_dirs == ["hidden-ones", "phone"]
+
+
+def test_a_folder_that_cant_be_opened_is_a_clean_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src, dest = tmp_path / "partner" / "Pictures", tmp_path / "out"
+    real_is_dir, real_exists = Path.is_dir, Path.exists
+
+    def is_dir(self: Path, *a: Any, **kw: Any) -> bool:
+        if self == src:
+            raise PermissionError(13, "Permission denied")
+        return real_is_dir(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    with pytest.raises(CaptionError, match="can't open the source folder"):
+        check_folders(src, dest)
+    src.mkdir(parents=True)
+    monkeypatch.setattr(Path, "is_dir", real_is_dir)
+
+    def exists(self: Path, *a: Any, **kw: Any) -> bool:
+        if self == dest:
+            raise PermissionError(13, "Permission denied")
+        return real_exists(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    with pytest.raises(CaptionError, match="can't open the destination folder"):
+        check_folders(src, dest)

@@ -238,3 +238,26 @@ def test_macos_mount_output_is_read() -> None:
     table = workdir.parse_macos_mounts(out)
     assert ("/Volumes/Photo Library", "smbfs", ["nodev", "nosuid", "mounted by me"]) in table
     assert table[0][:2] == ("/", "apfs")
+
+
+def test_macos_mount_points_match_whatever_case_was_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+    from types import SimpleNamespace
+
+    from asif import workdir
+
+    out = (
+        "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+        "//me@nas/Photos on /Volumes/Photos (smbfs, nodev, nosuid, mounted by me)\n"
+    )
+    monkeypatch.setattr(workdir.sys, "platform", "darwin")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout=out))
+    missing = tmp_path / "no-proc-mounts"
+    for typed in ("/Volumes/Photos/x", "/volumes/photos/x", "/Volumes/PHOTOS"):
+        assert workdir.mount_of(typed, missing) == (
+            "/Volumes/Photos",
+            "smbfs",
+            ["nodev", "nosuid", "mounted by me"],
+        )

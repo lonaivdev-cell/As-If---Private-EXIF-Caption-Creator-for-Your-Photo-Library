@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -274,6 +275,14 @@ def parse_macos_mounts(out: str) -> list[tuple[str, str, list[str]]]:
     return table
 
 
+def _mount_key(path: str) -> str:
+    """``path`` as the filesystem compares it: on macOS, ignoring case and
+    Unicode form (APFS, HFS+ and smbfs do; ``resolve()`` keeps what was typed)."""
+    if sys.platform != "darwin":
+        return path
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
+
+
 def mount_of(
     entry: str, mounts_file: Path = Path("/proc/mounts")
 ) -> tuple[str, str, list[str]] | None:
@@ -286,10 +295,11 @@ def mount_of(
     table = _mount_table(mounts_file)
     if table is None:
         return None
+    key = _mount_key(entry)
     best: tuple[int, str, str, list[str]] | None = None
     for mount_point, fstype, options in table:
-        prefix = mount_point.rstrip("/") + "/"
-        if entry == mount_point or entry.startswith(prefix):
+        point = _mount_key(mount_point)
+        if key == point or key.startswith(point.rstrip("/") + "/"):
             depth = len(Path(mount_point).parts)
             # ">=": the mount listed last on the same path is the one on top.
             if best is None or depth >= best[0]:

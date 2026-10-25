@@ -190,7 +190,11 @@ def check_folders(src: Path, dest: Path) -> tuple[Path, Path]:
     """Resolve and sanity-check the source and destination folders."""
     src = src.expanduser().resolve()
     dest = dest.expanduser().resolve()
-    if not src.is_dir():
+    try:
+        src_is_dir = src.is_dir()
+    except OSError as exc:
+        raise CaptionError(f"can't open the source folder {src}: {exc.strerror}") from exc
+    if not src_is_dir:
         raise CaptionError(f"source folder not found: {src}")
     if dest == src:
         raise CaptionError(
@@ -201,7 +205,11 @@ def check_folders(src: Path, dest: Path) -> tuple[Path, Path]:
         raise CaptionError("the destination can't be inside the source folder")
     if dest in src.parents:
         raise CaptionError("the source can't be inside the destination folder")
-    if dest.exists() and not dest.is_dir():
+    try:
+        not_a_folder = dest.exists() and not dest.is_dir()
+    except OSError as exc:
+        raise CaptionError(f"can't open the destination folder {dest}: {exc.strerror}") from exc
+    if not_a_folder:
         raise CaptionError(f"the destination exists and isn't a folder: {dest}")
     return src, dest
 
@@ -232,10 +240,21 @@ def discover(src: Path) -> Discovery:
         where = Path(exc.filename) if exc.filename else src
         unreadable.append(where.relative_to(src).as_posix() if where != src else ".")
 
+    real_src = os.path.realpath(src)
     for root, dirs, files in os.walk(src, followlinks=False, onerror=on_error):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         for name in dirs:
-            if os.path.islink(os.path.join(root, name)):
+            full = os.path.join(root, name)
+            if not os.path.islink(full):
+                continue
+            # A link to a folder that is walked anyway (a shortcut inside the
+            # library) loses nothing; any other is reported, never followed.
+            target = os.path.realpath(full)
+            inside = target == real_src or target.startswith(real_src.rstrip(os.sep) + os.sep)
+            hidden = any(
+                part.startswith(".") for part in Path(os.path.relpath(target, real_src)).parts
+            )
+            if not inside or hidden:
                 linked.append((Path(root) / name).relative_to(src).as_posix())
         for name in sorted(files):
             path = Path(root) / name
