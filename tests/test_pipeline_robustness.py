@@ -794,7 +794,7 @@ def test_a_stop_while_the_copy_is_placed_leaves_nothing_behind(
     with pytest.raises(KeyboardInterrupt):
         local._commit(ram, dest, 0o644, expect_sha="0" * 64)
     assert not dest.exists()
-    assert not list(dest.parent.iterdir())
+    assert not dest.parent.exists()  # nor the folder made for it
 
 
 def test_one_unwritable_subfolder_doesnt_stop_the_run(
@@ -1108,7 +1108,7 @@ def test_a_copy_that_fails_its_read_back_is_removed_on_any_filesystem(
     dest = tmp_path / "out" / "a.jpg"
     with pytest.raises(local._ReadBackMismatch):
         local._commit(ram, dest, 0o644, expect_sha="0" * 64)
-    assert not list(dest.parent.iterdir())
+    assert not dest.parent.exists()  # nor the folder made for it
 
 
 def _nfs4_acl(*aces: tuple[int, int, bytes]) -> bytes:
@@ -1146,7 +1146,7 @@ def test_an_nfs4_acl_that_stays_is_refused(tmp_path: Path, monkeypatch: pytest.M
     dest = tmp_path / "out" / "a.jpg"
     with pytest.raises(local._InheritedAcl):
         local._commit(ram, dest, 0o640)
-    assert not list(dest.parent.iterdir())
+    assert not dest.parent.exists()  # nor the folder made for it
 
 
 # -- round 5 -----------------------------------------------------------------
@@ -1185,29 +1185,38 @@ def test_the_owner_of_a_folder_above_the_destination_counts(open_dir: Path) -> N
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="needs a folder owned by someone else")
-def test_our_own_folder_seen_through_an_id_mapping_is_not_someone_elses(
-    open_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # sshfs or NFS can show our own folder with the server's numbers.
+def test_a_folder_shown_as_someone_elses_counts_as_theirs(open_dir: Path) -> None:
+    # On a share it may be our own account under another number, or an
+    # all_squash export every local user gets into: no telling, so refused.
     src = _folder(open_dir / "private", 0o700)
     dest = _folder(open_dir / "nas" / "captioned", 0o700)
     os.chown(dest, 65534, -1)
-    monkeypatch.setattr(local.os, "geteuid", lambda: 1000)  # as a normal user
-    assert not local._more_people_can_list(dest, src)
-    dest.chmod(0o733)  # but one others can write in is really someone else's
     assert local._more_people_can_list(dest, src)
 
 
-def test_a_fuse_mount_only_we_can_enter_is_private(
+def test_fuse_mounts_are_judged_by_who_can_get_in(
     open_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     src = _folder(open_dir / "private", 0o700)
-    dest = _folder(open_dir / "mnt" / "nas", 0o755)
+    home = _folder(open_dir / "home", 0o700)  # nobody else gets past this here...
+    mount = _folder(home / "nas", 0o755)
+    dest = _folder(mount / "captioned", 0o755)
+    sshfs = (str(mount), "fuse.sshfs", ["rw", "user_id=0"])
+    monkeypatch.setattr(
+        local, "mount_of", lambda entry: sshfs if entry.startswith(str(mount)) else None
+    )
+    # ...but the share's other users see the folder as the share shows it.
     assert local._more_people_can_list(dest, src)
-    monkeypatch.setattr(local, "mount_of", lambda entry: ("fuse.sshfs", ["rw", "user_id=0"]))
+    dest.chmod(0o700)
     assert not local._more_people_can_list(dest, src)
-    assert local._reach_mask(dest) == 0o700  # an original there is private too
-    monkeypatch.setattr(local, "mount_of", lambda entry: ("fuse.sshfs", ["rw", "allow_other"]))
+    # An original on a mount only we can enter is private, whatever its modes.
+    assert local._more_people_can_list(_folder(open_dir / "pub", 0o755), mount)
+    assert local._reach_mask(mount) == 0o700
+    # allow_other without default_permissions: every local user gets in as the share's account.
+    unchecked = (str(mount), "fuse.sshfs", ["rw", "allow_other"])
+    monkeypatch.setattr(
+        local, "mount_of", lambda e: unchecked if e.startswith(str(mount)) else None
+    )
     assert local._more_people_can_list(dest, src)
 
 
@@ -1460,3 +1469,97 @@ def test_a_destination_root_we_cant_write_in_still_takes_copies_in_our_folders(
     summary = _run(src, dest, cfg, tmp_path)
     assert summary.aborted is None
     assert _states(summary) == {"2024/a.jpg": State.CLEAN, "b.jpg": State.FAILED_UPLOAD}
+
+
+# -- round 6 -----------------------------------------------------------------
+
+
+def test_a_drive_unmounted_from_its_mount_point_stops_the_run(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg", "b.jpg", "c.jpg")
+    dest = tmp_path / "nas"
+
+    def unmount(outcome: Any, index: int, total: int) -> None:
+        if index == 1:  # the share goes; its empty mount point stays behind
+            dest.rename(tmp_path / "was-mounted")
+            dest.mkdir()
+
+    summary = _run(src, dest, cfg, tmp_path, on_progress=unmount)
+    assert summary.aborted is not None and "is gone" in summary.aborted
+    assert not list(dest.iterdir())  # nothing landed on the disk underneath
+
+
+@pytest.mark.parametrize("err", [errno.ENOTCONN, errno.EIO])
+def test_a_share_that_stops_answering_stops_the_run_cleanly(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, err: int
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg", "b.jpg", "c.jpg")
+    dest = tmp_path / "nas"
+    dropped = {"now": False}
+    real_stat = os.stat
+
+    def stat(path: Any, *a: Any, **kw: Any) -> os.stat_result:
+        if dropped["now"] and str(path).startswith(str(dest)):
+            raise OSError(err, os.strerror(err))
+        return real_stat(path, *a, **kw)
+
+    def drop(outcome: Any, index: int, total: int) -> None:
+        dropped["now"] = True
+
+    monkeypatch.setattr(local.os, "stat", stat)
+    summary = _run(src, dest, cfg, tmp_path, on_progress=drop)
+    assert summary.aborted is not None and summary.aborted.endswith("nothing more will be written")
+    assert len(summary.outcomes) == 2
+
+
+def test_a_private_folder_isnt_copied_onto_a_drive_that_cant_keep_it_private(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(
+        fixtures_dir, _folder(open_dir / "public", 0o755), "open.jpg", "Private/sub/a.jpg"
+    )
+    (src / "open.jpg").chmod(0o644)
+    (src / "Private").chmod(0o700)
+    dest = open_dir / "usb"
+    _forced_modes(monkeypatch, dest)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(src, dest, cfg, tmp_path)
+    assert _states(summary) == {"open.jpg": State.CLEAN, "Private/sub/a.jpg": State.FAILED_UPLOAD}
+    assert len(runs) == 1  # refused before the model ran
+    assert not (dest / "Private").exists()  # its name never shows up there
+
+
+def test_a_copy_that_cant_be_kept_private_never_holds_a_byte(
+    open_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = open_dir / "usb" / "Private" / "a.jpg"
+    _folder(open_dir / "usb", 0o755)
+    _forced_modes(monkeypatch, open_dir / "usb")
+    sizes: list[int] = []
+    real = local._kept_private
+
+    def spy(fd: int, mode: int, folder: Path) -> None:
+        sizes.append(os.fstat(fd).st_size)
+        real(fd, mode, folder)
+
+    monkeypatch.setattr(local, "_kept_private", spy)
+    ram = open_dir / "ram.jpg"
+    ram.write_bytes(b"private bytes")
+    with pytest.raises(local._ModeNotKept):
+        local._commit(ram, dest, 0o600)
+    assert sizes == [0]
+    assert not dest.parent.exists()  # the folder made for it is gone again
+
+
+def test_a_share_that_shows_our_files_as_someone_elses_still_takes_copies(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The kernel won't let a non-owner remove an ACL: EPERM, not a failure.
+    def removexattr(*a: Any) -> None:
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(local.os, "removexattr", removexattr, raising=False)
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg")
+    summary = _run(src, tmp_path / "out", cfg, tmp_path)
+    assert _states(summary) == {"a.jpg": State.CLEAN}

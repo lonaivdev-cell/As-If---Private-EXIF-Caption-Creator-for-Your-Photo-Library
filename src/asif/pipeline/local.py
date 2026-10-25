@@ -382,7 +382,7 @@ def _reach_mask(path: Path) -> int:
         gid = path.resolve().stat().st_gid
     except OSError:
         return 0o700
-    if _private_mount(path.resolve()):
+    if _private_mount(mount_of(str(path.resolve()))):
         return 0o700  # only we can enter that mount
     if _has_acl(path):
         mask &= ~0o070
@@ -447,14 +447,51 @@ def _someone_else(uid: int) -> bool:
     return uid not in (os.getuid(), 0)
 
 
-def _private_mount(path: Path) -> bool:
-    """Is resolved ``path`` on a FUSE mount only the user who mounted it can enter?
+Mount = tuple[str, str, list[str]] | None  # mount point, type, options
+
+
+def _private_mount(mount: Mount) -> bool:
+    """Is it a FUSE mount only the user who mounted it can enter?
 
     sshfs, rclone and the like mount that way unless told ``allow_other``,
-    and since As If can enter it, that user is us.
+    and since As If can get in, that user is us. (Only on this computer:
+    the share's other users still see what the share lets them.)
     """
-    mount = mount_of(str(path))
-    return mount is not None and mount[0].startswith("fuse") and "allow_other" not in mount[1]
+    return mount is not None and mount[1].startswith("fuse") and "allow_other" not in mount[2]
+
+
+def _modes_unenforced(mount: Mount) -> bool:
+    """Is it a FUSE mount every local user can enter, whatever the modes say?
+
+    With ``allow_other`` but not ``default_permissions`` the kernel doesn't
+    check permissions at all: everyone gets in as the mount's own account.
+    """
+    return (
+        mount is not None
+        and mount[1].startswith("fuse")
+        and "allow_other" in mount[2]
+        and "default_permissions" not in mount[2]
+    )
+
+
+# Filesystems that other computers' users get to as well: network shares,
+# and FUSE ones, which mostly are network or cloud storage. For a folder on
+# one, the folders above its mount point keep none of them out.
+_SHARED_FSTYPES = ("nfs", "cifs", "smb", "ceph", "gluster", "afs", "davfs", "lustre", "9p", "fuse")
+_LOCAL_FUSE = ("fuseblk", "fuse.gocryptfs", "fuse.encfs", "fuse.cryfs", "fuse.securefs")
+
+
+def _shared_mount(mount: Mount) -> bool:
+    return (
+        mount is not None
+        and mount[1].startswith(_SHARED_FSTYPES)
+        and not mount[1].startswith(_LOCAL_FUSE)
+    )
+
+
+def _within(path: Path, mount_point: str) -> bool:
+    entry = str(path)
+    return entry == mount_point or entry.startswith(mount_point.rstrip("/") + "/")
 
 
 # POSIX ACL entry tags, as in system.posix_acl_access.
@@ -593,20 +630,21 @@ def _folder_audience(folder: Path, *, wide: bool, bits: int = 0o444) -> int:
     Symlinks are followed: what counts is the folder the names end up in.
     """
     real = folder.resolve()
-    if _private_mount(real):
-        return _NOBODY
+    mount = mount_of(str(real))
+    if not wide and _private_mount(mount):
+        return _NOBODY  # no one else on this computer gets in
+    if wide and _modes_unenforced(mount):
+        return _ANYONE
     st = real.stat()
     audience = _audience(real, bits, wide=wide)
-    if (
-        wide
-        and _someone_else(st.st_uid)
-        and (os.geteuid() == 0 or st.st_mode & 0o022 or _has_acl(real))
-    ):
-        # Someone else's folder that others can write in: its owner lists it
-        # too. (Someone else's 0700 folder we can write in is our own, seen
-        # through an ID mapping: sshfs, NFS.)
+    if wide and _someone_else(st.st_uid):
+        # Someone else's folder: they can list it too. (On a share that may
+        # be our own account, shown by another number; there's no telling.)
         audience = _ANYONE
+    shared = wide and _shared_mount(mount)
     for parent in real.parents:
+        if shared and mount is not None and not _within(parent, mount[0]):
+            break  # the share's other users never pass through these
         search = _audience(parent, 0o111, wide=wide)
         if wide and _someone_else(parent.stat().st_uid):
             search = _ANYONE  # its owner gets through, whatever the bits say
@@ -647,6 +685,16 @@ class _ModeNotKept(Exception):
     """The destination gave a copy more read access than As If set (a FAT or
     exFAT drive, or a network share, whose permissions are fixed when mounted)."""
 
+    def __init__(self, forced: int) -> None:
+        super().__init__(oct(forced))
+        self.forced = forced
+
+
+_MODE_NOT_KEPT = (
+    "the destination would let other users read the copy (it gives every file the "
+    "same permissions), but not the original"
+)
+
 
 class _FolderRefused(Exception):
     """The destination can't hold a folder by this name (or a file inside it)."""
@@ -669,7 +717,7 @@ def _kept_private(fd: int, mode: int, folder: Path) -> None:
             raise _InheritedAcl
     forced = stat.S_IMODE(os.fstat(fd).st_mode) & 0o044 & ~mode
     if forced and _folder_audience(folder, wide=True, bits=0o111) != _NOBODY:
-        raise _ModeNotKept
+        raise _ModeNotKept(forced)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -699,17 +747,21 @@ def _make_private_dirs(path: Path, root: Path | None = None) -> list[Path]:
             raise FileNotFoundError(errno.ENOENT, "the destination folder is gone", str(root))
         missing.append(path)
         path = path.parent
-    created = []
-    for folder in reversed(missing):
-        try:
-            os.mkdir(folder, 0o700)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            if exc.errno in _PER_PATH_ERRNOS:
-                raise _FolderRefused(folder, exc) from exc
-            raise
-        created.append(folder)
+    created: list[Path] = []
+    try:
+        for folder in reversed(missing):
+            try:
+                os.mkdir(folder, 0o700)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                if exc.errno in _PER_PATH_ERRNOS:
+                    raise _FolderRefused(folder, exc) from exc
+                raise
+            created.append(folder)
+    except BaseException:
+        _remove_created(created)
+        raise
     return created
 
 
@@ -739,7 +791,9 @@ def _no_wider_than_the_original(fd: int, mode: int, gid: int | None) -> int:
         try:
             removexattr(fd, "system.posix_acl_access")
         except OSError as exc:
-            if exc.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+            # EPERM: the file shows as someone else's (an ID-mapped share).
+            # An ACL left on it is neutralised by ``_kept_private``.
+            if exc.errno not in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EPERM):
                 raise
     if gid is not None and os.fstat(fd).st_gid != gid:
         try:
@@ -747,6 +801,22 @@ def _no_wider_than_the_original(fd: int, mode: int, gid: int | None) -> int:
         except OSError:
             mode &= ~0o070
     return mode
+
+
+def _check_root(root: Path | None, root_id: tuple[int, int] | None) -> None:
+    """Raise if ``root`` is no longer the folder the run started with.
+
+    A drive unmounted from it leaves an empty folder of the same name on
+    the disk underneath, which mustn't get the copies.
+    """
+    if root is None or root_id is None:
+        return
+    try:
+        st = os.stat(root)
+    except OSError as exc:
+        raise FileNotFoundError(errno.ENOENT, "the destination folder is gone", str(root)) from exc
+    if (st.st_dev, st.st_ino) != root_id:
+        raise FileNotFoundError(errno.ENOENT, "the destination folder is gone", str(root))
 
 
 def _commit(
@@ -757,6 +827,7 @@ def _commit(
     gid: int | None = None,
     expect_sha: str | None = None,
     root: Path | None = None,
+    root_id: tuple[int, int] | None = None,
 ) -> bool:
     """Write ``ram_copy`` to ``dest`` without ever replacing an existing file.
 
@@ -766,40 +837,41 @@ def _commit(
     FUSE mounts such as rclone) it falls back to an exclusive create.
     The temp name is short and fixed-length, so a long photo name can't push
     it past the filesystem's name limit. The copy gets ``mode``, the
-    original's group ``gid`` (or no group access) and no inherited ACL;
-    ``_InheritedAcl`` is raised if an NFSv4 ACL would still let others read
-    it, and ``_ModeNotKept`` if the destination gives it more read access
-    than ``mode`` anyway. Folders created for it are then removed again.
+    original's group ``gid`` (or no group access) and no inherited ACL,
+    all before it holds a byte; ``_InheritedAcl`` is raised if an NFSv4 ACL
+    would still let others read it, and ``_ModeNotKept`` if the destination
+    gives it more read access than ``mode`` anyway. Folders created for a
+    copy that isn't placed are removed again, and nothing is written once
+    ``root`` isn't the folder with ``root_id`` any more.
 
     With ``expect_sha``, the placed copy is read back and must hash to it,
     or ``_ReadBackMismatch`` is raised. A copy that was placed but not
     confirmed (mismatch, error, Ctrl+C, even mid-placement) is removed again,
     so nothing unverified is ever left for a later run to take as done.
     """
+    _check_root(root, root_id)
     created = _make_private_dirs(dest.parent, root)
     tmp = dest.parent / f".asif-{secrets.token_hex(8)}.tmp"
+    done = False
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except OSError as exc:
-        if exc.errno in _PER_PATH_ERRNOS - {errno.EEXIST}:
-            raise _FolderRefused(dest.parent, exc) from exc  # the temp name is short and plain
-        raise
-    try:
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            if exc.errno in _PER_PATH_ERRNOS - {errno.EEXIST}:
+                raise _FolderRefused(dest.parent, exc) from exc  # the temp name is short and plain
+            raise
         with ram_copy.open("rb") as fin, os.fdopen(fd, "wb") as fout:
             mode = _no_wider_than_the_original(fout.fileno(), mode, gid)
+            os.fchmod(fout.fileno(), mode & 0o777)
+            _kept_private(fout.fileno(), mode, dest.parent)
             while chunk := fin.read(_COPY_CHUNK):
                 fout.write(chunk)
             fout.flush()
             os.fsync(fout.fileno())
-            os.fchmod(fout.fileno(), mode & 0o777)
-            try:
-                _kept_private(fout.fileno(), mode, dest.parent)
-            except (_InheritedAcl, _ModeNotKept):
-                _remove_created(created)
-                raise
         st = ram_copy.stat()
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         ours = os.stat(tmp)
+        _check_root(root, root_id)  # once more, just before it's placed
         placed = False
         try:
             try:
@@ -828,9 +900,12 @@ def _commit(
                 if placed or os.path.samestat(os.stat(dest, follow_symlinks=False), ours):
                     dest.unlink()
             raise
+        done = True
         return True
     finally:
         tmp.unlink(missing_ok=True)
+        if not done:
+            _remove_created(created)
 
 
 Done = Literal["done", "stale", "no", "unknown"]
@@ -890,6 +965,10 @@ class _Ctx:
     """Destination folders As If found it can't use, and why."""
     usable: set[Path] = field(default_factory=set)
     """Destination folders a test file could be written to (and kept private) in."""
+    forced: dict[Path, int] = field(default_factory=dict)
+    """Read bits destination folders give every new file, where others can get to it."""
+    dest_id: tuple[int, int] | None = None
+    """The destination folder's (device, inode) when the run started."""
 
 
 def _describe(ctx: _Ctx, ram: Path, img: str) -> CaptionResult:
@@ -973,10 +1052,8 @@ def _destination_problem(ctx: _Ctx, rel: str, dest: Path, exc: OSError) -> ItemO
     # Permission denied is one folder's answer (someone else's in a shared
     # destination, or a 0700 one from another user's run): skip that folder,
     # not the run. Folders below it that the user can write to still work.
-    if not ctx.dest_root.is_dir():
-        raise _DestinationError(
-            f"the destination folder {ctx.dest_root} is gone (unplugged or unmounted?)"
-        ) from exc
+    if _dest_gone(ctx):
+        raise _DestinationError(_gone(ctx)) from exc
     if exc.errno == errno.EACCES:
         folder = _nearest_existing(dest.parent, ctx.dest_root)
         return _block(ctx, rel, folder, f"can't write into {_shown(ctx, folder)}")
@@ -1017,6 +1094,19 @@ def _permissions_not_kept(dest: Path, src: Path) -> bool:
         raise _SourceUnreadable(exc) from exc
 
 
+def _dest_gone(ctx: _Ctx) -> bool:
+    """Is the destination folder gone, or no longer the one the run started with?"""
+    try:
+        st = os.stat(ctx.dest_root)
+    except OSError:
+        return True
+    return ctx.dest_id is not None and (st.st_dev, st.st_ino) != ctx.dest_id
+
+
+def _gone(ctx: _Ctx) -> str:
+    return f"the destination folder {ctx.dest_root} is gone (unplugged or unmounted?)"
+
+
 def _try_folder(ctx: _Ctx, rel: str, dest: Path) -> ItemOutcome | None:
     """Make sure a copy can go where ``dest`` is, before the model runs.
 
@@ -1024,6 +1114,8 @@ def _try_folder(ctx: _Ctx, rel: str, dest: Path) -> ItemOutcome | None:
     would be created in: a folder that refuses it, or gives it access rules
     As If can't remove, is skipped without spending a model run per photo.
     """
+    if _dest_gone(ctx):
+        raise _DestinationError(_gone(ctx))
     folder = _nearest_existing(dest.parent, ctx.dest_root)
     if folder in ctx.usable:
         return None
@@ -1039,8 +1131,8 @@ def _try_folder(ctx: _Ctx, rel: str, dest: Path) -> ItemOutcome | None:
             probe.unlink(missing_ok=True)
     except _InheritedAcl:
         return _block(ctx, rel, folder, _inherited_acl_reason(ctx, folder))
-    except _ModeNotKept:
-        pass  # the whole destination was checked up front; per photo at commit
+    except _ModeNotKept as kept:
+        ctx.forced[folder] = kept.forced  # fine for photos others may read anyway
     except OSError as exc:
         return _destination_problem(ctx, rel, dest, exc)
     ctx.usable.add(folder)
@@ -1117,9 +1209,14 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
             return refused
 
     try:
-        size = src.stat().st_size
+        src_st = src.stat()
     except OSError as exc:
         return _source_problem(rel, exc, "before As If got to it")
+    size = src_st.st_size
+    if not ctx.dry_run and ctx.forced:
+        forced = ctx.forced.get(_nearest_existing(dest.parent, ctx.dest_root), 0)
+        if forced & ~(src_st.st_mode & _reach_mask(src)):
+            return ItemOutcome(rel, State.FAILED_UPLOAD, _MODE_NOT_KEPT)
     if size * 3 > ctx.work.free_bytes():
         return ItemOutcome(rel, State.QUARANTINE, "too big for the RAM work dir")
 
@@ -1240,19 +1337,20 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         try:
             with ctx.log.timed("commit", img):
                 committed = _commit(
-                    ram, dest, mode, gid=src_st.st_gid, expect_sha=processed_sha, root=ctx.dest_root
+                    ram,
+                    dest,
+                    mode,
+                    gid=src_st.st_gid,
+                    expect_sha=processed_sha,
+                    root=ctx.dest_root,
+                    root_id=ctx.dest_id,
                 )
         except _InheritedAcl:
             # The folders made for it are gone again: the rule comes from above.
             folder = _nearest_existing(dest.parent, ctx.dest_root)
             return _block(ctx, rel, folder, _inherited_acl_reason(ctx, folder))
         except _ModeNotKept:
-            return ItemOutcome(
-                rel,
-                State.FAILED_UPLOAD,
-                "the destination would let other users read the copy (it gives every file "
-                "the same permissions), but not the original",
-            )
+            return ItemOutcome(rel, State.FAILED_UPLOAD, _MODE_NOT_KEPT)
         except _FolderRefused as refused:
             folder = refused.folder
             why = (
@@ -1315,6 +1413,7 @@ def caption_folder(
     # they were written in, so the log is only as private as that folder.)
     secrets.SystemRandom().shuffle(files)
 
+    dest_id: tuple[int, int] | None = None
     if not dry_run:
         try:
             created = _make_private_dirs(dest)
@@ -1329,11 +1428,19 @@ def caption_folder(
                 )
             if _more_people_can_list(dest, src):
                 _remove_created(created)
+                hint = ""
+                if _shared_mount(mount_of(str(dest.resolve()))):
+                    hint = (
+                        " On a network drive your own folders can show as someone else's: "
+                        "mount it so they show as yours (for sshfs, -o idmap=user)."
+                    )
                 raise CaptionError(
                     f"other users can list the destination {dest} but not {src}, so they "
                     f"would see your photos' names. Run `chmod 700 {dest}` if it's yours, or "
-                    "name a new folder (As If creates new ones private)."
+                    f"name a new folder (As If creates new ones private).{hint}"
                 )
+            dest_st = os.stat(dest)
+            dest_id = (dest_st.st_dev, dest_st.st_ino)
         except _FolderRefused as exc:
             raise CaptionError(
                 f"can't create the destination folder {exc.folder}: {exc.exc.strerror}"
@@ -1379,6 +1486,7 @@ def caption_folder(
             ctx = _Ctx(
                 cfg, model, et, InferenceClient(model.worker), work, log, run_id, dry_run, dest
             )
+            ctx.dest_id = dest_id
             stack.callback(lambda: ctx.client.close())
             log.event("run_start", n=len(files))
             try:
