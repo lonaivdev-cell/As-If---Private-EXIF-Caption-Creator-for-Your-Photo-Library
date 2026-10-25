@@ -1194,30 +1194,41 @@ def test_a_folder_shown_as_someone_elses_counts_as_theirs(open_dir: Path) -> Non
     assert local._more_people_can_list(dest, src)
 
 
-def test_fuse_mounts_are_judged_by_who_can_get_in(
+def _on_share(monkeypatch: pytest.MonkeyPatch, mount: Path, opts: list[str] | None = None) -> None:
+    """Make everything under ``mount`` look like an sshfs share."""
+    share = (str(mount), "fuse.sshfs", opts or ["rw", "user_id=0"])
+    monkeypatch.setattr(
+        local, "mount_of", lambda entry: share if local._within(Path(entry), str(mount)) else None
+    )
+
+
+def test_on_a_share_only_folders_as_if_made_count_as_private(
     open_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     src = _folder(open_dir / "private", 0o700)
     home = _folder(open_dir / "home", 0o700)  # nobody else gets past this here...
     mount = _folder(home / "nas", 0o755)
-    dest = _folder(mount / "captioned", 0o755)
-    sshfs = (str(mount), "fuse.sshfs", ["rw", "user_id=0"])
-    monkeypatch.setattr(
-        local, "mount_of", lambda entry: sshfs if entry.startswith(str(mount)) else None
-    )
-    # ...but the share's other users see the folder as the share shows it.
-    assert local._more_people_can_list(dest, src)
-    dest.chmod(0o700)
-    assert not local._more_people_can_list(dest, src)
-    # An original on a mount only we can enter is private, whatever its modes.
-    assert local._more_people_can_list(_folder(open_dir / "pub", 0o755), mount)
+    _on_share(monkeypatch, mount)
+    # ...but the share's other users don't come through here, and what the
+    # share shows (sshfs uid=, gid=, umask=) can't be trusted: 0700 or not.
+    existing = _folder(mount / "family", 0o700)
+    assert local._more_people_can_list(existing, src)
+    mine = _folder(mount / "captioned", 0o700)
+    local._remember_own_folders([mine])
+    assert not local._more_people_can_list(mine, src)
+    # allow_other without default_permissions: every local user gets in.
+    _on_share(monkeypatch, mount, ["rw", "allow_other"])
+    assert local._more_people_can_list(mine, src)
+
+
+def test_an_original_on_a_mount_only_we_can_enter_is_private(
+    open_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = _folder(open_dir / "nas", 0o755)  # its modes say anyone can list it
+    _on_share(monkeypatch, mount)
+    public = _folder(open_dir / "pub", 0o755)
+    assert local._more_people_can_list(public, mount)
     assert local._reach_mask(mount) == 0o700
-    # allow_other without default_permissions: every local user gets in as the share's account.
-    unchecked = (str(mount), "fuse.sshfs", ["rw", "allow_other"])
-    monkeypatch.setattr(
-        local, "mount_of", lambda e: unchecked if e.startswith(str(mount)) else None
-    )
-    assert local._more_people_can_list(dest, src)
 
 
 def _forced_modes(monkeypatch: pytest.MonkeyPatch, under: Path) -> None:
@@ -1563,3 +1574,107 @@ def test_a_share_that_shows_our_files_as_someone_elses_still_takes_copies(
     src = _library(fixtures_dir, tmp_path / "src", "a.jpg")
     summary = _run(src, tmp_path / "out", cfg, tmp_path)
     assert _states(summary) == {"a.jpg": State.CLEAN}
+
+
+# -- round 7 -----------------------------------------------------------------
+
+
+def test_copies_go_onto_a_share_only_in_folders_as_if_made(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg", "2024/b.jpg")
+    (src / "a.jpg").chmod(0o640)
+    mount = _folder(open_dir / "nas", 0o755)
+    _on_share(monkeypatch, mount)
+    _folder(mount / "family", 0o2770)  # someone's shared folder, shown as ours
+    with pytest.raises(CaptionError, match="only trusts folders it made itself"):
+        _run(src, mount / "family", cfg, tmp_path)
+    summary = _run(src, mount / "captioned", cfg, tmp_path)
+    assert set(_states(summary).values()) == {State.CLEAN}
+    copy = (mount / "captioned" / "a.jpg").stat()
+    assert stat.S_IMODE(copy.st_mode) & 0o077 == 0  # a share's groups are the server's
+    again = _run(src, mount / "captioned", cfg, tmp_path)  # and it can be resumed
+    assert set(_states(again).values()) == {State.SKIPPED_DONE}
+
+
+def test_a_share_that_ignores_permissions_is_refused_for_private_photos(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
+    mount = _folder(open_dir / "cloud", 0o755)
+    _on_share(monkeypatch, mount)
+    real_fchmod = os.fchmod
+
+    def ignored(fd: int, mode: int) -> None:  # rclone: chmod does nothing
+        if not Path(os.readlink(f"/proc/self/fd/{fd}")).is_relative_to(mount):
+            real_fchmod(fd, mode)
+
+    monkeypatch.setattr(local.os, "fchmod", ignored)
+    with pytest.raises(CaptionError, match="doesn't keep the permissions"):
+        _run(src, mount / "captioned", cfg, tmp_path)
+
+
+def test_a_copy_whose_group_cant_be_kept_gets_only_what_everyone_had(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def refuse(*a: Any) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")  # FAT: one group only
+
+    monkeypatch.setattr(local.os, "fchown", refuse)
+    probe = tmp_path / "f"
+    probe.write_bytes(b"")
+    fd = os.open(probe, os.O_RDONLY)
+    try:
+        other = os.fstat(fd).st_gid + 1
+        keep = local._no_wider_than_the_original
+        assert keep(fd, 0o644, other) == 0o644  # everyone could read it anyway
+        assert keep(fd, 0o640, other) == 0o600
+        assert keep(fd, 0o604, other) == 0o604
+    finally:
+        os.close(fd)
+
+
+def test_the_destination_is_held_open_only_for_the_run(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg")
+    before = len(os.listdir("/proc/self/fd"))
+    _run(src, tmp_path / "out", cfg, tmp_path)
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+def test_an_unmount_during_the_model_run_writes_nothing(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg")
+    dest = tmp_path / "nas"
+    real = local._describe
+
+    def unmount_meanwhile(ctx: Any, ram: Path, img: str) -> Any:
+        if dest.exists():
+            dest.rename(tmp_path / "was-mounted")  # a lazy unmount, mid-model
+            dest.mkdir()
+        return real(ctx, ram, img)
+
+    monkeypatch.setattr(local, "_describe", unmount_meanwhile)
+    summary = _run(src, dest, cfg, tmp_path)
+    assert summary.aborted is not None and "is gone" in summary.aborted
+    assert not list(dest.iterdir())
+
+
+def test_folders_made_before_a_refused_name_are_removed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_mkdir = os.mkdir
+
+    def refuse_colon(path: Any, *a: Any, **kw: Any) -> None:
+        if ":" in Path(path).name:
+            raise OSError(errno.EINVAL, "Invalid argument")
+        real_mkdir(path, *a, **kw)
+
+    monkeypatch.setattr(local.os, "mkdir", refuse_colon)
+    root = tmp_path / "out"
+    root.mkdir()
+    with pytest.raises(local._FolderRefused):
+        local._make_private_dirs(root / "Health" / "2024" / "day: 1", root)
+    assert not list(root.iterdir())
