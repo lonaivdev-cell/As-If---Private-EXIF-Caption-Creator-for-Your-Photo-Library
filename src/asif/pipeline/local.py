@@ -498,29 +498,34 @@ def _own_folders_file() -> Path:
 _MADE_NOW: set[str] = set()
 
 
+def _folder_key(folder: Path) -> str:
+    """How a folder is noted: a hash of its full path, so no folder names are kept."""
+    return hashlib.sha256(os.fsencode(folder.resolve())).hexdigest()
+
+
 def _own_folders_on_shares() -> set[str]:
     """Folders on network drives that As If made itself (private), so it can trust them.
 
-    Kept on this computer, where the share's other users can't add to it.
+    Kept on this computer, where the share's other users can't add to it,
+    as hashes of their paths (``_folder_key``).
     """
     try:
-        made = set(_own_folders_file().read_text(encoding="utf-8").splitlines())
-    except OSError:
+        made = set(_own_folders_file().read_text(encoding="ascii").split())
+    except (OSError, UnicodeDecodeError):
         made = set()
     return made | _MADE_NOW
 
 
 def _remember_own_folders(folders: list[Path]) -> None:
     """Note folders As If just made, those on a network drive (best effort)."""
-    entries = [str(f.resolve()) for f in folders if _shared_mount(mount_of(str(f.resolve())))]
-    entries = [e for e in entries if "\n" not in e]
+    entries = [_folder_key(f) for f in folders if _shared_mount(mount_of(str(f.resolve())))]
     if not entries:
         return
     try:
         registry = _own_folders_file()
         paths.ensure_private_dir(registry.parent)
         fd = os.open(registry, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        with os.fdopen(fd, "a", encoding="ascii") as fh:
             fh.write("".join(f"{e}\n" for e in entries))
             fh.flush()
             os.fsync(fh.fileno())
@@ -541,6 +546,21 @@ def _chmod_ignored(fd: int) -> bool:
         if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
             return True
     return False
+
+
+def _squashed(folder: Path, mount: Mount) -> bool:
+    """Does a kernel NFS or SMB share show a folder As If made as someone else's?
+
+    Then the server gives what anyone makes to one shared account
+    (all_squash, "map all users", Samba's force user), and every user of
+    the share can open it. (sshfs and other FUSE clients show their own
+    numbers, so there the owner shown means nothing.)
+    """
+    return (
+        mount is not None
+        and not mount[1].startswith("fuse")
+        and _someone_else(folder.stat().st_uid)
+    )
 
 
 def _within(path: Path, mount_point: str) -> bool:
@@ -695,7 +715,7 @@ def _folder_audience(folder: Path, *, wide: bool, bits: int = 0o444) -> int:
         # they never pass through this computer's folders. Only a folder As
         # If made there itself, private, counts as private (going by the
         # mode it set: who it shows as the owner means nothing there).
-        if str(real) not in _own_folders_on_shares():
+        if _folder_key(real) not in _own_folders_on_shares() or _squashed(real, mount):
             return _ANYONE
         return _audience(real, bits, wide=True)
     st = real.stat()
@@ -859,8 +879,13 @@ def _no_wider_than_the_original(fd: int, mode: int, gid: int | None) -> int:
         except OSError:
             # Its group stays someone else's: give it only what everyone (the
             # original's group and all others) could already do.
-            mode = (mode & ~0o070) | (mode & (mode & 0o007) << 3)
+            mode = _everyones_group(mode)
     return mode
+
+
+def _everyones_group(mode: int) -> int:
+    """``mode`` with the group given only what everyone else gets too."""
+    return (mode & ~0o070) | (mode & (mode & 0o007) << 3)
 
 
 def _check_root(root: Path | None, root_id: tuple[int, int] | None) -> None:
@@ -904,7 +929,8 @@ def _commit(
     gives it more read access than ``mode`` anyway. Folders created for a
     copy that isn't placed are removed again, and nothing is written once
     ``root`` isn't the folder with ``root_id`` any more. ``on_made`` gets the
-    folders made for a copy that was placed.
+    folders made for the copy as soon as they are made (they are As If's
+    own even if a failure leaves them behind).
 
     With ``expect_sha``, the placed copy is read back and must hash to it,
     or ``_ReadBackMismatch`` is raised. A copy that was placed but not
@@ -916,6 +942,8 @@ def _commit(
     tmp = dest.parent / f".asif-{secrets.token_hex(8)}.tmp"
     done = False
     try:
+        if on_made is not None and created:
+            on_made(created)
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except OSError as exc:
@@ -963,8 +991,6 @@ def _commit(
                     dest.unlink()
             raise
         done = True
-        if on_made is not None and created:
-            on_made(created)
         return True
     finally:
         tmp.unlink(missing_ok=True)
@@ -1242,6 +1268,17 @@ def _source_problem(rel: str, exc: OSError, when: str) -> ItemOutcome:
     return ItemOutcome(rel, State.QUARANTINE, f"can't read the original ({exc.strerror or exc})")
 
 
+def _copy_mode(ctx: _Ctx, src: Path, src_st: os.stat_result, dest: Path) -> int:
+    """The mode a copy gets: no more than its original effectively had, and on
+    a share, no more for the group than for everyone (its groups are the
+    server's, whatever it shows)."""
+    mode = src_st.st_mode & _reach_mask(src)
+    nearest = _nearest_existing(dest.parent, ctx.dest_root).resolve()
+    if _shared_mount(mount_of(str(nearest))):
+        mode = _everyones_group(mode)
+    return mode
+
+
 def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcome:
     suffix = src.suffix.lower()
     if suffix in NOT_YET:
@@ -1284,7 +1321,7 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
     size = src_st.st_size
     if not ctx.dry_run and ctx.forced:
         forced = ctx.forced.get(_nearest_existing(dest.parent, ctx.dest_root), 0)
-        if forced & ~(src_st.st_mode & _reach_mask(src)):
+        if forced & ~_copy_mode(ctx, src, src_st, dest):
             return ItemOutcome(rel, State.FAILED_UPLOAD, _MODE_NOT_KEPT)
     if size * 3 > ctx.work.free_bytes():
         return ItemOutcome(rel, State.QUARANTINE, "too big for the RAM work dir")
@@ -1394,11 +1431,7 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         try:
             unchanged = check_source_unchanged(fp_then, fingerprint(src))
             src_st = src.stat()
-            mode = src_st.st_mode & _reach_mask(src)
-            if _shared_mount(
-                mount_of(str(_nearest_existing(dest.parent, ctx.dest_root).resolve()))
-            ):
-                mode &= ~0o070  # a share's groups are the server's, whatever it shows
+            mode = _copy_mode(ctx, src, src_st, dest)
         except OSError as exc:
             return _source_problem(rel, exc, "while As If was working on it")
         if not unchanged.ok:
@@ -1451,6 +1484,49 @@ def _process(ctx: _Ctx, src: Path, dest: Path, rel: str, img: str) -> ItemOutcom
         wipe_file(ram)
 
 
+def _destination_ok(dest: Path, src: Path) -> None:
+    """Raise ``CaptionError`` if copies of ``src`` mustn't go into ``dest``."""
+    mount = mount_of(str(dest.resolve()))
+    on_share = _shared_mount(mount)
+    if _permissions_not_kept(dest, src):
+        if on_share:
+            raise CaptionError(
+                f"other people could see and open the copies in {dest}: this network "
+                "drive doesn't keep the permissions As If sets, so it can't keep them "
+                "private. Use a folder on this computer."
+            )
+        raise CaptionError(
+            f"other users on this computer could see and open the copies in {dest}: "
+            "its drive gives every file the same permissions (FAT and exFAT drives "
+            "often do), so As If can't keep them private. Use a folder only you can "
+            "open, such as one in your home folder, or mount the drive just for you "
+            "(for example with the options uid=$(id -u),umask=077)."
+        )
+    if not _more_people_can_list(dest, src):
+        return
+    hint = ""
+    if (
+        on_share
+        and _folder_key(dest) in _own_folders_on_shares()
+        and _squashed(dest.resolve(), mount)
+    ):
+        raise CaptionError(
+            f"this network drive makes {dest}, and everything As If creates there, someone "
+            "else's (all_squash, \"map all users\" or Samba's force user), so every user of "
+            "the share could open the copies. Use a folder on this computer, or a share "
+            "that keeps your own account."
+        )
+    if on_share:
+        hint = (
+            " On a network drive As If only trusts folders it made itself, so name a new one there."
+        )
+    raise CaptionError(
+        f"other users can list the destination {dest} but not {src}, so they "
+        f"would see your photos' names. Run `chmod 700 {dest}` if it's yours, or "
+        f"name a new folder (As If creates new ones private).{hint}"
+    )
+
+
 def caption_folder(
     src: Path,
     dest: Path,
@@ -1488,40 +1564,19 @@ def caption_folder(
     secrets.SystemRandom().shuffle(files)
 
     if not dry_run:
-        _MADE_NOW.clear()  # (a refused run's folders were removed again)
+        _MADE_NOW.clear()
+        created: list[Path] = []
         try:
-            created = _make_private_dirs(dest)
-            _MADE_NOW.update(str(f.resolve()) for f in created)
-            on_share = _shared_mount(mount_of(str(dest.resolve())))
-            if _permissions_not_kept(dest, src):
+            try:
+                created = _make_private_dirs(dest)
+                _MADE_NOW.update(_folder_key(f) for f in created)
+                _destination_ok(dest, src)
+                _remember_own_folders(created)
+            except BaseException:
+                # Nothing it made is left behind (its name would say something).
                 _remove_created(created)
-                if on_share:
-                    raise CaptionError(
-                        f"other people could see and open the copies in {dest}: this network "
-                        "drive doesn't keep the permissions As If sets, so it can't keep them "
-                        "private. Use a folder on this computer."
-                    )
-                raise CaptionError(
-                    f"other users on this computer could see and open the copies in {dest}: "
-                    "its drive gives every file the same permissions (FAT and exFAT drives "
-                    "often do), so As If can't keep them private. Use a folder only you can "
-                    "open, such as one in your home folder, or mount the drive just for you "
-                    "(for example with the options uid=$(id -u),umask=077)."
-                )
-            if _more_people_can_list(dest, src):
-                _remove_created(created)
-                hint = ""
-                if on_share:
-                    hint = (
-                        " On a network drive As If only trusts folders it made itself, so "
-                        "name a new one there."
-                    )
-                raise CaptionError(
-                    f"other users can list the destination {dest} but not {src}, so they "
-                    f"would see your photos' names. Run `chmod 700 {dest}` if it's yours, or "
-                    f"name a new folder (As If creates new ones private).{hint}"
-                )
-            _remember_own_folders(created)
+                _MADE_NOW.clear()
+                raise
         except _FolderRefused as exc:
             raise CaptionError(
                 f"can't create the destination folder {exc.folder}: {exc.exc.strerror}"

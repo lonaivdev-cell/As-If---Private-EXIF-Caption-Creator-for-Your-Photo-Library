@@ -8,6 +8,7 @@ left behind in the RAM work dir.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
@@ -1194,9 +1195,14 @@ def test_a_folder_shown_as_someone_elses_counts_as_theirs(open_dir: Path) -> Non
     assert local._more_people_can_list(dest, src)
 
 
-def _on_share(monkeypatch: pytest.MonkeyPatch, mount: Path, opts: list[str] | None = None) -> None:
-    """Make everything under ``mount`` look like an sshfs share."""
-    share = (str(mount), "fuse.sshfs", opts or ["rw", "user_id=0"])
+def _on_share(
+    monkeypatch: pytest.MonkeyPatch,
+    mount: Path,
+    opts: list[str] | None = None,
+    fstype: str = "fuse.sshfs",
+) -> None:
+    """Make everything under ``mount`` look like a network share (sshfs by default)."""
+    share = (str(mount), fstype, opts or ["rw", "user_id=0"])
     monkeypatch.setattr(
         local, "mount_of", lambda entry: share if local._within(Path(entry), str(mount)) else None
     )
@@ -1678,3 +1684,113 @@ def test_folders_made_before_a_refused_name_are_removed_again(
     with pytest.raises(local._FolderRefused):
         local._make_private_dirs(root / "Health" / "2024" / "day: 1", root)
     assert not list(root.iterdir())
+
+
+# -- round 8 -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("fstype", ["cifs", "9p", "fuse.rclone"])
+def test_public_photos_go_onto_a_share_with_fixed_permissions(
+    open_dir: Path,
+    fixtures_dir: Path,
+    cfg: Config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fstype: str,
+) -> None:
+    # SMB with cifs defaults, WSL2's /mnt/c, rclone: every file 0644, chmod ignored.
+    src = _library(fixtures_dir, _folder(open_dir / "pub", 0o755), "a.jpg", "2024/b.jpg")
+    for photo in (src / "a.jpg", src / "2024" / "b.jpg"):
+        photo.chmod(0o644)
+    mount = _folder(open_dir / "nas", 0o755)
+    _on_share(monkeypatch, mount, fstype=fstype)
+    _forced_modes(monkeypatch, mount)
+    runs = _count_model_runs(monkeypatch)
+    summary = _run(src, mount / "captioned", cfg, tmp_path)
+    assert set(_states(summary).values()) == {State.CLEAN}
+    assert len(runs) == 2
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="needs to make folders someone else's")
+def test_a_share_that_squashes_everyone_into_one_account_is_refused(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), "a.jpg")
+    mount = _folder(open_dir / "nfs", 0o755)
+    _on_share(monkeypatch, mount, fstype="nfs4")
+    real_mkdir = os.mkdir
+
+    def all_squash(path: Any, *a: Any, **kw: Any) -> None:
+        real_mkdir(path, *a, **kw)
+        if Path(path).is_relative_to(mount):
+            os.chown(path, 65534, 65534)  # the server's anonymous account
+
+    monkeypatch.setattr(local.os, "mkdir", all_squash)
+    with pytest.raises(CaptionError, match="someone else's"):
+        _run(src, mount / "captioned", cfg, tmp_path)
+    assert not (mount / "captioned").exists()
+
+
+def test_a_folder_name_that_isnt_utf8_goes_onto_a_share_and_isnt_written_down(
+    open_dir: Path, fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import re
+
+    from asif import paths
+
+    name = os.fsdecode(b"caf\xe9 private")  # Latin-1 bytes from an old camera or disk
+    src = _library(fixtures_dir, _folder(open_dir / "private", 0o700), f"{name}/a.jpg")
+    mount = _folder(open_dir / "nas", 0o755)
+    _on_share(monkeypatch, mount)
+    summary = _run(src, mount / "captioned", cfg, tmp_path)
+    assert set(_states(summary).values()) == {State.CLEAN}
+    noted = (paths.state_dir() / "own-folders-on-shares").read_text(encoding="ascii")
+    assert noted and all(re.fullmatch(r"[0-9a-f]{64}", line) for line in noted.split())
+
+
+def test_folders_made_for_a_copy_count_as_ours_even_if_the_copy_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made: list[list[Path]] = []
+
+    def link_fails(*a: Any) -> None:
+        raise OSError(errno.EIO, "Input/output error")  # the share dropped mid-copy
+
+    real_rmdir = os.rmdir
+
+    def rmdir_fails(path: Any, *a: Any, **kw: Any) -> None:
+        if Path(path).name == "2024":  # and the folder couldn't go either
+            raise OSError(errno.EIO, "Input/output error")
+        real_rmdir(path, *a, **kw)
+
+    monkeypatch.setattr(local.os, "link", link_fails)
+    monkeypatch.setattr(local.os, "rmdir", rmdir_fails)
+    ram = tmp_path / "ram.jpg"
+    ram.write_bytes(b"x")
+    dest = tmp_path / "out" / "2024" / "a.jpg"
+    (tmp_path / "out").mkdir()
+    with pytest.raises(OSError):
+        local._commit(ram, dest, 0o600, on_made=made.append)
+    monkeypatch.undo()
+    assert made == [[dest.parent]]
+
+
+def test_the_destination_is_held_open_while_photos_are_done(
+    fixtures_dir: Path, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    src = _library(fixtures_dir, tmp_path / "src", "a.jpg")
+    dest = tmp_path / "out"
+    seen: list[bool] = []
+    real = local._describe
+
+    def check(ctx: Any, ram: Path, img: str) -> Any:
+        held = []
+        for fd in os.listdir("/proc/self/fd"):
+            with contextlib.suppress(OSError):
+                held.append(os.readlink(f"/proc/self/fd/{fd}"))
+        seen.append(os.path.realpath(dest) in held)
+        return real(ctx, ram, img)
+
+    monkeypatch.setattr(local, "_describe", check)
+    summary = _run(src, dest, cfg, tmp_path)
+    assert summary.aborted is None and seen == [True]
