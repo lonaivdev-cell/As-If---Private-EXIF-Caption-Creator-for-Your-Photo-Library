@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from asif import paths
+from asif.config import Config, ConfigError, load_config
+
+
+def test_missing_file_means_defaults(tmp_path: Path) -> None:
+    cfg = load_config(tmp_path / "nope.toml")
+    assert cfg == Config()
+    assert cfg.general.caption_lang == "en"
+    assert cfg.resources.max_edge_px == 1024
+    assert cfg.guards.max_failure_rate == 0.02
+
+
+def test_reads_values(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[general]\ncaption_lang = "pt-BR"\ncompat = "wide"\n'
+        '[model]\nid = "stub"\nserver_args = ["--flash-attn"]\n'
+    )
+    cfg = load_config(path)
+    assert cfg.general.caption_lang == "pt-BR"
+    assert cfg.general.compat == "wide"
+    assert cfg.model.server_args == ["--flash-attn"]
+
+
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        ("[general]\nmax_edge = 512\n", "general.max_edge"),  # typo'd key is an error
+        ("[nonsense]\nx = 1\n", "nonsense"),
+        ('[general]\ncaption_lang = "Portuguese"\n', "BCP-47"),
+        ('[general]\ncaption_lang = "en\\n-if"\n', "BCP-47"),
+        ('[general]\ncaption_lang = "all"\n', "BCP-47"),  # an exiftool wildcard
+        ('[general]\ncompat = "iptc"\n', "general.compat"),
+        ("[resources]\nmax_edge_px = 10\n", "max_edge_px"),
+        ("[general\n", "not valid TOML"),
+    ],
+)
+def test_bad_config_is_a_clear_error(tmp_path: Path, body: str, fragment: str) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    with pytest.raises(ConfigError) as info:
+        load_config(path)
+    assert fragment in str(info.value)
+    assert str(path) in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'# Configura\xe7\xe3o\n[general]\ncaption_lang = "pt-BR"\n',  # Latin-1
+        "[general]\n".encode("utf-16"),  # Notepad's "Unicode"
+    ],
+)
+def test_a_config_that_isnt_utf8_is_a_clear_error(tmp_path: Path, body: bytes) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(body)
+    with pytest.raises(ConfigError, match="save it as UTF-8") as info:
+        load_config(path)
+    assert str(path) in str(info.value)
+
+
+@pytest.mark.parametrize("lang", ["en", "pt-BR", "zh-Hant", "zh-Hant-TW", "es-419", "fil"])
+def test_language_tags_accepted(lang: str) -> None:
+    cfg = Config()
+    cfg.general.caption_lang = lang
+    assert cfg.general.caption_lang == lang
+
+
+def test_assignment_is_validated() -> None:
+    cfg = Config()
+    with pytest.raises(ValueError):
+        cfg.general.caption_lang = "x-default"
+    with pytest.raises(ValueError):
+        cfg.resources.max_edge_px = 99999
+
+
+def test_asif_home_puts_everything_in_one_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path))
+    for path in (paths.config_dir(), paths.data_dir(), paths.state_dir(), paths.cache_dir()):
+        assert tmp_path in path.parents
+    assert paths.config_file() == tmp_path / "config" / "config.toml"
+    assert Config().resources.staging_path() == tmp_path / "cache" / "staging"
+
+
+@pytest.mark.skipif(__import__("sys").platform == "darwin", reason="XDG is Linux-only")
+def test_xdg_variables_are_honoured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ASIF_HOME")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setenv("XDG_STATE_HOME", "relative/paths/are/ignored")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert paths.config_dir() == tmp_path / "cfg" / "asif"
+    assert paths.state_dir() == tmp_path / "home" / ".local" / "state" / "asif"
+
+
+def test_ensure_private_dir(tmp_path: Path) -> None:
+    path = paths.ensure_private_dir(tmp_path / "a" / "b")
+    assert path.is_dir()
+    assert path.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize(
+    ("home", "mount_point_left"),
+    [
+        ("Vault/asif", False),  # the mount point goes away when locked (/media, /Volumes)
+        ("Vault/asif", True),  # an empty folder is left (gocryptfs, CryFS, fstab LUKS)
+        ("Vault", True),  # ASIF_HOME is the mount point itself
+    ],
+)
+def test_ensure_private_dir_never_writes_to_an_asif_home_that_isnt_set_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: str, mount_point_left: bool
+) -> None:
+    # An encrypted volume that isn't mounted, or a typo: nothing goes on the disk underneath.
+    if mount_point_left:
+        (tmp_path / "Vault").mkdir()
+    monkeypatch.setenv("ASIF_HOME", str(tmp_path / home))
+    assert paths.asif_home_not_set_up() == tmp_path / home
+    before = sorted(tmp_path.rglob("*"))
+    with pytest.raises(FileNotFoundError, match="isn't set up here"):
+        paths.ensure_private_dir(paths.state_dir())
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_setting_up_asif_home_never_creates_the_folders_its_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "Vault" / "asif"
+    monkeypatch.setenv("ASIF_HOME", str(home))
+    with pytest.raises(FileNotFoundError, match="Vault doesn't exist"):
+        paths.set_up_asif_home()
+    assert not (tmp_path / "Vault").exists()
+
+    (tmp_path / "Vault").mkdir()  # mounted
+    assert paths.set_up_asif_home() is True
+    assert (home / paths.HOME_MARKER).is_file()
+    assert paths.asif_home_not_set_up() is None
+    assert paths.ensure_private_dir(paths.state_dir()).is_dir()
+    assert paths.set_up_asif_home() is False  # already set up
+
+    monkeypatch.delenv("ASIF_HOME")
+    assert paths.asif_home_not_set_up() is None
+    assert paths.set_up_asif_home() is False
